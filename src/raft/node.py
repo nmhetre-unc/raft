@@ -293,8 +293,11 @@ class RaftClusterNode:
     that translation: it converts `int -> str` for outgoing `src`/`now`
     calls into the wrapped `RaftNode`, and `str -> int` for the
     `(dst, payload)` pairs it produces, and otherwise gets entirely out of
-    the way -- every other attribute (`role`, `current_term`, `voted_for`,
-    `leader_id`, `node_id`, ...) reads straight through to the real node.
+    the way. The handful of fields external callers (tests, invariant
+    checkers) actually need to inspect -- `role`, `current_term`,
+    `voted_for`, `leader_id`, `node_id`, `storage` -- are typed
+    properties reading straight through to the real node; anything else
+    falls back through `__getattr__`, untyped but still reachable.
     """
 
     def __init__(self, raft_node: RaftNode) -> None:
@@ -303,10 +306,35 @@ class RaftClusterNode:
     def __getattr__(self, name: str) -> object:
         return getattr(self.raft_node, name)
 
-    def tick(self, now: int) -> list[tuple[int, Message]]:
+    @property
+    def node_id(self) -> str:
+        return self.raft_node.node_id
+
+    @property
+    def role(self) -> Role:
+        return self.raft_node.role
+
+    @property
+    def current_term(self) -> int:
+        return self.raft_node.current_term
+
+    @property
+    def voted_for(self) -> str | None:
+        return self.raft_node.voted_for
+
+    @property
+    def leader_id(self) -> str | None:
+        return self.raft_node.leader_id
+
+    @property
+    def storage(self) -> Storage:
+        return self.raft_node.storage
+
+    def tick(self, now: int) -> list[tuple[int, object]]:
         return [(int(dst), msg) for dst, msg in self.raft_node.tick(now)]
 
-    def handle(self, payload: Message, src: int, now: int) -> list[tuple[int, Message]]:
+    def handle(self, payload: object, src: int, now: int) -> list[tuple[int, object]]:
+        assert isinstance(payload, Message), f"unexpected payload type: {type(payload)!r}"
         produced = self.raft_node.handle(payload, str(src), now)
         return [(int(dst), msg) for dst, msg in produced]
 

@@ -394,3 +394,21 @@ def test_stale_request_vote_reply_is_ignored() -> None:
 
     assert out == []
     assert node.role is Role.FOLLOWER  # a stale vote can't make us leader
+
+
+def test_raft_cluster_node_exposes_typed_fields_and_falls_back_for_the_rest() -> None:
+    storage = MemoryStorage()
+    raft_node = RaftNode("0", ["1"], storage, rng=random.Random(1))
+    adapter = RaftClusterNode(raft_node)
+
+    # Explicit typed properties.
+    assert adapter.node_id == "0"
+    assert adapter.role is Role.FOLLOWER
+    assert adapter.current_term == 0
+    assert adapter.voted_for is None
+    assert adapter.leader_id is None
+    assert adapter.storage is storage
+
+    # Anything else reaches the wrapped RaftNode through __getattr__.
+    assert adapter.peers == ["1"]
+    assert adapter.votes_received == set()

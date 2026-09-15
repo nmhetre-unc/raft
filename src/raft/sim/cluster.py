@@ -82,6 +82,12 @@ class Cluster[N: Node]:
     cadence at which every live node is ticked together (a Raft node
     built on this is expected to count ticks itself, the way it would
     count real timer callbacks in production).
+
+    `seed` (the value the caller passed in) and `step_count` (the number
+    of `step()` calls that actually processed an event) are both public,
+    so anything that needs to name exactly where a run is -- an invariant
+    checker reporting a violation, a fuzzer reproducing one -- can do so
+    without threading that bookkeeping through separately.
     """
 
     def __init__(
@@ -98,6 +104,8 @@ class Cluster[N: Node]:
 
         self.clock = Clock()
         self.network = Network(seed)
+        self.seed = seed
+        self.step_count = 0
         self._node_factory = node_factory
         self._tick_interval_ms = tick_interval_ms
         self._next_tick_time = tick_interval_ms
@@ -129,6 +137,7 @@ class Cluster[N: Node]:
             self.clock.run_until(t)
             self._fire_timer(t)
 
+        self.step_count += 1
         return True
 
     def run(self, steps: int) -> None:
