@@ -5,9 +5,9 @@ import random
 import pytest
 
 from raft.messages import AppendEntries, AppendEntriesReply, RequestVote, RequestVoteReply
-from raft.node import RaftNode, Role, raft_node_factory
+from raft.node import RaftClusterNode, RaftNode, Role, raft_node_factory
 from raft.sim.cluster import Cluster
-from raft.storage import LogEntry, MemoryStorage, StorageError
+from raft.storage import LogEntry, MemoryStorage, Storage, StorageError
 
 # Generous but cheap: calibration showed 5-node clusters converge on a
 # leader within ~35 steps for every seed tried, so this leaves ample
@@ -46,6 +46,48 @@ def leaders(cluster: Cluster) -> list[RaftNode]:
         if node is not None and node.role is Role.LEADER:
             result.append(node)
     return result
+
+
+def _all_nodes(cluster: Cluster) -> list[RaftNode]:
+    return [
+        node for node_id in cluster.node_ids() if (node := cluster.get_node(node_id)) is not None
+    ]
+
+
+class _FixedRandom:
+    """A `random.Random` stand-in whose `randint` always returns the same value.
+
+    Only `randint` is implemented because it's the only method `RaftNode`
+    ever calls on its injected rng.
+    """
+
+    def __init__(self, value: int) -> None:
+        self._value = value
+
+    def randint(self, a: int, b: int) -> int:
+        del a, b
+        return self._value
+
+
+def fixed_timeout_cluster(
+    n: int, seed: int, timeout_ms: int, tick_interval_ms: int = 10
+) -> Cluster:
+    """A Cluster where every node's election timeout is the same fixed constant.
+
+    Unlike `raft_node_factory`, which gives every node its own seeded
+    `random.Random`, every node here shares one `_FixedRandom` returning
+    the identical `timeout_ms` on every draw -- there is no randomness
+    left anywhere in the timeout, only the constant.
+    """
+    node_ids = [str(i) for i in range(n)]
+
+    def factory(node_id: int, storage: Storage) -> RaftClusterNode:
+        name = str(node_id)
+        peers = [peer for peer in node_ids if peer != name]
+        raft_node = RaftNode(name, peers, storage, rng=_FixedRandom(timeout_ms))
+        return RaftClusterNode(raft_node)
+
+    return Cluster(n=n, seed=seed, node_factory=factory, tick_interval_ms=tick_interval_ms)
 
 
 def test_five_nodes_boot_with_no_leader_then_elect_exactly_one() -> None:
@@ -204,6 +246,60 @@ def test_fixed_seed_elects_the_same_leader_in_the_same_term_across_two_runs() ->
         return leader.node_id, leader.current_term
 
     assert run_once() == run_once()
+
+
+def test_fixed_election_timeout_livelocks_but_randomized_timeout_elects_a_leader() -> None:
+    """Why the election timeout must be redrawn from a range, not fixed.
+
+    Cluster ticks every live node together, at the same instant, every
+    `tick_interval_ms` -- that's what makes the whole simulation
+    deterministic. It also means that if every node's election timeout
+    resolves to the identical duration, every node's deadline lands on
+    the identical instant too: all five become candidates on the same
+    tick, all vote for themselves before any RequestVote can arrive, and
+    every vote request is therefore denied (Figure 2 already forbids
+    voting for a second candidate once you've voted for yourself in the
+    same term). Nobody reaches a majority, every deadline resets to the
+    same fixed offset from the same instant all over again, and the whole
+    thing repeats forever: a livelock, not a freeze -- the term keeps
+    climbing every round even though no leader ever emerges.
+
+    Regression this guards against: it is not enough for each node to
+    merely have *some* randomness in its timeout. If a future change drew
+    the timeout once per node -- at construction, from each node's own
+    seeded rng -- and then reused that single draw on every reset instead
+    of calling the rng again, each node would still have picked a
+    plausible-looking, *different* constant... but a constant all the
+    same. Under Cluster's synchronized, everyone-ticks-together model,
+    any fixed relationship between nodes' timeouts can keep reproducing
+    the same split-vote outcome round after round, exactly like the
+    single-shared-constant case tested directly here. Redrawing on every
+    reset (`RaftNode._reset_election_deadline`, called from a fresh
+    `random.Random` each time) is what breaks any such resonance and lets
+    the cluster eventually stagger apart -- which is exactly what the
+    second half of this test demonstrates by swapping in `raft_node_factory`
+    and watching the same topology converge.
+    """
+    STEPS = 2000
+    FIXED_TIMEOUT_MS = 200
+
+    livelocked = fixed_timeout_cluster(n=5, seed=1, timeout_ms=FIXED_TIMEOUT_MS)
+    terms_before = {node.current_term for node in _all_nodes(livelocked)}
+    livelocked.run(STEPS)
+    terms_after = [node.current_term for node in _all_nodes(livelocked)]
+
+    assert leaders(livelocked) == []  # never converges
+    assert all(node.role is Role.CANDIDATE for node in _all_nodes(livelocked))
+    # every node stayed in lockstep -- proof this is a synchronized cycle,
+    # not five independent (and coincidentally simultaneous) failures
+    assert len(set(terms_after)) == 1
+    # and the shared term climbed a lot, proving livelock rather than a freeze
+    assert min(terms_after) - max(terms_before) >= 10
+
+    randomized = make_cluster(n=5, seed=1)
+    randomized.run(STEPS)
+
+    assert len(leaders(randomized)) == 1
 
 
 def test_persist_before_reply_storage_failure_prevents_the_reply() -> None:
