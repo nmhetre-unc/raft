@@ -50,12 +50,20 @@ class SafetyViolation(AssertionError):
     caller with a history of its own -- `raft.sim.fuzz.Fuzzer`, for
     instance -- can catch a violation, attach its trace and the step at
     which it actually noticed, and re-raise the same exception.
+
+    `reason` holds `message` on its own, before the `(seed=..., step=...)`
+    suffix gets appended for the exception's displayed text. Comparing
+    `reason` (rather than parsing the formatted message back apart) is
+    how a shrinker recognizes "the same violation" after `seed` stays
+    fixed but `step` legitimately shifts once the trace producing it has
+    been edited down.
     """
 
     def __init__(
         self, message: str, *, seed: int, step: int, trace: tuple[object, ...] = ()
     ) -> None:
         super().__init__(f"{message} (seed={seed}, step={step})")
+        self.reason = message
         self.seed = seed
         self.step = step
         self.trace = trace
