@@ -44,12 +44,21 @@ class SafetyViolation(AssertionError):
     failed assertion under pytest, while still being a distinct,
     catchable type for anything (a fuzzer's shrinker, say) that wants to
     handle a safety violation specifically rather than any assertion.
+
+    `trace` defaults to empty: the three checkers below never populate it,
+    since they see only a `Cluster`, not whatever drove it there. A
+    caller with a history of its own -- `raft.sim.fuzz.Fuzzer`, for
+    instance -- can catch a violation, attach its trace and the step at
+    which it actually noticed, and re-raise the same exception.
     """
 
-    def __init__(self, message: str, *, seed: int, step: int) -> None:
+    def __init__(
+        self, message: str, *, seed: int, step: int, trace: tuple[object, ...] = ()
+    ) -> None:
         super().__init__(f"{message} (seed={seed}, step={step})")
         self.seed = seed
         self.step = step
+        self.trace = trace
 
 
 def check_election_safety(cluster: Cluster[RaftClusterNode]) -> None:

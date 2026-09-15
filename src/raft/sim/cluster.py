@@ -176,6 +176,21 @@ class Cluster[N: Node]:
         """Remove any active partition; see `Network.heal`."""
         self.network.heal()
 
+    def next_event_time(self) -> int | None:
+        """The time of the next pending event, or None if the cluster is idle.
+
+        A safe upper bound for anything that wants to move `clock` forward
+        without going through `step()` -- advancing past this could make a
+        later `run_until()` call try to move time backward and raise.
+        """
+        next_msg = self._next_message_time()
+        next_timer = self._next_timer_time()
+        if next_msg is None:
+            return next_timer
+        if next_timer is None:
+            return next_msg
+        return min(next_msg, next_timer)
+
     def _require_known(self, node_id: NodeId) -> None:
         if node_id not in self._storage:
             raise KeyError(f"no such node: {node_id!r}")

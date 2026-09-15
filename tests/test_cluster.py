@@ -153,6 +153,16 @@ def test_a_reply_to_a_now_crashed_node_is_dropped_before_being_queued() -> None:
     assert any(kind == "handle" and node_id == 0 for kind, node_id, *_rest in log)
 
 
+def test_next_event_time_reports_a_pending_message_with_no_live_nodes() -> None:
+    log: list[tuple] = []
+    cluster = Cluster(n=1, seed=1, node_factory=_make_factory(log), tick_interval_ms=1000)
+    cluster.network.set_delay(0, 0, 5)
+    cluster.network.send(0, 0, "self-message", now=0)
+    cluster.crash(0)  # no live node left, but the message is still in flight
+
+    assert cluster.next_event_time() == 5
+
+
 def test_run_stops_early_once_idle_rather_than_looping_pointlessly() -> None:
     cluster = Cluster(n=0, seed=1, node_factory=EchoNode)
 
