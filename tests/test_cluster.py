@@ -40,9 +40,8 @@ class EchoNode:
         self.log.append(("tick", self.node_id, now))
         return []
 
-    def handle(self, msg: Message, now: int) -> list[Message]:
+    def handle(self, payload: object, src: NodeId, now: int) -> list[Message]:
         self.events_seen += 1
-        src, payload = msg
         self.log.append(("handle", self.node_id, now, src, payload))
         if isinstance(payload, tuple) and payload and payload[0] == "reply":
             return []  # don't reply to a reply -- keeps this finite

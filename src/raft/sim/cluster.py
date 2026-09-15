@@ -1,14 +1,19 @@
 """Ties the virtual `Clock`, the fault-injecting `Network`, and per-node
 `Storage` together into one deterministic simulation harness.
 
-There is no Raft node yet: `Cluster` is generic over any node that speaks
-a tiny protocol --
+`Cluster` is generic over any node that speaks a tiny protocol --
 
     tick(now) -> list[(dst, payload)]
-    handle((src, payload), now) -> list[(dst, payload)]
+    handle(payload, src, now) -> list[(dst, payload)]
 
--- so it can be exercised today with a trivial echo node and handed a real
-Raft node later without changing anything in this file.
+-- so it works equally well with a trivial echo node (see
+`tests/test_cluster.py`) or a real `RaftNode` (see `raft.node`).
+`handle` takes `payload` and `src` as separate arguments rather than a
+combined `(src, payload)` tuple, because that's what typed node
+implementations actually want to write against: a real node's `handle`
+has a specific message type for `payload` and a plain `str`/`int` for
+`src`, and a tuple parameter can't express that distinction to mypy the
+way two separate ones can.
 
 Cluster is the only thing that ever reads `Clock.now()` and hands `now`
 to `Network.send`/`Network.deliver_next`; nodes never see a clock or a
@@ -53,8 +58,7 @@ from raft.storage import MemoryStorage, Storage
 
 NodeId = int
 Message = tuple[NodeId, object]
-"""An addressed, opaque payload: `(dst, payload)` when produced by a node
-via `tick`/`handle`, or `(src, payload)` when delivered to `handle`."""
+"""An addressed, opaque payload produced by a node via `tick`/`handle`: `(dst, payload)`."""
 
 
 class Node(Protocol):
@@ -64,8 +68,8 @@ class Node(Protocol):
         """Called for every live node at each cluster-wide tick instant."""
         ...
 
-    def handle(self, msg: Message, now: int) -> list[Message]:
-        """Called with an incoming `(src, payload)` message addressed to this node."""
+    def handle(self, payload: object, src: NodeId, now: int) -> list[Message]:
+        """Called with one incoming payload addressed to this node, from `src`."""
         ...
 
 
@@ -137,6 +141,10 @@ class Cluster[N: Node]:
         """Return the currently live node for `node_id`, or None if it's down."""
         return self._nodes.get(node_id)
 
+    def node_ids(self) -> list[NodeId]:
+        """Every node id this cluster knows about, whether live or crashed."""
+        return list(self._storage)
+
     def crash(self, node_id: NodeId) -> None:
         """Discard the node's volatile state; its `Storage` is left untouched.
 
@@ -182,7 +190,7 @@ class Cluster[N: Node]:
         node = self._nodes.get(dst)
         if node is None:
             return  # dst is down; the message is gone, not redelivered later
-        produced = node.handle((src, payload), t)
+        produced = node.handle(payload, src, t)
         self._route(dst, produced, t)
 
     def _fire_timer(self, t: int) -> None:
