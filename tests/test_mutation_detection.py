@@ -18,15 +18,16 @@ does would be worse than no test at all here.
 Summary from the actual run (n=5, steps=300, seeds 0..49):
 
 - Always truncating on a resend, even when it fully matches (the
-  duplicate-message bug): still 0/50 detected, *even with
-  `check_no_spurious_truncation` now wired into the sweep*. This isn't a
-  bug in that checker -- it's independently proven correct on a
-  hand-constructed violation in `tests/test_invariants.py` -- it's that
-  the fuzzer's natural chaos never actually produces the object-identity
-  mismatch it's watching for. See that test's docstring for the reason
-  why, confirmed by directly instrumenting `Storage.truncate_from` across
-  thousands of fuzzer-driven truncations. GAP, but now a *narrower and
-  better-understood* one than before.
+  duplicate-message bug): still 0/50 detected via the sweep, *even with
+  `check_no_spurious_truncation` now wired in*. But this isn't a blind
+  spot in the checker: constructing its triggering condition directly
+  (`test_mutation_1_triggering_condition_is_caught_when_constructed_directly`)
+  and running the real, mutated `_handle_append_entries` against it shows
+  it fires immediately. The gap is specifically that the fuzzer's chaos
+  never produces that condition on its own -- confirmed by directly
+  instrumenting `Storage.truncate_from` across thousands of fuzzer-driven
+  truncations. A narrower, better-understood claim than "the checker
+  can't see this": the checker can: the fuzzer doesn't reach it.
 - Advancing match_index on a *failed* reply, not just success: 0/50
   detected. GAP.
 - Skipping the AppendEntries consistency check entirely: 42/50 detected,
@@ -38,14 +39,20 @@ Summary from the actual run (n=5, steps=300, seeds 0..49):
 
 import pytest
 
-from raft.invariants import SafetyViolation
+from raft.invariants import SafetyViolation, check_no_spurious_truncation
 from raft.messages import AppendEntries, AppendEntriesReply, Message
-from raft.node import RaftNode, Role
+from raft.node import RaftNode, Role, raft_node_factory
+from raft.sim.cluster import Cluster
 from raft.sim.fuzz import Fuzzer
+from raft.storage import LogEntry
 
 N_NODES = 5
 STEPS_PER_SEED = 300
 SEED_COUNT = 50
+
+
+def make_cluster(n: int, seed: int) -> Cluster:
+    return Cluster(n=n, seed=seed, node_factory=raft_node_factory(n, seed))
 
 
 def _sweep() -> dict[int, str]:
@@ -60,29 +67,61 @@ def _sweep() -> dict[int, str]:
     return violations
 
 
-def test_mutation_always_truncate_on_resend_is_still_not_detected_by_the_sweep(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def _mutation_1_always_truncate_on_resend(
+    self: RaftNode, msg: Message, src: str, now: int
+) -> list[tuple[str, Message]]:
     """Mutation 1: always truncate+reappend from prev_log_index+1, even
     when the resent entries already match what's stored -- the exact
     duplicate-message case `_handle_append_entries`'s real implementation
-    goes out of its way to make a no-op.
+    goes out of its way to make a no-op. Shared by both tests below so
+    the sweep test and the direct-construction test are provably
+    exercising the identical mutation, not two that have drifted apart.
+    """
+    assert isinstance(msg, AppendEntries)
+    if msg.term < self.current_term:
+        return [(src, AppendEntriesReply(term=self.current_term, success=False))]
+
+    self.role = Role.FOLLOWER
+    self.leader_id = msg.leader_id
+    self._reset_election_deadline(now)
+
+    log = self.storage.load_log()
+    if msg.prev_log_index >= len(log) or log[msg.prev_log_index].term != msg.prev_log_term:
+        return [(src, AppendEntriesReply(term=self.current_term, success=False))]
+
+    # MUTATION: no "already matches" check -- always truncate+append.
+    if msg.entries:
+        conflict_index = msg.prev_log_index + 1
+        if conflict_index < len(log):
+            self.storage.truncate_from(conflict_index)
+        self.storage.append_entries(list(msg.entries))
+
+    return [(src, AppendEntriesReply(term=self.current_term, success=True))]
+
+
+def test_mutation_always_truncate_on_resend_is_still_not_detected_by_the_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mutation 1 against the 50-seed sweep: relies on the fuzzer's chaos
+    to construct the triggering condition on its own.
 
     `check_no_spurious_truncation` (added specifically for this gap,
     comparing log entry object identity, not just value) is wired into
     every sweep run. It works: `tests/test_invariants.py` proves it fires
-    on a hand-constructed "different object, same value" swap. But this
-    sweep still finds 0/50 -- because that specific condition never
-    actually arises here. Instrumenting `Storage.truncate_from` directly
-    across thousands of fuzzer-driven truncations (50 seeds heavy on
-    every action, then 200 more at n=7 with chaos weights skewed hard
-    toward crash/restart/partition/client-request) turned up plenty of
-    real truncations, but every single one was either (a) the exact same
-    object being removed and put back -- a resend from the *same*
-    leader's own unchanged storage always carries the same references,
-    since nothing ever clones a `LogEntry` -- or (b) a genuine value
-    change from real conflict resolution. Never (c), a different object
-    holding an equal value.
+    on a hand-constructed "different object, same value" swap, and
+    `test_mutation_1_triggering_condition_is_caught_when_constructed_directly`
+    below proves it fires on this *exact* mutated handler, not just the
+    checker in isolation. But this sweep still finds 0/50 -- because that
+    specific condition never actually arises here. Instrumenting
+    `Storage.truncate_from` directly across thousands of fuzzer-driven
+    truncations (50 seeds heavy on every action, then 200 more at n=7
+    with chaos weights skewed hard toward crash/restart/partition/
+    client-request) turned up plenty of real truncations, but every
+    single one was either (a) the exact same object being removed and put
+    back -- a resend from the *same* leader's own unchanged storage
+    always carries the same references, since nothing ever clones a
+    `LogEntry` -- or (b) a genuine value change from real conflict
+    resolution. Never (c), a different object holding an equal value.
 
     The reason turns out to be structural, not just unlucky: `next_index`
     only ever walks backward one step at a time, on rejection, and a
@@ -92,39 +131,91 @@ def test_mutation_always_truncate_on_resend_is_still_not_detected_by_the_sweep(
     Whatever a leader sends past that point is therefore always either
     new or genuinely conflicting, never "the follower already has this,
     just from someone else" -- which is exactly the case
-    `check_no_spurious_truncation` needs to fire. Closing this for real
-    would need either a fuzzer action that can construct that condition
-    directly, or a different signal entirely -- this test's job is to
-    keep that claim honest, not to assert it's impossible.
+    `check_no_spurious_truncation` needs to fire. Given the test below
+    proves the checker itself is sound, the gap here is specifically one
+    of *fuzzer reachability*: closing it for real would need a fuzzer
+    action built to construct that condition directly, not a better
+    checker.
     """
-
-    def mutated(self: RaftNode, msg: Message, src: str, now: int) -> list[tuple[str, Message]]:
-        assert isinstance(msg, AppendEntries)
-        if msg.term < self.current_term:
-            return [(src, AppendEntriesReply(term=self.current_term, success=False))]
-
-        self.role = Role.FOLLOWER
-        self.leader_id = msg.leader_id
-        self._reset_election_deadline(now)
-
-        log = self.storage.load_log()
-        if msg.prev_log_index >= len(log) or log[msg.prev_log_index].term != msg.prev_log_term:
-            return [(src, AppendEntriesReply(term=self.current_term, success=False))]
-
-        # MUTATION: no "already matches" check -- always truncate+append.
-        if msg.entries:
-            conflict_index = msg.prev_log_index + 1
-            if conflict_index < len(log):
-                self.storage.truncate_from(conflict_index)
-            self.storage.append_entries(list(msg.entries))
-
-        return [(src, AppendEntriesReply(term=self.current_term, success=True))]
-
-    monkeypatch.setattr(RaftNode, "_handle_append_entries", mutated)
+    monkeypatch.setattr(RaftNode, "_handle_append_entries", _mutation_1_always_truncate_on_resend)
 
     violations = _sweep()
 
     assert violations == {}, f"expected this known gap to stay undetected; found: {violations}"
+
+
+def test_mutation_1_triggering_condition_is_caught_when_constructed_directly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mutation 1, given its exact triggering condition by hand instead of
+    hoping the fuzzer's chaos produces it: does check_no_spurious_truncation
+    actually fire?
+
+    The condition is an AppendEntries carrying an entry the follower
+    already holds, where the entry in the message and the one already
+    stored are *different Python objects* despite being value-equal --
+    which the sweep test above establishes essentially never arises
+    through this simulator's normal leader/follower traffic (a resend
+    from the same leader's own storage always carries the same object
+    references). The most plausible real-world shape for it anyway is a
+    duplicated message redelivered after the follower already applied an
+    earlier copy of the same logical entry, but that redelivered copy
+    was reconstructed from a source other than what the follower already
+    has -- e.g. two leaders who each independently inherited the same
+    already-committed entry from a common ancestor, one of them now
+    retrying what it believes is still an unacknowledged send. This test
+    constructs exactly that end state directly: no election, no second
+    node's storage involved, just a follower that already has an entry
+    and a message that resends "the same" one as a distinct object.
+
+    If this fires, `check_no_spurious_truncation` is proven sound end to
+    end -- through the real, mutated `_handle_append_entries` entry
+    point, not just against a hand-edited `Storage` -- and the sweep
+    test's gap is purely about the fuzzer never reaching this state, a
+    materially narrower claim than "the checker can't see this bug."
+    """
+    monkeypatch.setattr(RaftNode, "_handle_append_entries", _mutation_1_always_truncate_on_resend)
+
+    cluster = make_cluster(n=2, seed=1)
+    follower = cluster.get_node(1)
+    assert follower is not None
+
+    # The follower already applied this entry, from an earlier delivery.
+    already_applied = LogEntry(term=1, command="x")
+    follower.storage.append_entries([already_applied])
+
+    # check_no_spurious_truncation's baseline, exactly as the fuzzer would
+    # have recorded it after observing this state on an earlier step.
+    history = {follower.node_id: follower.storage.load_log()}
+    check_no_spurious_truncation(cluster, history)  # sanity: nothing wrong yet
+
+    # A redelivered "duplicate" of the same logical entry -- but a
+    # genuinely different object, as if reconstructed from a different
+    # origin than what the follower already has. Value-equal,
+    # object-different: exactly what a message duplicated in flight looks
+    # like from the receiving end.
+    resent = LogEntry(term=1, command="x")
+    assert resent is not already_applied
+    assert resent == already_applied
+
+    retry_message = AppendEntries(
+        term=1,
+        leader_id="0",
+        prev_log_index=0,
+        prev_log_term=0,
+        entries=(resent,),
+        leader_commit=0,
+    )
+    follower.raft_node.handle(retry_message, src="0", now=0)
+
+    # Confirm the mutated handler actually did tear the entry down and
+    # rebuild it -- same value, different object -- before checking.
+    rebuilt = follower.storage.load_log()[1]
+    assert rebuilt == already_applied
+    assert rebuilt is not already_applied
+
+    with pytest.raises(SafetyViolation, match="torn down and rebuilt"):
+        check_no_spurious_truncation(cluster, history)
 
 
 def test_mutation_match_index_advances_on_failure_is_not_detected(

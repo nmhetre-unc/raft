@@ -39,20 +39,27 @@ injected replication bugs survive undetected:
 - Blind truncate-and-reappend on a duplicate AppendEntries: invisible to
   value-comparing checks, since the log looks identical afterward.
   check_no_spurious_truncation was added specifically for this (it compares
-  entry object identity, not value, and is proven correct on a
-  hand-constructed violation) — but wiring it into the sweep did **not**
-  close the gap. Instrumenting `Storage.truncate_from` directly across
-  thousands of fuzzer-driven truncations (250 seeds total, up to n=7 with
-  chaos weights skewed hard toward crash/restart/partition/client-request)
-  never once produced the "different object, same value" condition the
-  checker watches for. The reason is structural: `next_index` only ever
-  walks backward one rejection at a time, and a rejection means the
-  follower's entry at prev_log_index doesn't match — so by construction the
-  walk lands exactly on the point of genuine agreement before any entries
-  are ever sent. Whatever a leader sends past that point is therefore
-  always either new or a real conflict, never "the follower already has
-  this, from someone else." Still open; would need either a fuzzer action
-  built specifically to construct that condition, or a different signal.
+  entry object identity, not value) — but wiring it into the sweep did
+  **not** close the gap. Instrumenting `Storage.truncate_from` directly
+  across thousands of fuzzer-driven truncations (250 seeds total, up to
+  n=7 with chaos weights skewed hard toward crash/restart/partition/
+  client-request) never once produced the "different object, same value"
+  condition the checker watches for. The reason is structural: `next_index`
+  only ever walks backward one rejection at a time, and a rejection means
+  the follower's entry at prev_log_index doesn't match — so by construction
+  the walk lands exactly on the point of genuine agreement before any
+  entries are ever sent. Whatever a leader sends past that point is
+  therefore always either new or a real conflict, never "the follower
+  already has this, from someone else."
+  Narrowed the claim by constructing that triggering condition directly —
+  a follower holding an entry from one delivery, then resent as a
+  genuinely different (but value-equal) object, as a duplicate redelivered
+  after an earlier copy from a different origin was already applied — and
+  running the real, mutated `_handle_append_entries` against it by hand.
+  It fires. So the checker is proven sound end to end, and this is purely
+  a fuzzer-reachability gap, not a blind spot in what's being checked:
+  would need a fuzzer action built to construct that condition, not a
+  better checker.
 - match_index advancing on a failed reply: unobservable while nothing reads
   match_index for a safety decision. Expected to close in Milestone 4, when
   commitment reads it.
