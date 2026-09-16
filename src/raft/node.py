@@ -41,22 +41,29 @@ from the other -- an optimistic guess and a confirmed fact answer
 different questions, and conflating them is exactly how a leader would
 end up believing a follower has entries it never actually got.
 
-`AppendEntriesReply` doesn't echo back what it's replying to (no
-`prev_log_index`, no entry count), and replies can arrive out of order in
-this simulator. So the leader records, per peer, the `(prev_log_index,
+`AppendEntriesReply` carries the follower's own `match_index`: the index
+it has actually verified it holds, computed by the follower itself from
+the specific request it's answering (see `raft.messages`). An earlier
+design instead had the *leader* track, per peer, the `(prev_log_index,
 entry_count)` it most recently *sent* -- overwritten on every send -- and
-uses that recorded value to interpret whatever reply comes back, rather
-than recomputing it from `next_index[peer]`'s value *at reply time*. The
-difference matters: `next_index` can have already been advanced by a
-different, later-sent-but-earlier-arriving reply by the time a delayed
-one shows up, so recomputing from it would attribute a stale reply to
-the wrong request. Recording what was true at send time is not immune to
-every pathological interleaving of overlapping in-flight requests to the
-same peer, but it is exactly right for the case this system actually
-produces: a second send before the first's reply arrives only ever
+used that recorded value to interpret whatever reply came back, on the
+theory that a second send before the first's reply arrives only ever
 carries a superset of what the first one sent (the log only grows), so
-whichever reply is (mis)attributed to the latest record still lands on
-the correct final `match_index`.
+whichever reply got (mis)attributed to the latest record would still land
+on the correct final `match_index`. That theory was wrong: the fuzzer
+found a live counterexample (see `BUGS.md`) where the reply to the
+*first*, *smaller* send arrived after a second, larger send had already
+overwritten the record, so the small reply got interpreted against the
+large one -- inflating `match_index` past what the peer had actually
+confirmed, in one seed enough to commit an entry with only two of five
+nodes truly holding it. Having the follower report its own confirmed
+index removes the guesswork entirely: whatever a given reply says, it says
+about *itself*, correctly, regardless of what other requests are also in
+flight. The leader's only remaining job is to never let a reply move
+`match_index` backward (`_handle_append_entries_reply` takes the max, not
+an overwrite) -- an old, delayed reply reporting a smaller confirmed index
+than one already recorded is simply stale, not corrupt, and is expected
+to arrive that way sometimes.
 
 `RaftNode` never sends anything and never reads a clock. `tick(now)` and
 `handle(msg, src, now)` both return `(destination, Message)` pairs for
@@ -182,10 +189,6 @@ class RaftNode:
         # module docstring for why these are never derived from each other.
         self.next_index: dict[str, int] = {}
         self.match_index: dict[str, int] = {}
-        # Leader-only: (prev_log_index, entry_count) most recently sent to
-        # each peer, recorded at send time -- see _handle_append_entries_reply
-        # for why a reply can't be interpreted without this.
-        self._outstanding: dict[str, tuple[int, int]] = {}
         # The deadline's first real draw is deferred to the first tick()
         # (see there for why): at construction time this node has no idea
         # what "now" actually is, and a restart can happen arbitrarily far
@@ -350,7 +353,8 @@ class RaftNode:
         if msg.leader_commit > self.commit_index:
             self.commit_index = min(msg.leader_commit, last_new_index)
 
-        return [(src, AppendEntriesReply(term=self.current_term, success=True))]
+        reply = AppendEntriesReply(term=self.current_term, success=True, match_index=last_new_index)
+        return [(src, reply)]
 
     def _handle_append_entries_reply(
         self, msg: AppendEntriesReply, src: str, now: int
@@ -360,30 +364,19 @@ class RaftNode:
         if self.role is not Role.LEADER:
             return []  # no longer leading; not ours to act on anymore
 
-        # AppendEntriesReply doesn't echo prev_log_index or how many
-        # entries were sent, so there's no way to interpret "success" or
-        # "failure" without separately knowing what this reply is even
-        # answering. Recomputing that from the *current* next_index[src]
-        # would be simpler, but it's wrong here: replies can arrive out of
-        # order in this simulator, so by the time a delayed reply shows
-        # up, next_index may already reflect a *later* send this reply
-        # knows nothing about. Recording what was actually sent, at the
-        # moment it was sent, is the only value that's still correct no
-        # matter when (or in what order) the reply for it comes back.
-        outstanding = self._outstanding.get(src)
-        if outstanding is None:
-            return []  # nothing recorded to interpret this reply against
-        prev_log_index, sent_count = outstanding
-
         if msg.success:
-            new_match_index = prev_log_index + sent_count
-            assert new_match_index >= self.match_index[src], (
-                f"match_index[{src!r}] would move backward: "
-                f"{self.match_index[src]} -> {new_match_index}"
-            )
-            self.match_index[src] = new_match_index
-            self.next_index[src] = new_match_index + 1
-            self._advance_commit_index()
+            # msg.match_index is the follower's own report of what IT
+            # verified, computed from the specific request this reply
+            # answers -- not this leader's guess about what it sent. Only
+            # advance, never overwrite: replies can arrive out of order in
+            # this simulator, and an old, delayed reply reporting a
+            # smaller confirmed index than one already recorded is simply
+            # stale, not a sign anything went backward on the follower
+            # (see the module docstring for the bug this design replaced).
+            if msg.match_index > self.match_index[src]:
+                self.match_index[src] = msg.match_index
+                self.next_index[src] = msg.match_index + 1
+                self._advance_commit_index()
             return []
 
         # Failure, and (per the checks above) at our current term, not a
@@ -463,7 +456,6 @@ class RaftNode:
         last_index = self.storage.last_log_index()
         self.next_index = dict.fromkeys(self.peers, last_index + 1)
         self.match_index = dict.fromkeys(self.peers, 0)
-        self._outstanding = {}
 
         if self.append_noop_on_election:
             # A leader can only ever commit an entry from its OWN current
@@ -505,17 +497,9 @@ class RaftNode:
         return out
 
     def _build_append_entries_for(self, peer: str, log: list[LogEntry]) -> AppendEntries:
-        """Build the AppendEntries `peer` should get right now, from its next_index.
-
-        Also records what was sent as the new outstanding request for
-        `peer` -- overwriting whatever was recorded before, since a reply
-        for the earlier one, if it's still coming, will be interpreted
-        against this newer record instead (see
-        `_handle_append_entries_reply`).
-        """
+        """Build the AppendEntries `peer` should get right now, from its next_index."""
         prev_log_index = self.next_index[peer] - 1
         entries = tuple(log[self.next_index[peer] :])
-        self._outstanding[peer] = (prev_log_index, len(entries))
         return AppendEntries(
             term=self.current_term,
             leader_id=self.node_id,
@@ -579,9 +563,10 @@ class RaftClusterNode:
     `(dst, payload)` pairs it produces, and otherwise gets entirely out of
     the way. The handful of fields external callers (tests, invariant
     checkers) actually need to inspect -- `role`, `current_term`,
-    `voted_for`, `leader_id`, `node_id`, `storage`, `commit_index` -- are
-    typed properties reading straight through to the real node; anything
-    else falls back through `__getattr__`, untyped but still reachable.
+    `voted_for`, `leader_id`, `node_id`, `storage`, `commit_index`,
+    `last_applied` -- are typed properties reading straight through to the
+    real node; anything else falls back through `__getattr__`, untyped but
+    still reachable.
     """
 
     def __init__(self, raft_node: RaftNode) -> None:
@@ -617,6 +602,10 @@ class RaftClusterNode:
     @property
     def commit_index(self) -> int:
         return self.raft_node.commit_index
+
+    @property
+    def last_applied(self) -> int:
+        return self.raft_node.last_applied
 
     def tick(self, now: int) -> list[tuple[int, object]]:
         return [(int(dst), msg) for dst, msg in self.raft_node.tick(now)]

@@ -64,11 +64,15 @@ from dataclasses import dataclass
 from enum import Enum
 
 from raft.invariants import (
+    AppliedEntryHistory,
+    CommittedEntry,
     SafetyViolation,
     check_election_safety,
     check_leader_append_only,
+    check_leader_completeness,
     check_log_matching,
     check_no_spurious_truncation,
+    check_state_machine_safety,
 )
 from raft.node import RaftClusterNode, Role, raft_node_factory
 from raft.sim.cluster import Cluster
@@ -279,6 +283,8 @@ class Fuzzer:
         self._heal_at = 0
         self._append_only_history: dict[str, list[LogEntry]] = {}
         self._no_spurious_truncation_history: dict[str, list[LogEntry]] = {}
+        self._leader_completeness_history: dict[int, CommittedEntry] = {}
+        self._state_machine_safety_history = AppliedEntryHistory()
 
     def _choose_action(self) -> Action:
         actions = list(Action)
@@ -510,6 +516,8 @@ class Fuzzer:
             check_leader_append_only(self.cluster, self._append_only_history)
             check_no_spurious_truncation(self.cluster, self._no_spurious_truncation_history)
             check_log_matching(self.cluster)
+            check_leader_completeness(self.cluster, self._leader_completeness_history)
+            check_state_machine_safety(self.cluster, self._state_machine_safety_history)
         except SafetyViolation as violation:
             violation.step = step_index
             violation.trace = tuple(self.trace)

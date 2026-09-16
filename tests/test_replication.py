@@ -184,7 +184,7 @@ def test_follower_with_a_matching_prefix_accepts_and_appends() -> None:
 
     reply = node.handle(msg, src="leader", now=0)
 
-    assert reply == [("leader", AppendEntriesReply(term=1, success=True))]
+    assert reply == [("leader", AppendEntriesReply(term=1, success=True, match_index=2))]
     assert storage.load_log() == [SENTINEL, LogEntry(term=1, command="a"), new_entry]
 
 
@@ -241,7 +241,7 @@ def test_conflicting_entry_and_everything_after_it_is_deleted_before_appending()
 
     reply = node.handle(msg, src="leader", now=0)
 
-    assert reply == [("leader", AppendEntriesReply(term=2, success=True))]
+    assert reply == [("leader", AppendEntriesReply(term=2, success=True, match_index=3))]
     assert storage.load_log() == [SENTINEL, LogEntry(term=1, command="a"), new_b, new_c]
 
 
@@ -269,7 +269,7 @@ def test_resending_entries_the_follower_already_has_is_a_true_noop() -> None:
     reply = node.handle(msg, src="leader", now=0)
     after = storage.load_log()
 
-    assert reply == [("leader", AppendEntriesReply(term=1, success=True))]
+    assert reply == [("leader", AppendEntriesReply(term=1, success=True, match_index=2))]
     # Equal is not the point -- these must be the *same objects*, proving
     # storage was never truncated and reappended, only left alone.
     assert len(before) == len(after)
@@ -319,7 +319,7 @@ def test_longer_follower_log_is_preserved_unless_the_leader_actually_conflicts()
     reply = node.handle(matching_msg, src="leader", now=0)
     after_matching = storage.load_log()
 
-    assert reply == [("leader", AppendEntriesReply(term=1, success=True))]
+    assert reply == [("leader", AppendEntriesReply(term=1, success=True, match_index=2))]
     assert after_matching == before  # "c" survives: no conflict was ever sent
     assert all(a is b for a, b in zip(before, after_matching, strict=True))
 
@@ -347,19 +347,21 @@ def test_longer_follower_log_is_preserved_unless_the_leader_actually_conflicts()
 
 def test_successful_reply_advances_next_index_and_match_index() -> None:
     storage = MemoryStorage()
-    storage.append_entries([LogEntry(term=1, command="a"), LogEntry(term=1, command="b")])
     node = RaftNode("0", ["1"], storage, rng=random.Random(1))
     node.role = Role.LEADER
     node.leader_id = "0"
     node.next_index = {"1": 1}
     node.match_index = {"1": 0}
 
-    node._send_append_entries(now=0)  # records outstanding = (0, 2) for "1"
-
-    out = node.handle(AppendEntriesReply(term=node.current_term, success=True), src="1", now=1)
+    # The reply is self-describing -- it names the index it confirms --
+    # so, unlike the old _outstanding-based design, nothing needs to have
+    # been sent first for this to mean anything.
+    out = node.handle(
+        AppendEntriesReply(term=node.current_term, success=True, match_index=2), src="1", now=1
+    )
 
     assert out == []
-    assert node.match_index["1"] == 2  # prev_log_index(0) + entries sent(2)
+    assert node.match_index["1"] == 2
     assert node.next_index["1"] == 3
 
 
@@ -371,8 +373,6 @@ def test_failed_reply_decrements_next_index_and_produces_a_retry() -> None:
     node.leader_id = "0"
     node.next_index = {"1": 3}
     node.match_index = {"1": 0}
-
-    node._send_append_entries(now=0)  # records outstanding = (2, 0) for "1"
 
     out = node.handle(AppendEntriesReply(term=node.current_term, success=False), src="1", now=1)
 
@@ -394,7 +394,6 @@ def test_next_index_never_goes_below_1() -> None:
     node.next_index = {"1": 1}
     node.match_index = {"1": 0}
 
-    node._send_append_entries(now=0)
     node.handle(AppendEntriesReply(term=node.current_term, success=False), src="1", now=1)
 
     assert node.next_index["1"] == 1  # clamped at 1, not decremented to 0
@@ -408,30 +407,14 @@ def test_stale_reply_from_an_older_term_is_ignored() -> None:
     node.leader_id = "0"
     node.next_index = {"1": 1}
     node.match_index = {"1": 0}
-    node._send_append_entries(now=0)
 
-    out = node.handle(AppendEntriesReply(term=3, success=True), src="1", now=1)
+    # A generous match_index, to prove even that doesn't get applied once
+    # the term check alone should reject this reply outright.
+    out = node.handle(AppendEntriesReply(term=3, success=True, match_index=5), src="1", now=1)
 
     assert out == []
     assert node.match_index["1"] == 0  # untouched
     assert node.next_index["1"] == 1  # untouched
-
-
-def test_reply_with_no_recorded_outstanding_request_is_ignored() -> None:
-    storage = MemoryStorage()
-    node = RaftNode("0", ["1"], storage, rng=random.Random(1))
-    node.role = Role.LEADER
-    node.leader_id = "0"
-    node.next_index = {"1": 1}
-    node.match_index = {"1": 0}
-    # Note: no _send_append_entries() call -- nothing has ever been sent
-    # to "1", so there's no outstanding record to interpret this against.
-
-    out = node.handle(AppendEntriesReply(term=node.current_term, success=True), src="1", now=0)
-
-    assert out == []
-    assert node.match_index["1"] == 0
-    assert node.next_index["1"] == 1
 
 
 def test_reply_arriving_after_stepping_down_is_ignored() -> None:
@@ -441,42 +424,39 @@ def test_reply_arriving_after_stepping_down_is_ignored() -> None:
     node.leader_id = "0"
     node.next_index = {"1": 1}
     node.match_index = {"1": 0}
-    node._send_append_entries(now=0)
 
     node.role = Role.FOLLOWER  # stepped down (e.g. discovered a legitimate leader)
 
-    out = node.handle(AppendEntriesReply(term=node.current_term, success=True), src="1", now=1)
+    out = node.handle(
+        AppendEntriesReply(term=node.current_term, success=True, match_index=5), src="1", now=1
+    )
 
     assert out == []
     assert node.match_index["1"] == 0  # untouched
 
 
-def test_out_of_order_replies_do_not_corrupt_match_index() -> None:
+def test_out_of_order_replies_never_move_match_index_backward() -> None:
     storage = MemoryStorage()
-    storage.append_entries([LogEntry(term=1, command=c) for c in "abcde"])  # 5 entries
     node = RaftNode("0", ["1"], storage, rng=random.Random(1))
     node.role = Role.LEADER
     node.leader_id = "0"
     node.next_index = {"1": 1}
     node.match_index = {"1": 0}
 
-    # Two sends went out to "1" before either got a reply -- exactly what
-    # this leader does whenever a heartbeat or append_command fires again
-    # before the previous outstanding request was acknowledged. Only the
-    # most recent is ever recorded; here that's the second, larger one.
-    node._outstanding["1"] = (0, 3)  # first send: entries a, b, c
-    node._outstanding["1"] = (0, 5)  # second send: entries a..e (superset)
-
-    # The reply to the *second* send arrives first.
-    node.handle(AppendEntriesReply(term=node.current_term, success=True), src="1", now=1)
+    # The reply to a later, larger send arrives first.
+    node.handle(
+        AppendEntriesReply(term=node.current_term, success=True, match_index=5), src="1", now=1
+    )
     assert node.match_index["1"] == 5
     assert node.next_index["1"] == 6
 
-    # The reply to the *first* (smaller, already-superseded) send arrives
-    # second. Nothing sent anything new to "1" in between, so it's
-    # attributed to the same (still-recorded) second-send parameters --
-    # a harmless re-application of the same values, not a regression.
-    node.handle(AppendEntriesReply(term=node.current_term, success=True), src="1", now=2)
+    # A reply to an earlier, smaller send -- delayed, arriving second --
+    # is telling the truth about what THAT request confirmed; it's just
+    # stale relative to what a newer reply already established. It must
+    # not move match_index backward.
+    node.handle(
+        AppendEntriesReply(term=node.current_term, success=True, match_index=3), src="1", now=2
+    )
 
     assert node.match_index["1"] == 5  # never moved backward
     assert node.next_index["1"] == 6
@@ -540,12 +520,11 @@ def test_leader_commits_an_index_a_majority_of_match_index_has_reached() -> None
     node.leader_id = "0"
     node.next_index = dict.fromkeys(node.peers, 6)
     node.match_index = {"1": 5, "2": 0, "3": 0, "4": 0}
-    node._outstanding = {"2": (0, 5)}  # peer "2" is about to confirm index 5 too
 
     assert node.commit_index == 0
 
     # Leader (implicit) + "1" + "2" now = 3 of 5 -- a majority.
-    node.handle(AppendEntriesReply(term=1, success=True), src="2", now=0)
+    node.handle(AppendEntriesReply(term=1, success=True, match_index=5), src="2", now=0)
 
     assert node.commit_index == 5
 
@@ -559,11 +538,10 @@ def test_leader_does_not_commit_an_earlier_term_entry_despite_a_full_majority() 
     node.leader_id = "0"
     node.next_index = {"1": 2, "2": 2}
     node.match_index = {"1": 1, "2": 0}
-    node._outstanding = {"2": (0, 1)}
 
     # Every node in the cluster -- a full, not just bare, majority -- ends
     # up holding index 1 once this reply lands.
-    node.handle(AppendEntriesReply(term=3, success=True), src="2", now=0)
+    node.handle(AppendEntriesReply(term=3, success=True, match_index=1), src="2", now=0)
 
     assert node.commit_index == 0  # never committed: index 1's entry is term 1, not 3
 
@@ -583,11 +561,10 @@ def test_committing_a_current_term_entry_retroactively_commits_earlier_entries_b
     node.leader_id = "0"
     node.next_index = {"1": 4, "2": 4}
     node.match_index = {"1": 3, "2": 0}
-    node._outstanding = {"2": (0, 3)}
 
     assert node.commit_index == 0
 
-    node.handle(AppendEntriesReply(term=3, success=True), src="2", now=0)
+    node.handle(AppendEntriesReply(term=3, success=True, match_index=3), src="2", now=0)
 
     # Reaching index 3 (this leader's own term) in one step also commits
     # indices 1 and 2 -- despite being from an earlier term, which on

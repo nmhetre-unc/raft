@@ -3,6 +3,8 @@
 import pytest
 
 from raft.invariants import (
+    AppliedEntryHistory,
+    CommittedEntry,
     SafetyViolation,
     check_election_safety,
     check_leader_append_only,
@@ -266,18 +268,199 @@ def test_checkers_skip_crashed_nodes_without_erroring() -> None:
     check_log_matching(cluster)
     check_leader_append_only(cluster, {})
     check_no_spurious_truncation(cluster, {})
+    check_leader_completeness(cluster, {})
+    check_state_machine_safety(cluster, AppliedEntryHistory())
 
 
-# -- Not yet implemented --
+# -- Leader Completeness --
 
 
-def test_check_leader_completeness_is_not_yet_implemented() -> None:
+def test_check_leader_completeness_passes_on_a_healthy_cluster() -> None:
+    # append_noop_on_election=True so every elected leader actually has
+    # something at its own current term to commit -- without it, nothing
+    # in an election-only run ever advances commit_index at all (see
+    # raft.node's module docstring), and the test below would exercise
+    # nothing.
+    cluster = Cluster(
+        n=5,
+        seed=1,
+        node_factory=raft_node_factory(5, 1, append_noop_on_election=True),
+        tick_interval_ms=10,
+    )
+    history: dict[int, CommittedEntry] = {}
+
+    for _ in range(RUN_STEPS):
+        if not cluster.step():
+            break
+        check_leader_completeness(cluster, history)  # must never raise
+
+    assert history  # sanity: something was actually committed and checked
+
+
+def test_check_leader_completeness_raises_when_a_later_leader_lacks_a_committed_entry() -> None:
     cluster = make_cluster(n=3, seed=1)
-    with pytest.raises(NotImplementedError):
-        check_leader_completeness(cluster)
+    history: dict[int, CommittedEntry] = {}
+
+    committed_node = cluster.get_node(0)
+    assert committed_node is not None
+    committed_node.storage.append_entries([LogEntry(term=1, command="a")])
+    committed_node.raft_node.current_term = 1
+    committed_node.raft_node.commit_index = 1
+    check_leader_completeness(cluster, history)  # records index 1 as committed at term 1
+    assert history == {1: CommittedEntry(term=1, established_at_term=1)}
+
+    later_leader = cluster.get_node(1)
+    assert later_leader is not None
+    later_leader.raft_node.role = Role.LEADER
+    later_leader.raft_node.current_term = 5  # later than the term index 1 was committed at
+    # later_leader's log is still empty -- missing the committed entry entirely.
+
+    with pytest.raises(SafetyViolation, match="missing entry"):
+        check_leader_completeness(cluster, history)
 
 
-def test_check_state_machine_safety_is_not_yet_implemented() -> None:
+def test_check_leader_completeness_ignores_a_leader_at_or_below_the_committed_term() -> None:
+    """Only a leader from a LATER term is bound by an earlier commitment --
+    Figure 8's restriction is about committing forward, not a constraint
+    on what a same-or-earlier-term node's log looks like."""
     cluster = make_cluster(n=3, seed=1)
-    with pytest.raises(NotImplementedError):
-        check_state_machine_safety(cluster)
+    history: dict[int, CommittedEntry] = {}
+
+    committed_node = cluster.get_node(0)
+    assert committed_node is not None
+    committed_node.storage.append_entries([LogEntry(term=3, command="a")])
+    committed_node.raft_node.current_term = 3
+    committed_node.raft_node.commit_index = 1
+    check_leader_completeness(cluster, history)
+    assert history == {1: CommittedEntry(term=3, established_at_term=3)}
+
+    leader = cluster.get_node(1)
+    assert leader is not None
+    leader.raft_node.role = Role.LEADER
+    leader.raft_node.current_term = 3  # same term as the commitment, not later
+    # leader's log is empty -- would be missing it, but isn't bound by it.
+
+    check_leader_completeness(cluster, history)  # must not raise
+
+
+def test_check_leader_completeness_ignores_a_leader_that_predates_a_ridden_along_entry() -> None:
+    """A leader elected between an entry's own term and the later term
+    whose commit decision actually rode it along is not bound by it --
+    it was never part of the guarantee that made the entry safe.
+
+    This is the regression the term/established_at_term split in
+    `CommittedEntry` exists for: gating on the entry's own term (3, here)
+    instead of the term whose decision actually committed it (5) would
+    wrongly flag `leader`, elected at term 4 -- honestly, before index 1
+    was ever protected -- as having "lost" something it was never
+    guaranteed to have in the first place.
+    """
+    cluster = make_cluster(n=3, seed=1)
+    history: dict[int, CommittedEntry] = {}
+
+    committed_node = cluster.get_node(0)
+    assert committed_node is not None
+    # index 1 (term 3) only becomes safe once index 2 (term 5, THIS node's
+    # current term) commits alongside it -- Figure 8's rule, riding an
+    # earlier-term entry along beneath a current-term one.
+    committed_node.storage.append_entries(
+        [LogEntry(term=3, command="old"), LogEntry(term=5, command="new")]
+    )
+    committed_node.raft_node.current_term = 5
+    committed_node.raft_node.commit_index = 2
+    check_leader_completeness(cluster, history)
+    assert history == {
+        1: CommittedEntry(term=3, established_at_term=5),
+        2: CommittedEntry(term=5, established_at_term=5),
+    }
+
+    leader = cluster.get_node(1)
+    assert leader is not None
+    leader.raft_node.role = Role.LEADER
+    leader.raft_node.current_term = 4  # between the entry's term (3) and term 5
+    # leader's log is empty -- would be "missing" index 1 under the wrong gate.
+
+    check_leader_completeness(cluster, history)  # must not raise
+
+
+# -- State Machine Safety --
+
+
+def test_check_state_machine_safety_passes_when_nothing_has_been_applied_yet() -> None:
+    """Nothing in this codebase advances last_applied yet (see raft.node's
+    module docstring) -- so on a real, healthy run this checker currently
+    has nothing to ever observe. Implemented now regardless, so it's
+    ready the moment something starts advancing it."""
+    cluster = make_cluster(n=5, seed=1)
+    cluster.run(RUN_STEPS)
+    history = AppliedEntryHistory()
+
+    check_state_machine_safety(cluster, history)  # must not raise
+
+    assert history.applied == {}
+
+
+def test_check_state_machine_safety_raises_when_two_nodes_apply_different_entries() -> None:
+    cluster = make_cluster(n=3, seed=1)
+    history = AppliedEntryHistory()
+
+    node_a = cluster.get_node(0)
+    node_b = cluster.get_node(1)
+    assert node_a is not None
+    assert node_b is not None
+
+    node_a.storage.append_entries([LogEntry(term=1, command="a")])
+    node_a.raft_node.last_applied = 1
+    check_state_machine_safety(cluster, history)
+    assert history.applied == {1: LogEntry(term=1, command="a")}
+
+    node_b.storage.append_entries([LogEntry(term=2, command="DIFFERENT")])
+    node_b.raft_node.last_applied = 1
+
+    with pytest.raises(SafetyViolation, match="applied"):
+        check_state_machine_safety(cluster, history)
+
+
+def test_check_state_machine_safety_allows_the_same_node_reapplying_unchanged() -> None:
+    cluster = make_cluster(n=3, seed=1)
+    history = AppliedEntryHistory()
+
+    node = cluster.get_node(0)
+    assert node is not None
+    node.storage.append_entries([LogEntry(term=1, command="a")])
+    node.raft_node.last_applied = 1
+    check_state_machine_safety(cluster, history)
+
+    check_state_machine_safety(cluster, history)  # nothing new -- must not raise
+
+
+def test_check_state_machine_safety_tracks_each_nodes_progress_independently() -> None:
+    """A slower node's own catch-up range must still get checked against
+    what a faster node already recorded -- not silently skipped because a
+    shared high-water mark had already moved past its target index. This
+    is exactly why AppliedEntryHistory keeps a per-node cursor rather than
+    one shared mark the way check_leader_completeness's history does."""
+    cluster = make_cluster(n=3, seed=1)
+    history = AppliedEntryHistory()
+
+    fast_node = cluster.get_node(0)
+    slow_node = cluster.get_node(1)
+    assert fast_node is not None
+    assert slow_node is not None
+
+    fast_node.storage.append_entries(
+        [LogEntry(term=1, command="a"), LogEntry(term=1, command="b")]
+    )
+    fast_node.raft_node.last_applied = 2
+    check_state_machine_safety(cluster, history)
+    assert history.applied == {
+        1: LogEntry(term=1, command="a"),
+        2: LogEntry(term=1, command="b"),
+    }
+
+    # The slow node only now catches up to index 1 -- with a CONFLICTING value.
+    slow_node.storage.append_entries([LogEntry(term=1, command="DIFFERENT")])
+    slow_node.raft_node.last_applied = 1
+
+    with pytest.raises(SafetyViolation, match="applied"):
+        check_state_machine_safety(cluster, history)

@@ -5,36 +5,53 @@ correctness -- via `monkeypatch`, never committed to `src/raft/node.py`
 itself -- and runs the same 50-seed sweep `tests/test_fuzz_sweep.py`
 runs, to answer one question: does the fuzzer actually notice?
 
-The honest answer, found by actually running this, is "not always." Two
-of the four mutations here are **known, tracked gaps**: the sweep passes
-all 50 seeds even though the mutated code is genuinely wrong. Those
-tests assert the current (unfortunate) truth -- zero detections -- on
+The honest answer, found by actually running this, is "not always." One
+of the four mutations here is a **known, tracked gap**: the sweep passes
+all 50 seeds even though the mutated code is genuinely wrong. That test
+asserts the current (unfortunate) truth -- zero detections -- on
 purpose, so that this file itself is the record of the gap, and so that
-the day some future invariant check starts catching one, this test
-starts failing and demands to be updated rather than staying silently
-stale. A test that always passes regardless of what `check_*` actually
-does would be worse than no test at all here.
+the day some future invariant check starts catching it, this test starts
+failing and demands to be updated rather than staying silently stale. A
+test that always passes regardless of what `check_*` actually does would
+be worse than no test at all here.
 
-Summary from the actual run (n=5, steps=300, seeds 0..49):
+Summary from the actual run (n=5, steps=300, seeds 0..49), after
+`check_leader_completeness` and `check_state_machine_safety` (Milestone
+4's commit-index-dependent checks) were wired in:
 
 - Always truncating on a resend, even when it fully matches (the
-  duplicate-message bug): still 0/50 detected via the sweep, *even with
-  `check_no_spurious_truncation` now wired in*. But this isn't a blind
-  spot in the checker: constructing its triggering condition directly
-  (`test_mutation_1_triggering_condition_is_caught_when_constructed_directly`)
-  and running the real, mutated `_handle_append_entries` against it shows
-  it fires immediately. The gap is specifically that the fuzzer's chaos
-  never produces that condition on its own -- confirmed by directly
-  instrumenting `Storage.truncate_from` across thousands of fuzzer-driven
-  truncations. A narrower, better-understood claim than "the checker
-  can't see this": the checker can: the fuzzer doesn't reach it.
-- Advancing match_index on a *failed* reply, not just success: 0/50
-  detected. GAP.
-- Skipping the AppendEntries consistency check entirely: 42/50 detected,
-  always via check_log_matching.
+  duplicate-message bug): `check_no_spurious_truncation`'s own specific
+  signature ("different object, same value") still never arises through
+  the sweep -- confirmed exactly as before, by directly instrumenting
+  `Storage.truncate_from` and by
+  `test_mutation_1_triggering_condition_is_caught_when_constructed_directly`,
+  which proves the checker fires on this exact mutated handler once that
+  condition is constructed by hand. But `check_leader_completeness` now
+  catches 2/50 seeds anyway, via a *different* consequence of the same
+  mutation: always truncating from `prev_log_index + 1` discards
+  anything a follower holds beyond the resent range too, and on those 2
+  seeds that collateral damage later mattered to an election. Still a
+  narrower claim than "the checker can't see this": `check_no_spurious_
+  truncation`'s own trigger remains a fuzzer-reachability gap; it's just
+  no longer true that *nothing* catches this mutation.
+- Advancing match_index/next_index on a rejected reply, trusting it
+  regardless of the reply's success flag: 4/50 detected, always via
+  `check_leader_completeness` -- some later, honestly elected leader
+  ends up missing an entry an earlier leader believed it had committed,
+  purely because of the corrupted match_index. This is exactly the gap
+  Leader Completeness was added to close, and it does. (The original
+  version of this mutation directly corrupted a leader-side
+  `_outstanding` record that no longer exists: fixing the real bug that
+  record turned out to enable, found via this exact checker on
+  *unmutated* code, removed it -- see BUGS.md. The mutation is rewritten
+  here to recreate the same class of bug against the message shape that
+  replaced it.)
+- Skipping the AppendEntries consistency check entirely: 33/50 detected
+  -- 32 via check_log_matching, 1 via check_leader_completeness (see that
+  test for why one seed's report differs from the rest).
 - Leader-side next_index initialized to 1 instead of last_log_index + 1:
-  0/50 detected -- and on reflection this one may not be a safety gap at
-  all, just a wasteful one (see its test for why).
+  0/50 detected -- GAP, and on reflection this one may not be a safety
+  gap at all, just a wasteful one (see its test for why).
 """
 
 import pytest
@@ -96,10 +113,12 @@ def _mutation_1_always_truncate_on_resend(
             self.storage.truncate_from(conflict_index)
         self.storage.append_entries(list(msg.entries))
 
-    return [(src, AppendEntriesReply(term=self.current_term, success=True))]
+    match_index = msg.prev_log_index + len(msg.entries)
+    reply = AppendEntriesReply(term=self.current_term, success=True, match_index=match_index)
+    return [(src, reply)]
 
 
-def test_mutation_always_truncate_on_resend_is_still_not_detected_by_the_sweep(
+def test_mutation_always_truncate_on_resend_is_occasionally_caught_a_different_way(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Mutation 1 against the 50-seed sweep: relies on the fuzzer's chaos
@@ -111,37 +130,39 @@ def test_mutation_always_truncate_on_resend_is_still_not_detected_by_the_sweep(
     on a hand-constructed "different object, same value" swap, and
     `test_mutation_1_triggering_condition_is_caught_when_constructed_directly`
     below proves it fires on this *exact* mutated handler, not just the
-    checker in isolation. But this sweep still finds 0/50 -- because that
-    specific condition never actually arises here. Instrumenting
+    checker in isolation. But *that specific signature* still never
+    arises here, confirmed the same way as before: instrumenting
     `Storage.truncate_from` directly across thousands of fuzzer-driven
-    truncations (50 seeds heavy on every action, then 200 more at n=7
-    with chaos weights skewed hard toward crash/restart/partition/
-    client-request) turned up plenty of real truncations, but every
-    single one was either (a) the exact same object being removed and put
-    back -- a resend from the *same* leader's own unchanged storage
-    always carries the same references, since nothing ever clones a
-    `LogEntry` -- or (b) a genuine value change from real conflict
-    resolution. Never (c), a different object holding an equal value.
+    truncations turned up plenty of real truncations, but every single
+    one was either (a) the exact same object being removed and put back
+    -- a resend from the *same* leader's own unchanged storage always
+    carries the same references, since nothing ever clones a `LogEntry`
+    -- or (b) a genuine value change from real conflict resolution.
+    Never (c), a different object holding an equal value. That part of
+    the original finding stands: `next_index` only ever walks backward
+    one step at a time, on rejection, so the walk necessarily lands
+    exactly on the point of genuine agreement before any entries are
+    ever included in a message -- structurally, not just by chance,
+    `check_no_spurious_truncation`'s own trigger is unreachable here.
 
-    The reason turns out to be structural, not just unlucky: `next_index`
-    only ever walks backward one step at a time, on rejection, and a
-    rejection means the follower's entry at `prev_log_index` doesn't
-    match -- so the walk necessarily lands exactly on the point of
-    genuine agreement before any entries are ever included in a message.
-    Whatever a leader sends past that point is therefore always either
-    new or genuinely conflicting, never "the follower already has this,
-    just from someone else" -- which is exactly the case
-    `check_no_spurious_truncation` needs to fire. Given the test below
-    proves the checker itself is sound, the gap here is specifically one
-    of *fuzzer reachability*: closing it for real would need a fuzzer
-    action built to construct that condition directly, not a better
-    checker.
+    What's changed since `check_leader_completeness` was wired in: this
+    mutation also always truncates from `prev_log_index + 1` even when
+    nothing conflicts, discarding anything a follower holds *beyond* the
+    resent range too -- collateral damage the real handler's "already
+    matches" check exists specifically to prevent. 2/50 seeds now catch
+    that collateral damage, via `check_leader_completeness`, when the
+    discarded entries on that follower turn out to matter to a later
+    election. This is a materially narrower finding than "the checker
+    can't see this bug": `check_no_spurious_truncation`'s own signature
+    remains unreached, and this new detection is a *different* checker
+    catching a *different* (also real) consequence of the same mutation.
     """
     monkeypatch.setattr(RaftNode, "_handle_append_entries", _mutation_1_always_truncate_on_resend)
 
     violations = _sweep()
 
-    assert violations == {}, f"expected this known gap to stay undetected; found: {violations}"
+    assert 0 < len(violations) < 10, f"detection rate shifted materially: {violations}"
+    assert all("missing entry" in reason for reason in violations.values())
 
 
 def test_mutation_1_triggering_condition_is_caught_when_constructed_directly(
@@ -218,22 +239,31 @@ def test_mutation_1_triggering_condition_is_caught_when_constructed_directly(
         check_no_spurious_truncation(cluster, history)
 
 
-def test_mutation_match_index_advances_on_failure_is_not_detected(
+def test_mutation_match_index_advances_on_failure_is_detected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Mutation 2: advance match_index/next_index on a *failed* reply too,
     not only on success -- so the leader believes entries are replicated
     that the follower actually rejected.
 
-    KNOWN GAP: 0/50 seeds detect this, with or without keeping the
-    original "match_index must not move backward" assertion (checked
-    both ways). None of the three implemented checkers inspect
-    match_index directly -- it doesn't yet feed into anything
-    safety-critical, since there is no commitIndex until Milestone 4.
-    This is exactly the kind of gap that commit-index-dependent checks
-    (Leader Completeness, State Machine Safety) would need to close,
-    since committing based on a corrupted match_index is where this
-    would actually cause observable harm.
+    Rewritten for the post-fix message shape: `AppendEntriesReply` now
+    carries the follower's own honestly-computed `match_index`, so there
+    is no leader-side "what did I last send this peer" record left to
+    corrupt the way the original version of this mutation did (it patched
+    `_outstanding`, which no longer exists -- see BUGS.md for the real bug
+    that removed it, found via this exact checker). Reproducing the same
+    *class* of bug -- a leader crediting a peer with an index nothing
+    actually confirmed -- now means ignoring the reply's honestly-reported
+    match_index and instead assuming this leader's own current log is
+    fully replicated to the peer, regardless of what the reply actually
+    says.
+
+    DETECTED, always via check_leader_completeness: some later, honestly
+    elected leader lacks an entry an earlier leader believed committed
+    only because of this corruption. This is exactly the gap
+    `check_leader_completeness` was added to close: nothing about
+    election safety, log matching, or append-only-ness inherently
+    depends on match_index being trustworthy, but commitment does.
     """
 
     def mutated(self: RaftNode, msg: Message, src: str, now: int) -> list[tuple[str, Message]]:
@@ -242,15 +272,14 @@ def test_mutation_match_index_advances_on_failure_is_not_detected(
             return []
         if self.role is not Role.LEADER:
             return []
-        outstanding = self._outstanding.get(src)
-        if outstanding is None:
-            return []
-        prev_log_index, sent_count = outstanding
 
-        # MUTATION: unconditional, no longer gated on msg.success.
-        new_match_index = prev_log_index + sent_count
-        self.match_index[src] = new_match_index
-        self.next_index[src] = new_match_index + 1
+        # MUTATION: trust that this peer has fully caught up to this
+        # leader's own current log -- ignoring what the reply actually
+        # confirms -- unconditionally, not gated on msg.success.
+        believed_match_index = self.storage.last_log_index()
+        if believed_match_index > self.match_index[src]:
+            self.match_index[src] = believed_match_index
+            self.next_index[src] = believed_match_index + 1
 
         if msg.success:
             return []
@@ -263,7 +292,8 @@ def test_mutation_match_index_advances_on_failure_is_not_detected(
 
     violations = _sweep()
 
-    assert violations == {}, f"expected this known gap to stay undetected; found: {violations}"
+    assert len(violations) > 0, "expected this to be detected; check_leader_completeness regressed"
+    assert all("missing entry" in reason for reason in violations.values())
 
 
 def test_mutation_skipping_the_consistency_check_is_detected(
@@ -274,10 +304,17 @@ def test_mutation_skipping_the_consistency_check_is_detected(
     position the follower's log happens to currently end at, regardless
     of what Raft index the leader thinks they're at.
 
-    DETECTED: 42/50 seeds, always via check_log_matching -- the index
+    DETECTED: 33/50 seeds -- 32 via check_log_matching (the index
     misalignment this causes reliably produces two nodes disagreeing on
-    what's stored at a shared (index, term). Genuine invariant coverage,
-    not a coincidence.
+    what's stored at a shared (index, term)), and 1 via
+    check_leader_completeness, where the same misalignment happens to
+    surface as a later leader missing an entry before the log-matching
+    divergence it would also eventually cause ever gets checked (a
+    `SafetyViolation` stops the run at the first property that catches
+    it, so which one fires first for a given seed depends on exactly
+    when each condition becomes checkable, not which bug is "more
+    real"). Both are genuine invariant coverage of the same underlying
+    mutation, not a coincidence.
     """
 
     def mutated(self: RaftNode, msg: Message, src: str, now: int) -> list[tuple[str, Message]]:
@@ -305,14 +342,19 @@ def test_mutation_skipping_the_consistency_check_is_detected(
                 self.storage.truncate_from(conflict_index)
             self.storage.append_entries(list(new_entries))
 
-        return [(src, AppendEntriesReply(term=self.current_term, success=True))]
+        match_index = msg.prev_log_index + len(msg.entries)
+        reply = AppendEntriesReply(term=self.current_term, success=True, match_index=match_index)
+        return [(src, reply)]
 
     monkeypatch.setattr(RaftNode, "_handle_append_entries", mutated)
 
     violations = _sweep()
 
     assert len(violations) > 0, "expected this to be reliably caught; detection ability regressed"
-    assert all("log matching violated" in reason for reason in violations.values())
+    assert all(
+        "log matching violated" in reason or "missing entry" in reason
+        for reason in violations.values()
+    )
 
 
 def test_mutation_pessimistic_next_index_is_not_detected(
@@ -339,7 +381,6 @@ def test_mutation_pessimistic_next_index_is_not_detected(
         # MUTATION: pessimistic (1) instead of optimistic (last_log_index + 1).
         self.next_index = dict.fromkeys(self.peers, 1)
         self.match_index = dict.fromkeys(self.peers, 0)
-        self._outstanding = {}
         return self._send_append_entries(now)
 
     monkeypatch.setattr(RaftNode, "_become_leader", mutated)
