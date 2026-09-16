@@ -25,6 +25,20 @@ enforced structurally rather than left to chance:
   next draw, on average, and the cluster would rarely see partitioned
   behavior for long enough to actually react to it.
 
+CLIENT_REQUEST is what actually exercises replication -- without it, the
+cluster's log stays at the sentinel forever, and `check_log_matching` and
+`check_leader_append_only` both pass on every run for the same reason a
+test with no assertions passes: there's nothing there to be wrong. It
+calls `append_command` on whichever node is currently leader (skipped,
+not an error, if there isn't one), with a command derived from
+`step_index` rather than a counter or a random draw, so the same seed
+sends the same commands even after shrinking has renumbered the steps
+around it. `append_command` only *produces* messages -- it never sends
+them, exactly like `tick`/`handle` -- so its output is routed through
+`Cluster.route()`, the same path `step()` uses internally; skipping that
+and leaving the messages unsent would mean every entry sits in the
+leader's own log forever and never reaches a single peer.
+
 Replay and shrinking (`replay`, `shrink`) both work on `list[TraceEntry]`,
 not `list[Action]`. A bare action *kind* -- "crash", with no word on
 which node -- isn't enough to replay anything exactly: which node
@@ -54,7 +68,7 @@ from raft.invariants import (
     check_leader_append_only,
     check_log_matching,
 )
-from raft.node import RaftClusterNode, raft_node_factory
+from raft.node import RaftClusterNode, Role, raft_node_factory
 from raft.sim.cluster import Cluster
 from raft.storage import LogEntry
 
@@ -66,15 +80,17 @@ class Action(Enum):
     PARTITION = "partition"
     HEAL = "heal"
     ADVANCE_CLOCK = "advance_clock"
+    CLIENT_REQUEST = "client_request"
 
 
 DEFAULT_WEIGHTS: dict[Action, float] = {
-    Action.STEP: 70.0,
+    Action.STEP: 60.0,
     Action.CRASH: 7.0,
     Action.RESTART: 7.0,
     Action.PARTITION: 6.0,
     Action.HEAL: 8.0,
     Action.ADVANCE_CLOCK: 2.0,
+    Action.CLIENT_REQUEST: 10.0,
 }
 
 # How long (in fuzzer steps) a newly-formed partition refuses to heal.
@@ -91,14 +107,23 @@ class TraceEntry:
 
     `detail` always starts with "skipped" when the drawn action turned
     out to be ineligible (nothing to crash, a partition still in its
-    persistence window, ...) and was a no-op; anything else means it
-    actually took effect. The remaining fields hold whichever resolved
-    parameters that action needed -- `node_id` for CRASH/RESTART,
-    `group_a`/`group_b`/`duration` for PARTITION, `ms` for
-    ADVANCE_CLOCK -- and stay `None` both for STEP/HEAL (never
-    parameterized; HEAL's outcome is fully determined by state this
-    record's predecessors already pin down) and for any no-op occurrence
-    of an action that normally would carry one.
+    persistence window, no leader to send a client request to, ...) and
+    was a no-op; anything else means it actually took effect. The
+    remaining fields hold whichever resolved parameters that action
+    needed -- `node_id` for CRASH/RESTART/CLIENT_REQUEST (the leader it
+    targeted), `group_a`/`group_b`/`duration` for PARTITION, `ms` for
+    ADVANCE_CLOCK, `command` for CLIENT_REQUEST -- and stay `None` both
+    for STEP/HEAL (never parameterized; HEAL's outcome is fully
+    determined by state this record's predecessors already pin down) and
+    for any no-op occurrence of an action that normally would carry one.
+
+    `command` is recorded, not recomputed from `step_index` on replay,
+    even though it's originally *derived* from `step_index`
+    deterministically (see `_do_client_request`): shrinking re-indexes
+    steps from 0, so a shrunk trace's step numbers don't match the
+    original run's, and recomputing from the new number would silently
+    send a different command than the one that actually reproduced
+    whatever this trace is being kept to reproduce.
     """
 
     step: int
@@ -109,6 +134,7 @@ class TraceEntry:
     group_b: frozenset[int] | None = None
     duration: int | None = None
     ms: int | None = None
+    command: object | None = None
 
 
 class Fuzzer:
@@ -271,6 +297,8 @@ class Fuzzer:
             return self._do_heal(step_index)
         if action is Action.ADVANCE_CLOCK:
             return self._do_advance_clock(step_index, forced)
+        if action is Action.CLIENT_REQUEST:
+            return self._do_client_request(step_index, forced)
         raise AssertionError(f"unhandled action: {action!r}")  # pragma: no cover
 
     def _do_step(self, step_index: int) -> TraceEntry:
@@ -418,6 +446,60 @@ class Fuzzer:
 
         detail = self._apply_advance_clock(ms)
         return TraceEntry(step=step_index, action=Action.ADVANCE_CLOCK, detail=detail, ms=ms)
+
+    def _current_leader_id(self) -> int | None:
+        for node_id in self.cluster.node_ids():
+            node = self.cluster.get_node(node_id)
+            if node is not None and node.role is Role.LEADER:
+                return node_id
+        return None
+
+    def _apply_client_request(self, leader_id: int, command: object) -> str:
+        leader = self.cluster.get_node(leader_id)
+        if leader is None:
+            return "skipped (recorded leader is no longer alive)"
+
+        # append_command() only produces messages, it never sends them --
+        # exactly like tick()/handle() -- so this must go through the same
+        # Cluster.route() every other action's output does, or the entry
+        # sits in the leader's own log and never reaches a single peer.
+        now = self.cluster.clock.now()
+        produced = leader.append_command(command, now)
+        self.cluster.route(leader_id, produced, now)
+        return f"leader {leader_id} appended {command!r}"
+
+    def _do_client_request(self, step_index: int, forced: TraceEntry | None) -> TraceEntry:
+        if forced is not None:
+            if forced.node_id is None or forced.command is None:
+                detail = forced.detail
+            else:
+                detail = self._apply_client_request(forced.node_id, forced.command)
+            return TraceEntry(
+                step=step_index,
+                action=Action.CLIENT_REQUEST,
+                detail=detail,
+                node_id=forced.node_id,
+                command=forced.command,
+            )
+
+        leader_id = self._current_leader_id()
+        if leader_id is None:
+            detail = "skipped (no leader)"
+            return TraceEntry(step=step_index, action=Action.CLIENT_REQUEST, detail=detail)
+
+        # Derived from step_index, not a counter or an RNG draw, so the
+        # same step always produces the same command on replay -- without
+        # this, two runs of the same seed could append different commands
+        # at the same point and still call it "identical".
+        command = f"cmd-{step_index}"
+        detail = self._apply_client_request(leader_id, command)
+        return TraceEntry(
+            step=step_index,
+            action=Action.CLIENT_REQUEST,
+            detail=detail,
+            node_id=leader_id,
+            command=command,
+        )
 
     def _check_invariants(self, step_index: int) -> None:
         try:

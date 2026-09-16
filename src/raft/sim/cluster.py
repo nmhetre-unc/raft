@@ -215,15 +215,25 @@ class Cluster[N: Node]:
         if node is None:
             return  # dst is down; the message is gone, not redelivered later
         produced = node.handle(payload, src, t)
-        self._route(dst, produced, t)
+        self.route(dst, produced, t)
 
     def _fire_timer(self, t: int) -> None:
         for node_id in sorted(self._nodes):  # deterministic tie-break by id
             produced = self._nodes[node_id].tick(t)
-            self._route(node_id, produced, t)
+            self.route(node_id, produced, t)
         self._next_tick_time = t + self._tick_interval_ms
 
-    def _route(self, src: NodeId, produced: list[Message], now: int) -> None:
+    def route(self, src: NodeId, produced: list[Message], now: int) -> None:
+        """Send every `(dst, payload)` pair in `produced`, as if from `src`.
+
+        This is exactly what `step()` does internally with whatever a
+        node's `tick`/`handle` call returns -- public because it's also
+        the only correct way to inject output from a call `Cluster` never
+        made itself (a client's `append_command`, say). Routing that
+        output any other way would skip the same-liveness-check every
+        other message gets: a message to a node that's currently down is
+        dropped here, never even queued, exactly like any other message.
+        """
         for dst, payload in produced:
             if dst not in self._nodes:
                 continue  # dst is down; dropped here, never even queued

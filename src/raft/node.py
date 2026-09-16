@@ -464,7 +464,7 @@ class RaftClusterNode:
     routing and liveness bookkeeping. Without a translation at this
     boundary, every message a `RaftNode` produces would be addressed to a
     destination `Cluster` has never heard of -- a `str` can never equal
-    one of `Cluster`'s `int` ids -- and `Cluster._route` would silently
+    one of `Cluster`'s `int` ids -- and `Cluster.route` would silently
     drop it as if the destination were permanently down. This wrapper is
     that translation: it converts `int -> str` for outgoing `src`/`now`
     calls into the wrapped `RaftNode`, and `str -> int` for the
@@ -513,6 +513,15 @@ class RaftClusterNode:
         assert isinstance(payload, Message), f"unexpected payload type: {type(payload)!r}"
         produced = self.raft_node.handle(payload, str(src), now)
         return [(int(dst), msg) for dst, msg in produced]
+
+    def append_command(self, command: object, now: int) -> list[tuple[int, object]]:
+        """Same translation as `tick`/`handle`, for the client entry point.
+
+        Without this, `__getattr__` would forward straight to
+        `raft_node.append_command`, which addresses peers as `str` --
+        exactly the mismatch this whole class exists to paper over.
+        """
+        return [(int(dst), msg) for dst, msg in self.raft_node.append_command(command, now)]
 
 
 def raft_node_factory(
