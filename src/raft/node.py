@@ -1,14 +1,26 @@
 """The Raft node as a pure state machine.
 
-`RaftNode` implements leader election plus log replication, both
-directions -- Figure 2's `AppendEntries` receiver implementation in
-full, and the leader's handling of the reply it gets back -- but no
-commit tracking. A follower actually applies what it's sent: it runs the
-consistency check against `prev_log_index`/`prev_log_term`, deletes a
-conflicting entry and everything after it, and appends whatever's new.
-There is still no `commitIndex` anywhere in this file, and nothing here
-ever decides an entry is safe to hand to a state machine -- that's
-Milestone 4.
+`RaftNode` implements leader election, log replication in both
+directions, and commitment -- deciding when an entry is safe. There is
+still no state machine to actually *apply* a committed entry to
+(`last_applied` exists and is tracked as a field, but nothing advances
+it yet), and no log compaction; those remain later milestones.
+
+Commitment's one rule matters more than everything else in this file
+combined, and it is stated here in full rather than assumed known:
+**a leader may only ever advance `commit_index` to an index whose entry
+was written in its own current term.** A leader that instead commits the
+moment a majority merely *holds* an entry -- regardless of which term
+wrote it -- is unsafe: Figure 8 of the Raft paper shows a concrete
+five-node execution where doing so lets a later leader silently
+overwrite an entry an earlier leader had already told a client was
+committed. Entries from earlier terms are never committed *directly* --
+only *indirectly*, by riding along beneath a current-term entry once
+that one commits, via the Log Matching Property guaranteeing everything
+below it is already identical everywhere it exists. `_advance_commit_index`
+enforces this with an explicit, separately-commented guard rather than
+folding it into the majority arithmetic, specifically so it can never be
+mistaken for an incidental detail.
 
 A leader tracks two things per peer, and they are not interchangeable:
 
@@ -103,7 +115,7 @@ class Role(Enum):
 
 
 class RaftNode:
-    """A single Raft node's election-only state machine.
+    """A single Raft node's state machine: election, replication, commitment.
 
     Persistent (loaded from `storage` at construction, saved back to it
     before any reply that changed them is returned): `current_term`,
@@ -111,9 +123,15 @@ class RaftNode:
 
     Volatile (never touches `storage`, reset to nothing meaningful by a
     fresh construction -- i.e. by a simulated crash and restart):
-    `role`, `leader_id`, `election_deadline`, `votes_received`, and --
-    only meaningful while `role is Role.LEADER`, reinitialized fresh on
-    every election win -- `next_index`, `match_index`.
+    `role`, `leader_id`, `election_deadline`, `votes_received`,
+    `commit_index`, `last_applied`, and -- only meaningful while `role is
+    Role.LEADER`, reinitialized fresh on every election win --
+    `next_index`, `match_index`. `commit_index` staying volatile is
+    deliberate, not an oversight: it is fully reconstructible from the
+    current leader's next heartbeat after a restart (see
+    `_handle_append_entries`'s step 5), so persisting it would just be
+    redundant durability for a value every live node already recomputes
+    on its own.
     """
 
     def __init__(
@@ -124,6 +142,7 @@ class RaftNode:
         election_timeout_range: tuple[int, int] = (150, 300),
         heartbeat_interval: int = 50,
         rng: random.Random | None = None,
+        append_noop_on_election: bool = False,
     ) -> None:
         lo, hi = election_timeout_range
         if lo <= 0 or hi < lo:
@@ -137,6 +156,12 @@ class RaftNode:
         self.election_timeout_range = election_timeout_range
         self.heartbeat_interval = heartbeat_interval
         self._rng = rng if rng is not None else random.Random()
+        # Whether _become_leader appends a term-stamped, content-free entry
+        # on every election win. A flag, not always-on, specifically so a
+        # test can run the same node both ways: see _become_leader for why
+        # a leader with nothing at its own current term can never commit
+        # anything at all, including entries inherited from earlier terms.
+        self.append_noop_on_election = append_noop_on_election
 
         # Persistent state -- loaded now, written back by _persist_if_dirty().
         self.current_term, self.voted_for = storage.load_term_and_vote()
@@ -148,6 +173,11 @@ class RaftNode:
         self.votes_received: set[str] = set()
         self.election_deadline: int = 0
         self._next_heartbeat: int = 0
+        # The highest index this node believes is committed, and the
+        # highest index applied to a state machine that doesn't exist yet.
+        # Both volatile -- see the class docstring for why that's safe.
+        self.commit_index: int = 0
+        self.last_applied: int = 0
         # Leader-only, meaningless until the first election win; see the
         # module docstring for why these are never derived from each other.
         self.next_index: dict[str, int] = {}
@@ -253,7 +283,7 @@ class RaftNode:
             return []
         return self._become_leader(now)
 
-    # -- AppendEntries (Figure 2's receiver implementation, minus commit tracking) --
+    # -- AppendEntries (Figure 2's receiver implementation, commit tracking included) --
 
     def _handle_append_entries(
         self, msg: AppendEntries, src: str, now: int
@@ -304,7 +334,21 @@ class RaftNode:
             if conflict_index < len(log):
                 self.storage.truncate_from(conflict_index)  # 3: delete the conflict onward
             self.storage.append_entries(list(new_entries))  # 4: append what's new
-        # 5. Commit tracking: skipped -- Milestone 4.
+
+        # 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit,
+        # index of last new entry). "Index of last new entry" means the last
+        # index *this message* covers -- prev_log_index + len(entries) --
+        # regardless of whether those entries needed writing or already
+        # matched; a bare heartbeat (entries=()) still legitimately advances
+        # commit_index up to prev_log_index this way. The min() is not
+        # optional: without it, a follower would happily adopt a leader's
+        # higher commit_index even when its own log doesn't yet reach that
+        # far (it could still be catching up from an earlier, smaller
+        # message), which would mean claiming an entry is committed before
+        # this follower has even seen it.
+        last_new_index = msg.prev_log_index + len(msg.entries)
+        if msg.leader_commit > self.commit_index:
+            self.commit_index = min(msg.leader_commit, last_new_index)
 
         return [(src, AppendEntriesReply(term=self.current_term, success=True))]
 
@@ -339,6 +383,7 @@ class RaftNode:
             )
             self.match_index[src] = new_match_index
             self.next_index[src] = new_match_index + 1
+            self._advance_commit_index()
             return []
 
         # Failure, and (per the checks above) at our current term, not a
@@ -348,6 +393,43 @@ class RaftNode:
         self.next_index[src] = max(1, self.next_index[src] - 1)
         log = self.storage.load_log()
         return [(src, self._build_append_entries_for(src, log))]
+
+    def _advance_commit_index(self) -> None:
+        """Figure 2's leader commit rule -- with Figure 2's own last-paragraph
+        restriction (see also Figure 8) applied as an explicit, separate
+        guard, not folded into the majority check it sits beside.
+
+        The rule in full: a leader may advance commit_index to N if (a) a
+        majority of match_index values -- counting this leader's own log,
+        which trivially "matches" itself completely -- are >= N, AND (b)
+        the entry actually stored at index N was written in this leader's
+        OWN CURRENT TERM. Both conditions are required; neither implies
+        the other. Search from this leader's own last index downward, so
+        the first N found (if any) satisfying both is the highest such N.
+        """
+        match_counts = [*self.match_index.values(), self.storage.last_log_index()]
+        majority_needed = len(match_counts) // 2 + 1
+
+        log = self.storage.load_log()
+        for candidate in range(self.storage.last_log_index(), self.commit_index, -1):
+            confirmations = sum(1 for match_index in match_counts if match_index >= candidate)
+            if confirmations < majority_needed:
+                continue  # not enough nodes have reached this index yet
+
+            # THE CRITICAL RESTRICTION (Figure 2, last paragraph; Figure 8):
+            # never commit an entry from a term earlier than this leader's
+            # own current term, no matter how large the majority already
+            # holding it is. An entry only becomes safe to commit this way
+            # once a *current-term* entry above it commits -- everything
+            # below rides along via the Log Matching Property. Committing
+            # an old-term entry directly, on majority alone, is exactly
+            # the unsafe case Figure 8 exists to rule out: a later leader
+            # that never saw it as committed can still overwrite it.
+            if log[candidate].term != self.current_term:
+                continue
+
+            self.commit_index = candidate
+            return
 
     # -- Elections and heartbeats --
 
@@ -382,6 +464,26 @@ class RaftNode:
         self.next_index = dict.fromkeys(self.peers, last_index + 1)
         self.match_index = dict.fromkeys(self.peers, 0)
         self._outstanding = {}
+
+        if self.append_noop_on_election:
+            # A leader can only ever commit an entry from its OWN current
+            # term directly (_advance_commit_index's guard); everything
+            # from an earlier term only ever commits indirectly, by riding
+            # along beneath one. Without anything stamped at this leader's
+            # own term, it can never commit *anything* at all -- including
+            # entries it inherited from earlier leaders that a majority
+            # may already hold. This no-op is exactly what closes that
+            # gap: term-stamped, content-free, here purely so there is
+            # something this leader itself wrote that it can commit.
+            self.storage.append_entries([LogEntry(term=self.current_term, command=None)])
+
+        # A lone leader in a single-node cluster (self.peers == []) will
+        # never receive an AppendEntriesReply to trigger the usual
+        # advancement path, so it gets one explicit check here too --
+        # harmless for any multi-node cluster, where every peer's
+        # match_index has just been reset to 0 and so can never yet
+        # satisfy a majority at any new index.
+        self._advance_commit_index()
 
         return self._send_append_entries(now)  # sent immediately, per Figure 2
 
@@ -420,7 +522,7 @@ class RaftNode:
             prev_log_index=prev_log_index,
             prev_log_term=log[prev_log_index].term,
             entries=entries,
-            leader_commit=0,  # no commit tracking without replication
+            leader_commit=self.commit_index,
         )
 
     def append_command(self, command: object, now: int) -> list[tuple[str, Message]]:
@@ -437,6 +539,12 @@ class RaftNode:
             return []
 
         self.storage.append_entries([LogEntry(term=self.current_term, command=command)])
+        # Same reasoning as the lone-leader check in _become_leader: this
+        # entry is at self.current_term, so if this node has no peers (or
+        # somehow already has a standing majority at this new index), it
+        # can commit immediately without waiting on a reply that will
+        # never come.
+        self._advance_commit_index()
         return self._send_append_entries(now)
 
     def _has_majority(self) -> bool:
@@ -471,9 +579,9 @@ class RaftClusterNode:
     `(dst, payload)` pairs it produces, and otherwise gets entirely out of
     the way. The handful of fields external callers (tests, invariant
     checkers) actually need to inspect -- `role`, `current_term`,
-    `voted_for`, `leader_id`, `node_id`, `storage` -- are typed
-    properties reading straight through to the real node; anything else
-    falls back through `__getattr__`, untyped but still reachable.
+    `voted_for`, `leader_id`, `node_id`, `storage`, `commit_index` -- are
+    typed properties reading straight through to the real node; anything
+    else falls back through `__getattr__`, untyped but still reachable.
     """
 
     def __init__(self, raft_node: RaftNode) -> None:
@@ -506,6 +614,10 @@ class RaftClusterNode:
     def storage(self) -> Storage:
         return self.raft_node.storage
 
+    @property
+    def commit_index(self) -> int:
+        return self.raft_node.commit_index
+
     def tick(self, now: int) -> list[tuple[int, object]]:
         return [(int(dst), msg) for dst, msg in self.raft_node.tick(now)]
 
@@ -530,6 +642,7 @@ def raft_node_factory(
     *,
     election_timeout_range: tuple[int, int] = (150, 300),
     heartbeat_interval: int = 50,
+    append_noop_on_election: bool = False,
 ) -> Callable[[int, Storage], RaftClusterNode]:
     """Build a `Cluster`-compatible `node_factory` that produces `RaftNode`s.
 
@@ -561,6 +674,7 @@ def raft_node_factory(
             election_timeout_range=election_timeout_range,
             heartbeat_interval=heartbeat_interval,
             rng=random.Random(node_seeds[name]),
+            append_noop_on_election=append_noop_on_election,
         )
         return RaftClusterNode(raft_node)
 

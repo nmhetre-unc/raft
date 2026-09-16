@@ -1,11 +1,10 @@
 """Tests for RaftNode's log replication: leader-side per-follower state
 (`next_index`, `match_index`), constructing per-peer AppendEntries, the
-`append_command` client entry point, and the follower-side AppendEntries
+`append_command` client entry point, the follower-side AppendEntries
 receiver implementation (Figure 2's consistency check, conflict
-resolution, and append).
-
-There is still no commit tracking anywhere in this file's subject matter
--- that's Milestone 4.
+resolution, and append), and commitment (leader-side majority advancement
+under the current-term-only restriction, and follower-side adoption of
+`leader_commit`).
 """
 
 import random
@@ -525,3 +524,132 @@ def test_full_convergence_walks_back_and_overwrites_a_divergent_tail() -> None:
     assert leader.match_index["follower"] == last_index
     assert leader.next_index["follower"] == last_index + 1
     assert follower_storage.load_log() == leader_storage.load_log()
+
+
+# -- Commitment: leader-side majority advancement, the current-term-only
+# restriction (Figure 2's last paragraph; Figure 8), and follower-side
+# adoption of leader_commit --
+
+
+def test_leader_commits_an_index_a_majority_of_match_index_has_reached() -> None:
+    storage = MemoryStorage()
+    storage.append_entries([LogEntry(term=1, command=f"e{i}") for i in range(1, 6)])  # indices 1..5
+    node = RaftNode("0", ["1", "2", "3", "4"], storage, rng=random.Random(1))
+    node.current_term = 1
+    node.role = Role.LEADER
+    node.leader_id = "0"
+    node.next_index = dict.fromkeys(node.peers, 6)
+    node.match_index = {"1": 5, "2": 0, "3": 0, "4": 0}
+    node._outstanding = {"2": (0, 5)}  # peer "2" is about to confirm index 5 too
+
+    assert node.commit_index == 0
+
+    # Leader (implicit) + "1" + "2" now = 3 of 5 -- a majority.
+    node.handle(AppendEntriesReply(term=1, success=True), src="2", now=0)
+
+    assert node.commit_index == 5
+
+
+def test_leader_does_not_commit_an_earlier_term_entry_despite_a_full_majority() -> None:
+    storage = MemoryStorage()
+    storage.append_entries([LogEntry(term=1, command="old")])  # index 1, from an EARLIER term
+    node = RaftNode("0", ["1", "2"], storage, rng=random.Random(1))
+    node.current_term = 3  # this leader's current term has moved on
+    node.role = Role.LEADER
+    node.leader_id = "0"
+    node.next_index = {"1": 2, "2": 2}
+    node.match_index = {"1": 1, "2": 0}
+    node._outstanding = {"2": (0, 1)}
+
+    # Every node in the cluster -- a full, not just bare, majority -- ends
+    # up holding index 1 once this reply lands.
+    node.handle(AppendEntriesReply(term=3, success=True), src="2", now=0)
+
+    assert node.commit_index == 0  # never committed: index 1's entry is term 1, not 3
+
+
+def test_committing_a_current_term_entry_retroactively_commits_earlier_entries_below_it() -> None:
+    storage = MemoryStorage()
+    storage.append_entries(
+        [
+            LogEntry(term=1, command="old-1"),  # index 1, earlier term
+            LogEntry(term=1, command="old-2"),  # index 2, earlier term
+            LogEntry(term=3, command="new"),  # index 3, THIS leader's current term
+        ]
+    )
+    node = RaftNode("0", ["1", "2"], storage, rng=random.Random(1))
+    node.current_term = 3
+    node.role = Role.LEADER
+    node.leader_id = "0"
+    node.next_index = {"1": 4, "2": 4}
+    node.match_index = {"1": 3, "2": 0}
+    node._outstanding = {"2": (0, 3)}
+
+    assert node.commit_index == 0
+
+    node.handle(AppendEntriesReply(term=3, success=True), src="2", now=0)
+
+    # Reaching index 3 (this leader's own term) in one step also commits
+    # indices 1 and 2 -- despite being from an earlier term, which on
+    # their own (previous test) would never be committed directly.
+    assert node.commit_index == 3
+
+
+def test_follower_commit_index_never_exceeds_its_own_last_log_index() -> None:
+    storage = MemoryStorage()
+    storage.append_entries([LogEntry(term=1, command="a")])  # this follower only has index 1
+    node = RaftNode("f", ["leader"], storage, rng=random.Random(1))
+
+    # The leader claims a commit_index far beyond anything sent in (or
+    # already held by) this message -- exactly the case min() exists for.
+    msg = AppendEntries(
+        term=1, leader_id="leader", prev_log_index=1, prev_log_term=1, entries=(), leader_commit=100
+    )
+
+    node.handle(msg, src="leader", now=0)
+
+    assert node.commit_index == 1  # clamped to what this follower actually has
+    assert node.commit_index <= node.storage.last_log_index()
+
+
+def test_commit_index_is_0_after_restart_and_recovers_from_the_next_heartbeat() -> None:
+    storage = MemoryStorage()
+    storage.append_entries([LogEntry(term=1, command="a"), LogEntry(term=1, command="b")])
+    node = RaftNode("f", ["leader"], storage, rng=random.Random(1))
+    node.commit_index = 2  # this follower had learned entries 1 and 2 were committed
+
+    # A crash + restart: a fresh RaftNode over the same (persisted, so
+    # unaffected) storage. commit_index is volatile -- it does not survive.
+    restarted = RaftNode("f", ["leader"], storage, rng=random.Random(2))
+    assert restarted.commit_index == 0
+
+    heartbeat = AppendEntries(
+        term=1, leader_id="leader", prev_log_index=2, prev_log_term=1, entries=(), leader_commit=2
+    )
+    restarted.handle(heartbeat, src="leader", now=0)
+
+    assert restarted.commit_index == 2  # recovered from the leader's heartbeat
+
+
+def test_noop_on_election_lets_a_lone_leader_commit_immediately() -> None:
+    storage = MemoryStorage()
+    node = RaftNode("solo", [], storage, rng=random.Random(1), append_noop_on_election=True)
+    _force_election_timeout(node)
+
+    node.tick(now=10)
+
+    assert node.role is Role.LEADER
+    assert node.storage.last_log_index() == 1  # the no-op, at this leader's own term
+    assert node.commit_index == 1  # a lone node is trivially its own majority
+
+
+def test_without_noop_a_lone_leader_with_an_empty_log_commits_nothing() -> None:
+    storage = MemoryStorage()
+    node = RaftNode("solo", [], storage, rng=random.Random(1), append_noop_on_election=False)
+    _force_election_timeout(node)
+
+    node.tick(now=10)
+
+    assert node.role is Role.LEADER
+    assert node.storage.last_log_index() == 0  # nothing appended
+    assert node.commit_index == 0  # the sentinel is term 0, never a real current_term
