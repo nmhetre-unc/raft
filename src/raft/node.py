@@ -1,12 +1,29 @@
 """The Raft node as a pure state machine.
 
-`RaftNode` implements leader election only (Figure 2's election rules);
-log replication is deliberately absent. `AppendEntries` is already part
-of the wire protocol -- a heartbeat *is* an `AppendEntries` with
-`entries=()` -- but a receiving node ignores whatever entries it carries
-and never advances a commit index. There is no `commitIndex`,
-`nextIndex`, or `matchIndex` here; those belong to replication, not
-election, and aren't in this node's volatile state.
+`RaftNode` implements leader election plus the *leader's* side of log
+replication's bookkeeping; there is still no follower-side handling of
+real entries, and no commit tracking. `AppendEntries` now carries real
+entries when a leader has any to send -- a heartbeat is just the
+special case where it doesn't -- but a receiving node still ignores
+whatever entries it's given and never advances a commit index. There is
+no `commitIndex` here; that, and follower-side application of entries,
+are Milestone 4.
+
+A leader tracks two things per peer, and they are not interchangeable:
+
+- `next_index[peer]` is a *guess* -- the next log index this leader
+  believes it should try sending that peer. It starts optimistic (one
+  past this leader's own last entry) and walks backward only when a
+  peer rejects an AppendEntries, which isn't implemented yet either.
+- `match_index[peer]` is *known truth* -- the highest index this leader
+  has actual confirmation the peer has replicated. It starts at 0
+  (known nothing) and only ever moves forward, once a real
+  acknowledgement arrives.
+
+Neither is derived from the other, and nothing in this file computes one
+from the other -- an optimistic guess and a confirmed fact answer
+different questions, and conflating them is exactly how a leader would
+end up believing a follower has entries it never actually got.
 
 `RaftNode` never sends anything and never reads a clock. `tick(now)` and
 `handle(msg, src, now)` both return `(destination, Message)` pairs for
@@ -55,7 +72,7 @@ from raft.messages import (
     RequestVote,
     RequestVoteReply,
 )
-from raft.storage import Storage
+from raft.storage import LogEntry, Storage
 
 
 class Role(Enum):
@@ -73,7 +90,9 @@ class RaftNode:
 
     Volatile (never touches `storage`, reset to nothing meaningful by a
     fresh construction -- i.e. by a simulated crash and restart):
-    `role`, `leader_id`, `election_deadline`, `votes_received`.
+    `role`, `leader_id`, `election_deadline`, `votes_received`, and --
+    only meaningful while `role is Role.LEADER`, reinitialized fresh on
+    every election win -- `next_index`, `match_index`.
     """
 
     def __init__(
@@ -108,6 +127,10 @@ class RaftNode:
         self.votes_received: set[str] = set()
         self.election_deadline: int = 0
         self._next_heartbeat: int = 0
+        # Leader-only, meaningless until the first election win; see the
+        # module docstring for why these are never derived from each other.
+        self.next_index: dict[str, int] = {}
+        self.match_index: dict[str, int] = {}
         # The deadline's first real draw is deferred to the first tick()
         # (see there for why): at construction time this node has no idea
         # what "now" actually is, and a restart can happen arbitrarily far
@@ -133,7 +156,7 @@ class RaftNode:
             out.extend(self._start_election(now))
 
         if self.role is Role.LEADER and now >= self._next_heartbeat:
-            out.extend(self._send_heartbeats(now))
+            out.extend(self._send_append_entries(now))
 
         self._persist_if_dirty()
         return out
@@ -249,19 +272,59 @@ class RaftNode:
     def _become_leader(self, now: int) -> list[tuple[str, Message]]:
         self.role = Role.LEADER
         self.leader_id = self.node_id
-        return self._send_heartbeats(now)  # sent immediately, per Figure 2
 
-    def _send_heartbeats(self, now: int) -> list[tuple[str, Message]]:
-        heartbeat = AppendEntries(
-            term=self.current_term,
-            leader_id=self.node_id,
-            prev_log_index=self.storage.last_log_index(),
-            prev_log_term=self.storage.last_log_term(),
-            entries=(),
-            leader_commit=0,  # no commit tracking without replication
-        )
+        # Fresh per-peer state for this leadership stint -- never carried
+        # over from a previous one. next_index starts optimistic (this
+        # leader's own log, one past the end); match_index starts at the
+        # only thing actually known about a peer at this point: nothing.
+        last_index = self.storage.last_log_index()
+        self.next_index = dict.fromkeys(self.peers, last_index + 1)
+        self.match_index = dict.fromkeys(self.peers, 0)
+
+        return self._send_append_entries(now)  # sent immediately, per Figure 2
+
+    def _send_append_entries(self, now: int) -> list[tuple[str, Message]]:
+        """Send every peer an AppendEntries built from *its own* next_index.
+
+        Each peer gets a distinct message -- not one shared object -- since
+        `prev_log_index`/`prev_log_term` anchor the log-matching check at
+        wherever *that* peer is believed to be, and `entries` is whatever
+        this leader has from there onward. A peer already caught up (its
+        next_index one past this leader's last entry) simply gets `entries
+        = ()`: a heartbeat is nothing more than that case.
+        """
+        log = self.storage.load_log()
+        out: list[tuple[str, Message]] = []
+        for peer in self.peers:
+            prev_log_index = self.next_index[peer] - 1
+            message = AppendEntries(
+                term=self.current_term,
+                leader_id=self.node_id,
+                prev_log_index=prev_log_index,
+                prev_log_term=log[prev_log_index].term,
+                entries=tuple(log[self.next_index[peer] :]),
+                leader_commit=0,  # no commit tracking without replication
+            )
+            out.append((peer, message))
+
         self._next_heartbeat = now + self.heartbeat_interval
-        return [(peer, heartbeat) for peer in self.peers]
+        return out
+
+    def append_command(self, command: object, now: int) -> list[tuple[str, Message]]:
+        """A client's request to replicate `command`.
+
+        Returns `[]` and does nothing if this node isn't currently
+        leader -- the caller is expected to redirect to `leader_id`
+        instead of retrying here. Otherwise appends `command` (at this
+        leader's current term) to its own log and immediately sends it
+        on to every peer via the same per-peer AppendEntries logic a
+        heartbeat uses.
+        """
+        if self.role is not Role.LEADER:
+            return []
+
+        self.storage.append_entries([LogEntry(term=self.current_term, command=command)])
+        return self._send_append_entries(now)
 
     def _has_majority(self) -> bool:
         cluster_size = len(self.peers) + 1  # +1 for this node
