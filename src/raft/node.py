@@ -1,8 +1,9 @@
 """The Raft node as a pure state machine.
 
-`RaftNode` implements leader election plus log replication (Figure 2's
-`AppendEntries` receiver implementation, in full) -- but no commit
-tracking. A follower now actually applies what it's sent: it runs the
+`RaftNode` implements leader election plus log replication, both
+directions -- Figure 2's `AppendEntries` receiver implementation in
+full, and the leader's handling of the reply it gets back -- but no
+commit tracking. A follower actually applies what it's sent: it runs the
 consistency check against `prev_log_index`/`prev_log_term`, deletes a
 conflicting entry and everything after it, and appends whatever's new.
 There is still no `commitIndex` anywhere in this file, and nothing here
@@ -13,17 +14,37 @@ A leader tracks two things per peer, and they are not interchangeable:
 
 - `next_index[peer]` is a *guess* -- the next log index this leader
   believes it should try sending that peer. It starts optimistic (one
-  past this leader's own last entry) and walks backward only when a
-  peer rejects an AppendEntries, which isn't implemented yet either.
+  past this leader's own last entry), decrements by exactly one on a
+  rejection (no conflict-term optimization yet), and jumps forward again
+  on an acceptance.
 - `match_index[peer]` is *known truth* -- the highest index this leader
   has actual confirmation the peer has replicated. It starts at 0
   (known nothing) and only ever moves forward, once a real
-  acknowledgement arrives.
+  acknowledgement arrives -- enforced with an assertion, not a `max()`,
+  because a would-be regression means a reply got misattributed
+  somewhere, and that is a bug to surface, not paper over.
 
 Neither is derived from the other, and nothing in this file computes one
 from the other -- an optimistic guess and a confirmed fact answer
 different questions, and conflating them is exactly how a leader would
 end up believing a follower has entries it never actually got.
+
+`AppendEntriesReply` doesn't echo back what it's replying to (no
+`prev_log_index`, no entry count), and replies can arrive out of order in
+this simulator. So the leader records, per peer, the `(prev_log_index,
+entry_count)` it most recently *sent* -- overwritten on every send -- and
+uses that recorded value to interpret whatever reply comes back, rather
+than recomputing it from `next_index[peer]`'s value *at reply time*. The
+difference matters: `next_index` can have already been advanced by a
+different, later-sent-but-earlier-arriving reply by the time a delayed
+one shows up, so recomputing from it would attribute a stale reply to
+the wrong request. Recording what was true at send time is not immune to
+every pathological interleaving of overlapping in-flight requests to the
+same peer, but it is exactly right for the case this system actually
+produces: a second send before the first's reply arrives only ever
+carries a superset of what the first one sent (the log only grows), so
+whichever reply is (mis)attributed to the latest record still lands on
+the correct final `match_index`.
 
 `RaftNode` never sends anything and never reads a clock. `tick(now)` and
 `handle(msg, src, now)` both return `(destination, Message)` pairs for
@@ -131,6 +152,10 @@ class RaftNode:
         # module docstring for why these are never derived from each other.
         self.next_index: dict[str, int] = {}
         self.match_index: dict[str, int] = {}
+        # Leader-only: (prev_log_index, entry_count) most recently sent to
+        # each peer, recorded at send time -- see _handle_append_entries_reply
+        # for why a reply can't be interpreted without this.
+        self._outstanding: dict[str, tuple[int, int]] = {}
         # The deadline's first real draw is deferred to the first tick()
         # (see there for why): at construction time this node has no idea
         # what "now" actually is, and a restart can happen arbitrarily far
@@ -286,8 +311,43 @@ class RaftNode:
     def _handle_append_entries_reply(
         self, msg: AppendEntriesReply, src: str, now: int
     ) -> list[tuple[str, Message]]:
-        del msg, src, now  # nothing to do without replication tracking
-        return []
+        if msg.term < self.current_term:
+            return []  # stale reply, from a term we've since moved past
+        if self.role is not Role.LEADER:
+            return []  # no longer leading; not ours to act on anymore
+
+        # AppendEntriesReply doesn't echo prev_log_index or how many
+        # entries were sent, so there's no way to interpret "success" or
+        # "failure" without separately knowing what this reply is even
+        # answering. Recomputing that from the *current* next_index[src]
+        # would be simpler, but it's wrong here: replies can arrive out of
+        # order in this simulator, so by the time a delayed reply shows
+        # up, next_index may already reflect a *later* send this reply
+        # knows nothing about. Recording what was actually sent, at the
+        # moment it was sent, is the only value that's still correct no
+        # matter when (or in what order) the reply for it comes back.
+        outstanding = self._outstanding.get(src)
+        if outstanding is None:
+            return []  # nothing recorded to interpret this reply against
+        prev_log_index, sent_count = outstanding
+
+        if msg.success:
+            new_match_index = prev_log_index + sent_count
+            assert new_match_index >= self.match_index[src], (
+                f"match_index[{src!r}] would move backward: "
+                f"{self.match_index[src]} -> {new_match_index}"
+            )
+            self.match_index[src] = new_match_index
+            self.next_index[src] = new_match_index + 1
+            return []
+
+        # Failure, and (per the checks above) at our current term, not a
+        # stale-term step-down: back off by exactly one and retry
+        # immediately with the earlier prev_log_index. No conflict-term
+        # optimization yet -- a later refinement, not this milestone.
+        self.next_index[src] = max(1, self.next_index[src] - 1)
+        log = self.storage.load_log()
+        return [(src, self._build_append_entries_for(src, log))]
 
     # -- Elections and heartbeats --
 
@@ -321,6 +381,7 @@ class RaftNode:
         last_index = self.storage.last_log_index()
         self.next_index = dict.fromkeys(self.peers, last_index + 1)
         self.match_index = dict.fromkeys(self.peers, 0)
+        self._outstanding = {}
 
         return self._send_append_entries(now)  # sent immediately, per Figure 2
 
@@ -335,21 +396,32 @@ class RaftNode:
         = ()`: a heartbeat is nothing more than that case.
         """
         log = self.storage.load_log()
-        out: list[tuple[str, Message]] = []
-        for peer in self.peers:
-            prev_log_index = self.next_index[peer] - 1
-            message = AppendEntries(
-                term=self.current_term,
-                leader_id=self.node_id,
-                prev_log_index=prev_log_index,
-                prev_log_term=log[prev_log_index].term,
-                entries=tuple(log[self.next_index[peer] :]),
-                leader_commit=0,  # no commit tracking without replication
-            )
-            out.append((peer, message))
-
+        out: list[tuple[str, Message]] = [
+            (peer, self._build_append_entries_for(peer, log)) for peer in self.peers
+        ]
         self._next_heartbeat = now + self.heartbeat_interval
         return out
+
+    def _build_append_entries_for(self, peer: str, log: list[LogEntry]) -> AppendEntries:
+        """Build the AppendEntries `peer` should get right now, from its next_index.
+
+        Also records what was sent as the new outstanding request for
+        `peer` -- overwriting whatever was recorded before, since a reply
+        for the earlier one, if it's still coming, will be interpreted
+        against this newer record instead (see
+        `_handle_append_entries_reply`).
+        """
+        prev_log_index = self.next_index[peer] - 1
+        entries = tuple(log[self.next_index[peer] :])
+        self._outstanding[peer] = (prev_log_index, len(entries))
+        return AppendEntries(
+            term=self.current_term,
+            leader_id=self.node_id,
+            prev_log_index=prev_log_index,
+            prev_log_term=log[prev_log_index].term,
+            entries=entries,
+            leader_commit=0,  # no commit tracking without replication
+        )
 
     def append_command(self, command: object, now: int) -> list[tuple[str, Message]]:
         """A client's request to replicate `command`.

@@ -341,3 +341,187 @@ def test_longer_follower_log_is_preserved_unless_the_leader_actually_conflicts()
         LogEntry(term=1, command="b"),
         LogEntry(term=2, command="new-c"),
     ]
+
+
+# -- Leader-side AppendEntriesReply handling --
+
+
+def test_successful_reply_advances_next_index_and_match_index() -> None:
+    storage = MemoryStorage()
+    storage.append_entries([LogEntry(term=1, command="a"), LogEntry(term=1, command="b")])
+    node = RaftNode("0", ["1"], storage, rng=random.Random(1))
+    node.role = Role.LEADER
+    node.leader_id = "0"
+    node.next_index = {"1": 1}
+    node.match_index = {"1": 0}
+
+    node._send_append_entries(now=0)  # records outstanding = (0, 2) for "1"
+
+    out = node.handle(AppendEntriesReply(term=node.current_term, success=True), src="1", now=1)
+
+    assert out == []
+    assert node.match_index["1"] == 2  # prev_log_index(0) + entries sent(2)
+    assert node.next_index["1"] == 3
+
+
+def test_failed_reply_decrements_next_index_and_produces_a_retry() -> None:
+    storage = MemoryStorage()
+    storage.append_entries([LogEntry(term=1, command="a"), LogEntry(term=1, command="b")])
+    node = RaftNode("0", ["1"], storage, rng=random.Random(1))
+    node.role = Role.LEADER
+    node.leader_id = "0"
+    node.next_index = {"1": 3}
+    node.match_index = {"1": 0}
+
+    node._send_append_entries(now=0)  # records outstanding = (2, 0) for "1"
+
+    out = node.handle(AppendEntriesReply(term=node.current_term, success=False), src="1", now=1)
+
+    assert node.next_index["1"] == 2  # decremented by exactly one
+    assert node.match_index["1"] == 0  # untouched by a failure
+
+    assert len(out) == 1
+    retry_dst, retry_msg = out[0]
+    assert retry_dst == "1"
+    assert isinstance(retry_msg, AppendEntries)
+    assert retry_msg.prev_log_index == 1  # the new, decremented next_index(2) - 1
+
+
+def test_next_index_never_goes_below_1() -> None:
+    storage = MemoryStorage()
+    node = RaftNode("0", ["1"], storage, rng=random.Random(1))
+    node.role = Role.LEADER
+    node.leader_id = "0"
+    node.next_index = {"1": 1}
+    node.match_index = {"1": 0}
+
+    node._send_append_entries(now=0)
+    node.handle(AppendEntriesReply(term=node.current_term, success=False), src="1", now=1)
+
+    assert node.next_index["1"] == 1  # clamped at 1, not decremented to 0
+
+
+def test_stale_reply_from_an_older_term_is_ignored() -> None:
+    storage = MemoryStorage()
+    node = RaftNode("0", ["1"], storage, rng=random.Random(1))
+    node.current_term = 5
+    node.role = Role.LEADER
+    node.leader_id = "0"
+    node.next_index = {"1": 1}
+    node.match_index = {"1": 0}
+    node._send_append_entries(now=0)
+
+    out = node.handle(AppendEntriesReply(term=3, success=True), src="1", now=1)
+
+    assert out == []
+    assert node.match_index["1"] == 0  # untouched
+    assert node.next_index["1"] == 1  # untouched
+
+
+def test_reply_with_no_recorded_outstanding_request_is_ignored() -> None:
+    storage = MemoryStorage()
+    node = RaftNode("0", ["1"], storage, rng=random.Random(1))
+    node.role = Role.LEADER
+    node.leader_id = "0"
+    node.next_index = {"1": 1}
+    node.match_index = {"1": 0}
+    # Note: no _send_append_entries() call -- nothing has ever been sent
+    # to "1", so there's no outstanding record to interpret this against.
+
+    out = node.handle(AppendEntriesReply(term=node.current_term, success=True), src="1", now=0)
+
+    assert out == []
+    assert node.match_index["1"] == 0
+    assert node.next_index["1"] == 1
+
+
+def test_reply_arriving_after_stepping_down_is_ignored() -> None:
+    storage = MemoryStorage()
+    node = RaftNode("0", ["1"], storage, rng=random.Random(1))
+    node.role = Role.LEADER
+    node.leader_id = "0"
+    node.next_index = {"1": 1}
+    node.match_index = {"1": 0}
+    node._send_append_entries(now=0)
+
+    node.role = Role.FOLLOWER  # stepped down (e.g. discovered a legitimate leader)
+
+    out = node.handle(AppendEntriesReply(term=node.current_term, success=True), src="1", now=1)
+
+    assert out == []
+    assert node.match_index["1"] == 0  # untouched
+
+
+def test_out_of_order_replies_do_not_corrupt_match_index() -> None:
+    storage = MemoryStorage()
+    storage.append_entries([LogEntry(term=1, command=c) for c in "abcde"])  # 5 entries
+    node = RaftNode("0", ["1"], storage, rng=random.Random(1))
+    node.role = Role.LEADER
+    node.leader_id = "0"
+    node.next_index = {"1": 1}
+    node.match_index = {"1": 0}
+
+    # Two sends went out to "1" before either got a reply -- exactly what
+    # this leader does whenever a heartbeat or append_command fires again
+    # before the previous outstanding request was acknowledged. Only the
+    # most recent is ever recorded; here that's the second, larger one.
+    node._outstanding["1"] = (0, 3)  # first send: entries a, b, c
+    node._outstanding["1"] = (0, 5)  # second send: entries a..e (superset)
+
+    # The reply to the *second* send arrives first.
+    node.handle(AppendEntriesReply(term=node.current_term, success=True), src="1", now=1)
+    assert node.match_index["1"] == 5
+    assert node.next_index["1"] == 6
+
+    # The reply to the *first* (smaller, already-superseded) send arrives
+    # second. Nothing sent anything new to "1" in between, so it's
+    # attributed to the same (still-recorded) second-send parameters --
+    # a harmless re-application of the same values, not a regression.
+    node.handle(AppendEntriesReply(term=node.current_term, success=True), src="1", now=2)
+
+    assert node.match_index["1"] == 5  # never moved backward
+    assert node.next_index["1"] == 6
+
+
+def test_full_convergence_walks_back_and_overwrites_a_divergent_tail() -> None:
+    """A follower whose last 10 entries are stale gets walked back and
+    overwritten to match the leader exactly, one rejection at a time."""
+    leader_storage = MemoryStorage()
+    leader_storage.append_entries([LogEntry(term=2, command=f"leader-{i}") for i in range(1, 13)])
+
+    follower_storage = MemoryStorage()
+    follower_storage.append_entries(
+        [LogEntry(term=2, command="leader-1"), LogEntry(term=2, command="leader-2")]
+    )
+    # The follower's tail (indices 3..12) is from an old, overwritten term.
+    follower_storage.append_entries(
+        [LogEntry(term=1, command=f"stale-{i}") for i in range(3, 13)]
+    )
+
+    leader = RaftNode("leader", ["follower"], leader_storage, rng=random.Random(1))
+    follower = RaftNode("follower", ["leader"], follower_storage, rng=random.Random(2))
+    leader.current_term = 2
+    leader.role = Role.LEADER
+    leader.leader_id = "leader"
+    last_index = leader_storage.last_log_index()
+    leader.next_index = {"follower": last_index + 1}  # optimistic: 13
+    leader.match_index = {"follower": 0}
+
+    now = 0
+    produced = leader._send_append_entries(now=now)
+
+    rounds = 0
+    while produced:
+        rounds += 1
+        assert rounds < 100  # guard against an infinite retry loop
+        [(dst, msg)] = produced
+        assert dst == "follower"
+        [(reply_dst, reply_msg)] = follower.handle(msg, src="leader", now=now)
+        assert reply_dst == "leader"
+        now += 1
+        produced = leader.handle(reply_msg, src="follower", now=now)
+
+    assert rounds == 11  # 10 rejections walking back past the stale tail, then 1 acceptance
+    assert leader.match_index["follower"] == last_index
+    assert leader.next_index["follower"] == last_index + 1
+    assert follower_storage.load_log() == leader_storage.load_log()
