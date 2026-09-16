@@ -8,6 +8,7 @@ from raft.invariants import (
     check_leader_append_only,
     check_leader_completeness,
     check_log_matching,
+    check_no_spurious_truncation,
     check_state_machine_safety,
 )
 from raft.node import Role, raft_node_factory
@@ -128,6 +129,82 @@ def test_check_leader_append_only_resets_baseline_when_no_longer_leader() -> Non
     check_leader_append_only(cluster, history)  # must not raise: fresh baseline
 
 
+# -- No Spurious Truncation --
+
+
+def test_check_no_spurious_truncation_passes_on_a_healthy_cluster() -> None:
+    cluster = make_cluster(n=5, seed=1)
+    history: dict[str, list[LogEntry]] = {}
+
+    for _ in range(RUN_STEPS):
+        if not cluster.step():
+            break
+        check_no_spurious_truncation(cluster, history)  # must never raise
+
+
+def test_check_no_spurious_truncation_raises_when_an_equal_object_is_swapped_in() -> None:
+    cluster = make_cluster(n=3, seed=1)
+    history: dict[str, list[LogEntry]] = {}
+
+    node = cluster.get_node(0)
+    assert node is not None
+    original_entry = LogEntry(term=1, command="a")
+    node.storage.append_entries([original_entry])
+    check_no_spurious_truncation(cluster, history)  # records the baseline
+
+    # A *different* LogEntry object, but value-identical to what's already
+    # there -- exactly what a blind truncate-and-reappend of an
+    # already-matching resend would produce.
+    replacement = LogEntry(term=1, command="a")
+    assert replacement is not original_entry
+    assert replacement == original_entry
+    node.storage.truncate_from(1)
+    node.storage.append_entries([replacement])
+
+    with pytest.raises(SafetyViolation, match="torn down and rebuilt"):
+        check_no_spurious_truncation(cluster, history)
+
+
+def test_check_no_spurious_truncation_allows_a_genuine_value_change() -> None:
+    """Replacing an entry with a *different* value is legitimate conflict
+    resolution (Figure 2, step 3) -- not what this checker watches for."""
+    cluster = make_cluster(n=3, seed=1)
+    history: dict[str, list[LogEntry]] = {}
+
+    node = cluster.get_node(0)
+    assert node is not None
+    node.storage.append_entries([LogEntry(term=1, command="a")])
+    check_no_spurious_truncation(cluster, history)
+
+    node.storage.truncate_from(1)
+    node.storage.append_entries([LogEntry(term=2, command="different")])
+
+    check_no_spurious_truncation(cluster, history)  # must not raise
+
+
+def test_check_no_spurious_truncation_watches_followers_not_just_leaders() -> None:
+    """Unlike check_leader_append_only, this has no "only while leader"
+    exception -- the bug it exists for (a follower's blind receiver) lives
+    specifically in a role check_leader_append_only never looks at."""
+    cluster = make_cluster(n=3, seed=1)
+    history: dict[str, list[LogEntry]] = {}
+
+    node = cluster.get_node(0)
+    assert node is not None
+    assert node.role is Role.FOLLOWER
+
+    original_entry = LogEntry(term=1, command="a")
+    node.storage.append_entries([original_entry])
+    check_no_spurious_truncation(cluster, history)
+
+    replacement = LogEntry(term=1, command="a")
+    node.storage.truncate_from(1)
+    node.storage.append_entries([replacement])
+
+    with pytest.raises(SafetyViolation, match="torn down and rebuilt"):
+        check_no_spurious_truncation(cluster, history)
+
+
 # -- Log Matching --
 
 
@@ -188,6 +265,7 @@ def test_checkers_skip_crashed_nodes_without_erroring() -> None:
     check_election_safety(cluster)
     check_log_matching(cluster)
     check_leader_append_only(cluster, {})
+    check_no_spurious_truncation(cluster, {})
 
 
 # -- Not yet implemented --

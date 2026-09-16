@@ -26,9 +26,10 @@ enforced structurally rather than left to chance:
   behavior for long enough to actually react to it.
 
 CLIENT_REQUEST is what actually exercises replication -- without it, the
-cluster's log stays at the sentinel forever, and `check_log_matching` and
-`check_leader_append_only` both pass on every run for the same reason a
-test with no assertions passes: there's nothing there to be wrong. It
+cluster's log stays at the sentinel forever, and `check_log_matching`,
+`check_leader_append_only`, and `check_no_spurious_truncation` all pass
+on every run for the same reason a test with no assertions passes:
+there's nothing there to be wrong. It
 calls `append_command` on whichever node is currently leader (skipped,
 not an error, if there isn't one), with a command derived from
 `step_index` rather than a counter or a random draw, so the same seed
@@ -67,6 +68,7 @@ from raft.invariants import (
     check_election_safety,
     check_leader_append_only,
     check_log_matching,
+    check_no_spurious_truncation,
 )
 from raft.node import RaftClusterNode, Role, raft_node_factory
 from raft.sim.cluster import Cluster
@@ -276,6 +278,7 @@ class Fuzzer:
         self._partition_active = False
         self._heal_at = 0
         self._append_only_history: dict[str, list[LogEntry]] = {}
+        self._no_spurious_truncation_history: dict[str, list[LogEntry]] = {}
 
     def _choose_action(self) -> Action:
         actions = list(Action)
@@ -505,6 +508,7 @@ class Fuzzer:
         try:
             check_election_safety(self.cluster)
             check_leader_append_only(self.cluster, self._append_only_history)
+            check_no_spurious_truncation(self.cluster, self._no_spurious_truncation_history)
             check_log_matching(self.cluster)
         except SafetyViolation as violation:
             violation.step = step_index
