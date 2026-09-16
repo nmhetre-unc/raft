@@ -130,3 +130,26 @@ commit-index-dependent checks) were wired in:
 
 A clean sweep means the implemented checks found nothing, not that the
 implementation is correct.
+
+## check_state_machine_safety is a guaranteed-pass no-op until Milestone 5
+
+`last_applied` is initialized to 0 in RaftNode.__init__ and never advanced
+anywhere in the codebase — nothing reads commit_index and moves last_applied
+toward it, and no state machine exists to apply an entry's command to.
+
+check_state_machine_safety's guard is `if node.last_applied <= checked_through:
+continue`. With last_applied permanently 0, this is true for every node on
+every call, so the function returns before reaching its comparison-and-raise
+logic at all. This differs from a checker like check_log_matching, which
+executes its real comparison every step and simply hasn't found a mismatch:
+check_state_machine_safety never gets that far. It is correctly implemented
+and wired into every fuzzer step, but until something advances last_applied
+it verifies nothing. A clean sweep does not count as evidence for this
+property specifically.
+
+Scope: applying committed entries to a state machine is Raft's separate
+"apply" step (Figure 2 treats commit and apply as distinct), and belongs to
+the KV store milestone, not commitment. This was documented in RaftNode's
+own module docstring before this session and is not a new gap — it is
+flagged here so the mutation table and sweep results are read correctly:
+of the five implemented invariants, four are live and one is dormant.
