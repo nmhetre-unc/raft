@@ -1,13 +1,13 @@
 """The Raft node as a pure state machine.
 
-`RaftNode` implements leader election plus the *leader's* side of log
-replication's bookkeeping; there is still no follower-side handling of
-real entries, and no commit tracking. `AppendEntries` now carries real
-entries when a leader has any to send -- a heartbeat is just the
-special case where it doesn't -- but a receiving node still ignores
-whatever entries it's given and never advances a commit index. There is
-no `commitIndex` here; that, and follower-side application of entries,
-are Milestone 4.
+`RaftNode` implements leader election plus log replication (Figure 2's
+`AppendEntries` receiver implementation, in full) -- but no commit
+tracking. A follower now actually applies what it's sent: it runs the
+consistency check against `prev_log_index`/`prev_log_term`, deletes a
+conflicting entry and everything after it, and appends whatever's new.
+There is still no `commitIndex` anywhere in this file, and nothing here
+ever decides an entry is safe to hand to a state machine -- that's
+Milestone 4.
 
 A leader tracks two things per peer, and they are not interchangeable:
 
@@ -228,17 +228,58 @@ class RaftNode:
             return []
         return self._become_leader(now)
 
-    # -- AppendEntries (heartbeat; entries always ignored) --
+    # -- AppendEntries (Figure 2's receiver implementation, minus commit tracking) --
 
     def _handle_append_entries(
         self, msg: AppendEntries, src: str, now: int
     ) -> list[tuple[str, Message]]:
+        # 1. Reply false if term < currentTerm.
         if msg.term < self.current_term:
             return [(src, AppendEntriesReply(term=self.current_term, success=False))]
 
         self.role = Role.FOLLOWER
         self.leader_id = msg.leader_id
         self._reset_election_deadline(now)
+
+        log = self.storage.load_log()
+
+        # 2. Reply false if the log has no entry at prev_log_index, or has
+        # one whose term differs from prev_log_term -- the consistency
+        # check. Index 0 is the sentinel: every log has one, its term is
+        # always 0 everywhere, and any correctly-formed message naming
+        # prev_log_index=0 carries prev_log_term=0 too, so this passes
+        # unconditionally there without needing a special case for it.
+        if msg.prev_log_index >= len(log) or log[msg.prev_log_index].term != msg.prev_log_term:
+            return [(src, AppendEntriesReply(term=self.current_term, success=False))]
+
+        # 3 & 4. Find the first sent entry (if any) this follower doesn't
+        # already hold at that index and term -- Raft's Log Matching
+        # Property guarantees that wherever the term already matches, the
+        # command does too, so comparing term alone is exactly "already
+        # have this entry", not an approximation of it. Everything up to
+        # that point is left completely untouched: storage is only ever
+        # written to from the first genuine divergence onward, never
+        # truncated and rewritten over entries that already match. That
+        # matters because messages get duplicated in this system, and a
+        # resent, already-matching AppendEntries must be a true no-op --
+        # truncating and reappending would look identical afterward while
+        # having briefly discarded entries the leader already believes
+        # replicated (match_index says so), which is exactly the kind of
+        # gap a real crash could land in.
+        first_new = 0
+        while first_new < len(msg.entries):
+            index = msg.prev_log_index + 1 + first_new
+            if index >= len(log) or log[index].term != msg.entries[first_new].term:
+                break
+            first_new += 1
+
+        new_entries = msg.entries[first_new:]
+        if new_entries:
+            conflict_index = msg.prev_log_index + 1 + first_new
+            if conflict_index < len(log):
+                self.storage.truncate_from(conflict_index)  # 3: delete the conflict onward
+            self.storage.append_entries(list(new_entries))  # 4: append what's new
+        # 5. Commit tracking: skipped -- Milestone 4.
 
         return [(src, AppendEntriesReply(term=self.current_term, success=True))]
 
