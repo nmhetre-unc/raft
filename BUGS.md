@@ -211,16 +211,25 @@ A mutation test against the 50-seed sweep, re-run after `check_leader_
 completeness` and `check_state_machine_safety` (Milestone 4's
 commit-index-dependent checks) were wired in, and again after
 `check_no_spurious_truncation`'s value-based rewrite and `STALE_REDELIVER`
-(see the two entries above):
+(see the two entries above), and again after Milestone 5's `CLIENT_REQUEST`
+stopped omnisciently targeting the actual leader and started following
+`raft.node.NotLeader`'s own `leader_hint` instead (see the "leader-hint
+redirect" entry below) — that traffic-pattern change shifts sweep counts
+for mutations it has nothing to do with, the same way `STALE_REDELIVER`
+joining `DEFAULT_WEIGHTS` did before it, without touching either the
+mutation or the checker:
 
-- Blind truncate-and-reappend on a duplicate AppendEntries: **45/50
+- Blind truncate-and-reappend on a duplicate AppendEntries: **41/50
   seeds, all via `check_no_spurious_truncation`** (0 via
   `check_leader_completeness`, which runs later in the fixed check order
   and never gets the chance — a `SafetyViolation` stops the run at the
   first property that catches it). History: 2/50 (identity-based checker,
   `check_leader_completeness` only) → 43/50 (value-based checker,
   native reordering only) → 45/50 (with `STALE_REDELIVER` deliberately
-  constructing the precondition too).
+  constructing the precondition too) → 41/50 (leader-hint-following
+  `CLIENT_REQUEST`; see `tests/test_mutation_detection.py` for which of
+  the two seeds this diagnosis was built around, 3 and 35, is still in
+  the caught set and which no longer is).
 - Advancing match_index/next_index on a rejected reply, trusting it
   regardless of the reply's success flag: **closed**. 4/50 seeds, always via
   `check_leader_completeness` — some later, honestly elected leader ends up
@@ -242,9 +251,26 @@ commit-index-dependent checks) were wired in, and again after
 - Applying past commit_index — ignoring Figure 2's "apply" boundary
   entirely and replaying straight to the end of the log, committed or
   not (Milestone 5's replicated state machine and `last_applied` wiring,
-  see the entry below): **11/50 seeds, always via
-  `check_state_machine_safety`** — this checker's first real detection
+  see the entry below): 8/50 seeds (was 11/50 before the leader-hint
+  traffic-pattern shift described above), always via
+  `check_state_machine_safety` — this checker's first real detection
   in this project.
+- Skipping `apply_client_request`'s own serial_number dedup check
+  entirely — always re-applying a retried/redelivered `ClientRequest`
+  instead of recognizing it as already applied (Milestone 5's session
+  dedup, see "CLIENT_REQUEST sent opaque strings..." below): **0/50 via
+  any of the six `check_*` invariants — a structural gap, not a coverage
+  shortfall**. None of them ever inspect `KVStateMachine._data`/
+  `_sessions`; this mutation touches nothing else. The actually
+  appropriate detector — an `apply()`-call-counting spy, independent of
+  the mutation's own broken dedup decision, reused from
+  `tests/test_client_sessions.py`'s own positive-behavior test —
+  catches it on **38/50 seeds**. See
+  `tests/test_mutation_detection.py`'s two Mutation 6 tests: the sweep
+  numbers above, and a hand-built, fuzzer-independent proof that this is
+  a genuine final-value correctness hazard (a duplicate redelivery of an
+  already-superseded request clobbers a newer value with an older one)
+  that no existing checker could ever have a chance to see.
 
 A clean sweep means the implemented checks found nothing, not that the
 implementation is correct.
@@ -365,3 +391,100 @@ non-snapshotting implementation rather than build a bound that would
 either be unsafe or be substantially more scope than "minimal" — see
 `raft/statemachine.py`'s own module docstring for the same reasoning in
 place.
+
+## Milestone 5 complete: state machine, client sessions, and leader-hint redirect, verified under the full fault model
+
+Milestone 5 shipped across four prompts: the replicated `KVStateMachine`
+and `last_applied` wiring (above), per-client session dedup (above), a
+`NOT_LEADER`/`leader_hint` redirect so a client can find the leader
+without knowing it in advance, and this final pass — running the whole
+client-facing loop through the complete fault-injection harness at once,
+not each piece in isolation.
+
+**Leader-hint redirect** (`raft.node.NotLeader`, `RaftNode.leader_hint`):
+a node that isn't leader answers a client's `append_command` with
+`NotLeader(leader_hint=...)` instead of silently doing nothing —
+`leader_hint` is that node's own best current guess (the last node it saw
+a `RequestVote`/`AppendEntries` from at a term at least as new as its
+own), refreshed on every incoming message, read by nothing else in this
+file. `Fuzzer`'s `CLIENT_REQUEST` action follows it the way a real client
+has to (`_choose_client_request_target`), never omnisciently picking the
+actual leader — proven, not assumed, by two positive controls run
+directly against `_maybe_update_leader_hint`: a follower that hints
+itself is caught directly by
+`tests/test_replication.py::test_append_command_on_a_follower_hints_the_
+leader_it_last_saw`; a follower that forgets to check a message's term
+before trusting it — hinting whoever it saw N terms ago, stale or not —
+was, on first attempt, caught only *incidentally* by an unrelated
+mutation-detection sweep count shifting by one, not by any test actually
+asserting the property. That gap was closed by adding
+`test_append_command_hint_ignores_a_stale_message_from_an_earlier_term`,
+a direct assertion that a stale, lower-term message never overwrites a
+fresher hint. `leader_hint` itself is a plain node-id (`str` on
+`RaftNode`, `int` once `RaftClusterNode` translates it) used only as a
+dict-lookup key, never a message or node object reference — checked
+directly, not assumed safe by analogy to the id()-reuse hazard the
+client-sessions test above measured: there is no channel here for a
+reused Python object address to leak into a decision.
+
+**Reply-delivery scope, decided explicitly**: a client whose request
+commits but whose reply is dropped by fault injection (or whose leader
+crashes before it can reply at all) has no way, in this project, to
+*discover* the outcome beyond blindly retrying with the identical
+`(client_id, serial_number, command)`. That retry is always safe — session
+dedup guarantees at most one real application regardless — just
+uninformative. Building a way to answer "what happened to serial N?"
+would mean `append_command` consulting the leader's own session state
+before appending and a new return shape distinct from both `NotLeader`
+and "appended, in flight" — genuine new client-protocol surface, and one
+that still wouldn't fully solve the problem it targets (an *in-flight*,
+not-yet-committed request still has no result to report). Decided to
+document this as a permanent, accepted limitation instead, the same way
+`_sessions`'s unbounded growth and `read()`'s non-linearizability are
+documented above — not a gap to close later, a property of this
+project's scope. `Get` needs no special handling as a consequence: it was
+already never put through the log (see `raft/statemachine.py`'s own
+module docstring), and this decision doesn't change that.
+
+**Verified under the full combined fault model** — `CLIENT_REQUEST`
+(including retries that follow `leader_hint`), `STALE_REDELIVER`,
+`CRASH`, `RESTART`, `PARTITION`/`HEAL`, and `ADVANCE_CLOCK` all active at
+once, exactly `raft.sim.fuzz.DEFAULT_WEIGHTS`, both at 50 seeds (always)
+and 1000 seeds (`-m slow`):
+
+- Zero `SafetyViolation`s of any kind, at either sweep size.
+- `check_state_machine_safety` specifically, not bundled into that
+  generic result: measured non-vacuous over the 50-seed sweep — 40/50
+  seeds genuinely apply at least one entry somewhere, 292 distinct
+  applied-index observations total (6050 over the 1000-seed sweep) — so
+  a clean run means this checker was actually exercised, the same
+  distinction drawn above for why a clean sweep meant nothing before
+  Milestone 4's apply-wiring landed. See
+  `tests/test_client_request_integration.py::test_check_state_machine_
+  safety_stays_clean_under_the_full_fault_model`.
+- A deterministic, hand-built proof
+  (`test_client_request_survives_redirect_retry_and_a_leader_crash`) that
+  the whole loop holds together end to end: a client hits a follower,
+  gets redirected via `leader_hint`, retries against the real leader,
+  that leader commits and crashes before any follower learns of it, the
+  client retries again — blind to whether its first attempt ever
+  committed — against a newly-elected leader, and the command ends up
+  applied exactly once (an `apply()` call count, not a final-value
+  comparison, which a duplicate `Put` could never expose).
+- Final KV state cross-checked, for a handful of fuzzed seeds, against an
+  independently recomputed expectation derived straight from each node's
+  own committed log (a from-scratch dedup reimplementation, never a call
+  into `KVStateMachine` itself) —
+  `test_final_kv_state_matches_an_independently_computed_expectation`.
+  Stronger than Milestone 4's own bar ("differs by seed"): this confirms
+  *correct*, not just *varied*.
+- Mutation 6, this milestone's own target bug (skip session dedup
+  entirely) — see the coverage-gaps table above for the full report:
+  0/50 via the six existing `check_*` invariants (a structural gap, not a
+  shortfall), 38/50 via the appropriate detector.
+
+Of the five implemented invariants plus the client-session dedup
+mechanism, all are now exercised — not just wired in — by the complete
+fault model at once. Milestone 5 is complete; snapshotting and cluster
+membership changes remain out of scope, tracked as Milestone 6 (or
+later), not started here.

@@ -112,7 +112,38 @@ Summary from the actual run (n=5, steps=300, seeds 0..49), after
   sees different content than what an earlier, premature application
   already recorded there, and the checker's cross-observation comparison
   catches exactly that.
+- Skipping `apply_client_request`'s own serial_number dedup check
+  entirely -- always re-applying a `ClientRequest`'s command, even when
+  the log legitimately carries the same logical request more than once
+  (a resend that already committed once, or a duplicate produced by
+  `STALE_REDELIVER` or a misdirected-then-redirected retry): **0/50
+  detected by any of the six existing `check_*` invariants -- GAP, and
+  a structural one, not a coverage shortfall to chase**. Every one of
+  those checkers inspects replicated *log content* or replication-level
+  bookkeeping (`match_index`, `commit_index`, `last_applied`'s bound);
+  none of them ever look at `KVStateMachine._data`/`_sessions`, and this
+  mutation touches nothing else -- replication, the log, and
+  `last_applied` all proceed identically to unmutated code. It also
+  doesn't corrupt final *value* correctness as often as it sounds like
+  it should: `Put`/`Delete` are idempotent, so a duplicate re-application
+  of the *same* request only produces a wrong final value in the specific
+  window where a *different* request for the same key committed in
+  between the two log occurrences of the duplicate -- 0/50 seeds hit
+  that specific interleaving in this sample (see
+  `test_mutation_skip_session_dedup_check_is_a_structural_gap_for_existing_
+  checkers` for the direct value-level confirmation). What the bug always
+  does, on every seed that ever resends anything, is genuinely re-execute
+  `state_machine.apply()` a second time for an already-applied
+  `(client_id, serial_number)` -- caught, independent of
+  `apply_client_request`'s own internal decision, by
+  `tests/test_client_sessions.py`'s `apply()`-call-counting spy technique
+  (reused here as `_apply_spy_sweep`): **38/50 seeds** show a real,
+  observable double-application this way. This is the actually
+  appropriate detector for this bug class, not `check_state_machine_
+  safety` -- see that test's own docstring for the full reasoning.
 """
+
+import itertools
 
 import pytest
 
@@ -121,7 +152,7 @@ from raft.messages import AppendEntries, AppendEntriesReply, Message
 from raft.node import RaftNode, Role, raft_node_factory
 from raft.sim.cluster import Cluster
 from raft.sim.fuzz import Fuzzer
-from raft.statemachine import Delete, Get, Put
+from raft.statemachine import ClientRequest, Delete, Get, KVStateMachine, Put, _ClientSession
 from raft.storage import LogEntry
 
 N_NODES = 5
@@ -644,3 +675,175 @@ def test_mutation_apply_past_commit_index_is_detected(monkeypatch: pytest.Monkey
     assert all(
         "applied" in reason and "already applied there" in reason for reason in violations.values()
     )
+
+
+def _mutation_6_skip_session_dedup(self: KVStateMachine, request: ClientRequest) -> object:
+    """Mutation 6, this milestone's own target bug: skip
+    `apply_client_request`'s serial_number dedup check entirely --
+    unconditionally call `apply()` and overwrite the recorded session,
+    even when the log legitimately carries the same `(client_id,
+    serial_number)` more than once (a resend that already committed once,
+    or a duplicate produced by `STALE_REDELIVER` or a misdirected-then-
+    redirected retry -- see `raft.sim.fuzz`'s own module docstring).
+    Otherwise identical to the real `apply_client_request`.
+    """
+    result = self.apply(request.command)
+    self._sessions[request.client_id] = _ClientSession(request.serial_number, result)
+    return result
+
+
+def _apply_spy_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[int, dict[tuple[int, str], list[int]]]:
+    """Run the 50-seed sweep under Mutation 6 with an `apply()`-call-
+    counting spy installed on every `KVStateMachine` instance -- the same
+    technique, for the same id()-reuse reason, as
+    `tests/test_client_sessions.py`'s own
+    `test_no_double_application_across_the_fixed_seed_sweep`: each
+    instance is tagged with a monotonic id at construction so a crashed-
+    then-restarted node's fresh `KVStateMachine` (a legitimate, correct
+    replay from scratch -- see that test's own docstring) is never
+    conflated with an unrelated, already-garbage-collected instance that
+    happened to reuse the same address.
+
+    Detection is independent of `apply_client_request`'s own dedup
+    decision -- the spy only observes whether the underlying, state-
+    mutating `apply()` genuinely ran, so a mutation that's wrong about
+    when to skip can't hide from this by consistently agreeing with
+    itself.
+
+    Returns `{seed: {(machine_id, client_id): [serial_number, ...]}}`,
+    one entry per seed that shows at least one machine/client pair with a
+    repeated serial number among its genuinely-applied calls -- i.e. a
+    real double-application. A seed absent from the result never
+    double-applied anything, even though the dedup check was off the
+    entire time -- it simply never happened to resend/redeliver a request
+    whose serial had already been applied on that particular seed.
+    """
+    instance_ids: dict[int, int] = {}
+    next_instance_id = itertools.count()
+    original_init = KVStateMachine.__init__
+
+    def tagging_init(self: KVStateMachine) -> None:
+        original_init(self)
+        instance_ids[id(self)] = next(next_instance_id)
+
+    applied_log: list[tuple[int, str, int]] = []
+
+    def spy_apply_client_request(self: KVStateMachine, request: ClientRequest) -> object:
+        mutated = {"flag": False}
+        original_apply = self.apply
+
+        def tracking_apply(command: object) -> object:
+            mutated["flag"] = True
+            return original_apply(command)
+
+        self.apply = tracking_apply  # type: ignore[method-assign]
+        try:
+            result = _mutation_6_skip_session_dedup(self, request)
+        finally:
+            del self.apply  # restores the class method for the next call
+        if mutated["flag"]:
+            applied_log.append((instance_ids[id(self)], request.client_id, request.serial_number))
+        return result
+
+    monkeypatch.setattr(KVStateMachine, "__init__", tagging_init)
+    monkeypatch.setattr(KVStateMachine, "apply_client_request", spy_apply_client_request)
+
+    results: dict[int, dict[tuple[int, str], list[int]]] = {}
+    for seed in range(SEED_COUNT):
+        applied_log.clear()
+        fuzzer = Fuzzer(n=N_NODES, seed=seed, steps=STEPS_PER_SEED)
+        fuzzer.run()  # Mutation 6 never raises SafetyViolation -- see the test below
+
+        by_machine_client: dict[tuple[int, str], list[int]] = {}
+        for machine_id, client_id, serial in applied_log:
+            by_machine_client.setdefault((machine_id, client_id), []).append(serial)
+
+        duplicated = {
+            key: serials
+            for key, serials in by_machine_client.items()
+            if len(serials) != len(set(serials))
+        }
+        if duplicated:
+            results[seed] = duplicated
+
+    return results
+
+
+def test_mutation_skip_session_dedup_check_is_detected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mutation 6 against the 50-seed sweep, reported the same two ways
+    the module docstring's own entry documents:
+
+    Against the six existing `check_*` invariants (`_sweep()`, the exact
+    mechanism every other mutation in this file is scored by): **0/50 --
+    a structural gap, not a coverage shortfall**. Every one of those
+    checkers inspects replicated log content or replication-level
+    bookkeeping; this mutation never touches any of that -- only
+    `KVStateMachine._data`/`_sessions`, which none of them ever read. See
+    `test_mutation_skip_session_dedup_check_is_a_structural_gap_for_
+    existing_checkers` for direct, fuzzer-independent proof this is a
+    real value-correctness hazard regardless, and for exactly why no
+    existing checker could ever see it.
+
+    Against `_apply_spy_sweep` -- an `apply()`-call-counting spy,
+    independent of this mutation's own (broken) dedup decision, reused
+    from `tests/test_client_sessions.py`'s own positive-behavior test for
+    this exact property -- **38/50 seeds** show a real, observable double
+    application. This is the actually appropriate detector for this bug
+    class.
+    """
+    monkeypatch.setattr(KVStateMachine, "apply_client_request", _mutation_6_skip_session_dedup)
+
+    violations = _sweep()
+    assert violations == {}, (
+        f"expected this to stay a structural gap for the six check_* invariants "
+        f"(see the module docstring); found: {violations}"
+    )
+
+    double_applications = _apply_spy_sweep(monkeypatch)
+    assert len(double_applications) == 38, f"detection rate shifted: {sorted(double_applications)}"
+
+
+def test_mutation_skip_session_dedup_check_is_a_structural_gap_for_existing_checkers() -> None:
+    """Hand-built, fuzzer-independent proof of the two claims the sweep
+    numbers above only make statistically:
+
+    1. This is a genuine final-*value* correctness hazard, not merely a
+       wasted `apply()` call: constructed directly here, a duplicate log
+       entry for an already-superseded request -- exactly what
+       `STALE_REDELIVER` or a misdirected-then-redirected retry can
+       legitimately produce (see `raft.sim.fuzz`'s own module docstring)
+       -- makes the mutated `apply_client_request` clobber a NEWER value
+       with an OLDER one. The real, unmutated implementation is immune to
+       the identical sequence.
+    2. None of the six `check_*` invariants could ever have a chance to
+       catch this, even in this exact corrupting scenario: they all
+       operate on `RaftNode.storage`/`commit_index`/`last_applied`, none
+       of which this mutation touches -- replication and the log proceed
+       completely unaffected. Only `KVStateMachine._data`/`_sessions`
+       differ, and no `check_*` function ever reads either.
+    """
+    first = ClientRequest(client_id="c1", serial_number=1, command=Put(key="x", value=1))
+    second = ClientRequest(client_id="c1", serial_number=2, command=Put(key="x", value=2))
+
+    mutated_machine = KVStateMachine()
+    _mutation_6_skip_session_dedup(mutated_machine, first)
+    _mutation_6_skip_session_dedup(mutated_machine, second)
+    assert mutated_machine.snapshot() == {"x": 2}  # correct so far -- nothing duplicated yet
+
+    # A duplicate log entry for the FIRST, now-superseded request arrives
+    # and gets applied a second time.
+    _mutation_6_skip_session_dedup(mutated_machine, first)
+
+    assert mutated_machine.snapshot() == {"x": 1}, (
+        "mutation failed to reproduce the value-corruption hazard -- test needs revisiting"
+    )
+
+    # The real, unmutated implementation is immune to the identical sequence.
+    correct_machine = KVStateMachine()
+    correct_machine.apply_client_request(first)
+    correct_machine.apply_client_request(second)
+    correct_machine.apply_client_request(first)  # the same duplicate redelivery
+
+    assert correct_machine.snapshot() == {"x": 2}

@@ -9,8 +9,10 @@ checks Raft's safety properties after every step. A failing 160-step trace
 shrinks by delta debugging to the 1 or 2 actions that actually reproduce the
 violation. 1000 randomized schedules run in 28 seconds in CI.
 
-Currently implements leader election. Log replication, commitment, and
-snapshotting are in progress.
+Implements leader election, log replication, commitment, and a replicated
+key/value state machine with per-client session dedup and NOT_LEADER/
+leader-hint client redirect (Milestone 5, complete). Snapshotting and
+cluster membership changes are not implemented.
 
 ## Bugs found
 
