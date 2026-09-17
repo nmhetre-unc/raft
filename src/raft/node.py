@@ -1,10 +1,34 @@
 """The Raft node as a pure state machine.
 
 `RaftNode` implements leader election, log replication in both
-directions, and commitment -- deciding when an entry is safe. There is
-still no state machine to actually *apply* a committed entry to
-(`last_applied` exists and is tracked as a field, but nothing advances
-it yet), and no log compaction; those remain later milestones.
+directions, commitment -- deciding when an entry is safe -- and
+applying committed entries to a replicated key/value state machine
+(`raft.statemachine.KVStateMachine`). There is still no log compaction;
+that remains a later milestone.
+
+Applying is Figure 2's separate step, deliberately kept separate here
+too: `_apply_committed_entries` never decides *whether* something is
+safe (that's `_advance_commit_index`'s job alone, untouched by this),
+only *replays* whatever is already committed, one entry at a time, in
+order, toward whatever the state machine hasn't seen yet. It is pure
+state-machine-side logic -- a leader gets no special treatment here, and
+every node, in every role, applies its own committed entries identically.
+`last_applied` (like `commit_index`) stays volatile, not persisted, for
+the same reason: a restarted node's `Storage` is untouched by the crash
+(see `raft.storage`'s module docstring), so replaying the same committed
+log from index 1 into a fresh `KVStateMachine` after a restart
+reconstructs the identical final state a real disk-backed state machine
+would have kept -- redundant durability, not a gap. A command reaching
+`_apply_committed_entries` that isn't a real `raft.statemachine.Command`
+(the log's own index-0 sentinel, `_become_leader`'s content-free no-op,
+or -- outside this file -- a test or fuzzer using an opaque placeholder
+command to exercise replication without caring about state-machine
+semantics) is treated as inert: `last_applied` still advances past it,
+one index at a time, exactly like any other entry, but nothing is fed to
+the state machine for it. `get` is NOT put through this path at all in
+this milestone -- see `raft.statemachine.KVStateMachine.read` for the
+local-read alternative used instead, and the linearizability limitation
+that comes with it.
 
 Commitment's one rule matters more than everything else in this file
 combined, and it is stated here in full rather than assumed known:
@@ -112,6 +136,7 @@ from raft.messages import (
     RequestVote,
     RequestVoteReply,
 )
+from raft.statemachine import Delete, Get, KVStateMachine, Put
 from raft.storage import LogEntry, Storage
 
 
@@ -122,7 +147,8 @@ class Role(Enum):
 
 
 class RaftNode:
-    """A single Raft node's state machine: election, replication, commitment.
+    """A single Raft node's state machine: election, replication, commitment,
+    and applying committed entries to a replicated key/value store.
 
     Persistent (loaded from `storage` at construction, saved back to it
     before any reply that changed them is returned): `current_term`,
@@ -131,14 +157,17 @@ class RaftNode:
     Volatile (never touches `storage`, reset to nothing meaningful by a
     fresh construction -- i.e. by a simulated crash and restart):
     `role`, `leader_id`, `election_deadline`, `votes_received`,
-    `commit_index`, `last_applied`, and -- only meaningful while `role is
-    Role.LEADER`, reinitialized fresh on every election win --
-    `next_index`, `match_index`. `commit_index` staying volatile is
-    deliberate, not an oversight: it is fully reconstructible from the
-    current leader's next heartbeat after a restart (see
+    `commit_index`, `last_applied`, `state_machine`, and -- only
+    meaningful while `role is Role.LEADER`, reinitialized fresh on every
+    election win -- `next_index`, `match_index`. `commit_index` staying
+    volatile is deliberate, not an oversight: it is fully reconstructible
+    from the current leader's next heartbeat after a restart (see
     `_handle_append_entries`'s step 5), so persisting it would just be
     redundant durability for a value every live node already recomputes
-    on its own.
+    on its own. `last_applied`/`state_machine` are volatile for the
+    matching reason: replaying the untouched, persisted log back into a
+    fresh `KVStateMachine` after a restart reconstructs the identical
+    final state (see the module docstring).
     """
 
     def __init__(
@@ -181,10 +210,11 @@ class RaftNode:
         self.election_deadline: int = 0
         self._next_heartbeat: int = 0
         # The highest index this node believes is committed, and the
-        # highest index applied to a state machine that doesn't exist yet.
-        # Both volatile -- see the class docstring for why that's safe.
+        # highest index actually applied to state_machine so far. Both
+        # volatile -- see the class docstring for why that's safe.
         self.commit_index: int = 0
         self.last_applied: int = 0
+        self.state_machine = KVStateMachine()
         # Leader-only, meaningless until the first election win; see the
         # module docstring for why these are never derived from each other.
         self.next_index: dict[str, int] = {}
@@ -217,6 +247,7 @@ class RaftNode:
             out.extend(self._send_append_entries(now))
 
         self._persist_if_dirty()
+        self._apply_committed_entries()
         return out
 
     def handle(self, msg: Message, src: str, now: int) -> list[tuple[str, Message]]:
@@ -235,6 +266,7 @@ class RaftNode:
             raise TypeError(f"unknown message type: {type(msg)!r}")
 
         self._persist_if_dirty()
+        self._apply_committed_entries()
         return out
 
     # -- Figure 2, rule 1: applied first, before any message-specific logic --
@@ -424,6 +456,42 @@ class RaftNode:
             self.commit_index = candidate
             return
 
+    def _apply_committed_entries(self) -> None:
+        """Figure 2's separate "apply" step: replay every not-yet-applied
+        entry, in order, from `last_applied + 1` through `commit_index`,
+        advancing `last_applied` by exactly one per entry -- never
+        jumping straight to `commit_index`, never skipping one. Called
+        unconditionally at the end of `tick`, `handle`, and
+        `append_command` -- the same three (and only) places `commit_index`
+        can ever change, directly or transitively -- mirroring
+        `_persist_if_dirty`'s own pattern of a single, un-skippable
+        checkpoint at the end of every public entry point rather than a
+        call threaded through each individual commit_index-changing
+        branch. The `if` guard below makes the common case (nothing new
+        committed since last time) a cheap no-op, so calling this
+        unconditionally costs nothing when there's nothing to do.
+
+        Never decides whether an index is safe to apply -- that's
+        `_advance_commit_index`'s job alone, and by the time this runs,
+        `commit_index` has already been decided. This treats a leader no
+        differently than a follower: whoever is calling this just replays
+        the committed log it already has.
+
+        `entry.command` reaching an unrecognized type (not a real
+        `raft.statemachine.Command`) is treated as inert, not an error --
+        see the module docstring for exactly which entries take this path
+        and why applying nothing for them is still correct.
+        """
+        if self.last_applied >= self.commit_index:
+            return
+
+        log = self.storage.load_log()
+        for index in range(self.last_applied + 1, self.commit_index + 1):
+            command = log[index].command
+            if isinstance(command, Put | Get | Delete):
+                self.state_machine.apply(command)
+            self.last_applied = index
+
     # -- Elections and heartbeats --
 
     def _start_election(self, now: int) -> list[tuple[str, Message]]:
@@ -529,7 +597,9 @@ class RaftNode:
         # can commit immediately without waiting on a reply that will
         # never come.
         self._advance_commit_index()
-        return self._send_append_entries(now)
+        out = self._send_append_entries(now)
+        self._apply_committed_entries()
+        return out
 
     def _has_majority(self) -> bool:
         cluster_size = len(self.peers) + 1  # +1 for this node
@@ -564,9 +634,9 @@ class RaftClusterNode:
     the way. The handful of fields external callers (tests, invariant
     checkers) actually need to inspect -- `role`, `current_term`,
     `voted_for`, `leader_id`, `node_id`, `storage`, `commit_index`,
-    `last_applied` -- are typed properties reading straight through to the
-    real node; anything else falls back through `__getattr__`, untyped but
-    still reachable.
+    `last_applied`, `state_machine` -- are typed properties reading
+    straight through to the real node; anything else falls back through
+    `__getattr__`, untyped but still reachable.
     """
 
     def __init__(self, raft_node: RaftNode) -> None:
@@ -606,6 +676,10 @@ class RaftClusterNode:
     @property
     def last_applied(self) -> int:
         return self.raft_node.last_applied
+
+    @property
+    def state_machine(self) -> KVStateMachine:
+        return self.raft_node.state_machine
 
     def tick(self, now: int) -> list[tuple[int, object]]:
         return [(int(dst), msg) for dst, msg in self.raft_node.tick(now)]

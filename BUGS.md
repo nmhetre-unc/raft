@@ -239,29 +239,65 @@ commit-index-dependent checks) were wired in, and again after
   and still not obviously a safety bug — prev_log_index 0 always passes the
   sentinel check, so peers get a redundant resend that correct follower
   logic treats as a no-op.
+- Applying past commit_index — ignoring Figure 2's "apply" boundary
+  entirely and replaying straight to the end of the log, committed or
+  not (Milestone 5's replicated state machine and `last_applied` wiring,
+  see the entry below): **11/50 seeds, always via
+  `check_state_machine_safety`** — this checker's first real detection
+  in this project.
 
 A clean sweep means the implemented checks found nothing, not that the
 implementation is correct.
 
-## check_state_machine_safety is a guaranteed-pass no-op until Milestone 5
+## check_state_machine_safety was permanently un-triggerable before Milestone 5; now live
 
-`last_applied` is initialized to 0 in RaftNode.__init__ and never advanced
-anywhere in the codebase — nothing reads commit_index and moves last_applied
-toward it, and no state machine exists to apply an entry's command to.
+Prior to Milestone 5, `last_applied` was initialized to 0 in
+`RaftNode.__init__` and never advanced anywhere in the codebase — nothing
+read `commit_index` and moved `last_applied` toward it, and no state
+machine existed to apply an entry's command to.
 
-check_state_machine_safety's guard is `if node.last_applied <= checked_through:
-continue`. With last_applied permanently 0, this is true for every node on
-every call, so the function returns before reaching its comparison-and-raise
-logic at all. This differs from a checker like check_log_matching, which
-executes its real comparison every step and simply hasn't found a mismatch:
-check_state_machine_safety never gets that far. It is correctly implemented
-and wired into every fuzzer step, but until something advances last_applied
-it verifies nothing. A clean sweep does not count as evidence for this
-property specifically.
+`check_state_machine_safety`'s guard is `if node.last_applied <=
+checked_through: continue`. With `last_applied` permanently 0, this was
+true for every node on every call, so the function returned before ever
+reaching its comparison-and-raise logic. This differed from a checker
+like `check_log_matching`, which executes its real comparison every step
+and simply hadn't found a mismatch: `check_state_machine_safety` never
+got that far. It was correctly implemented and wired into every fuzzer
+step, but with nothing ever advancing `last_applied`, it was not merely
+quiet — it was structurally incapable of ever firing, on any run, no
+matter how long. The hand-constructed unit tests in
+`test_invariants.py` (`test_check_state_machine_safety_raises_when_two_
+nodes_apply_different_entries`, etc.) proved the checker's own logic was
+sound, but proved nothing about whether real `RaftNode` behavior could
+ever reach it — and, until this milestone, nothing could.
 
-Scope: applying committed entries to a state machine is Raft's separate
-"apply" step (Figure 2 treats commit and apply as distinct), and belongs to
-the KV store milestone, not commitment. This was documented in RaftNode's
-own module docstring before this session and is not a new gap — it is
-flagged here so the mutation table and sweep results are read correctly:
-of the five implemented invariants, four are live and one is dormant.
+Milestone 5 (`src/raft/statemachine.py`'s `KVStateMachine`, and
+`RaftNode._apply_committed_entries`, called at the end of `tick`,
+`handle`, and `append_command` — see `raft.node`'s module docstring)
+gives `last_applied` something to actually advance toward. First real
+results:
+
+- **Unmutated code, 50-seed sweep**: `last_applied` advances on at least
+  one live node in 34/50 seeds, reaching as high as 22 across 199 total
+  live-node observations, and never once exceeds `commit_index` —
+  `check_state_machine_safety` is now genuinely exercised on ordinary
+  fuzzing, not just vacuously satisfied (see
+  `tests/test_apply.py::test_last_applied_is_bounded_and_nonzero_across_the_fixed_seed_sweep`).
+- **Mutation 5** (apply past `commit_index` instead of stopping there —
+  see `tests/test_mutation_detection.py`): **11/50 seeds, always via
+  `check_state_machine_safety`** — the first time this checker has ever
+  caught anything through real `RaftNode` execution rather than a
+  hand-set field. Mechanism: an entry applied before it was actually
+  committed can still be truncated and overwritten by a later, honestly
+  elected leader that never saw it as committed (exactly the hazard
+  Figure 8 exists to rule out at the *commit* level; this is its
+  *apply*-level analogue). When that happens, whatever next applies that
+  same index sees genuinely different log content than an earlier,
+  premature application already recorded there.
+
+Scope, unchanged from before: applying committed entries to a state
+machine is Raft's separate "apply" step (Figure 2 treats commit and
+apply as distinct). This was documented in `RaftNode`'s own module
+docstring before this milestone and is not a new gap — it is corrected
+here now that the gap has actually been closed: of the five implemented
+invariants, all five are live.

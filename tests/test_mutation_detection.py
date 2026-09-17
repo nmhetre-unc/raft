@@ -6,7 +6,7 @@ itself -- and runs the same 50-seed sweep `tests/test_fuzz_sweep.py`
 runs, to answer one question: does the fuzzer actually notice?
 
 The honest answer, found by actually running this, is "not always." One
-of the four mutations here is a **known, tracked gap**: the sweep passes
+of the five mutations here is a **known, tracked gap**: the sweep passes
 all 50 seeds even though the mutated code is genuinely wrong. That test
 asserts the current (unfortunate) truth -- zero detections -- on
 purpose, so that this file itself is the record of the gap, and so that
@@ -71,12 +71,26 @@ Summary from the actual run (n=5, steps=300, seeds 0..49), after
   *unmutated* code, removed it -- see BUGS.md. The mutation is rewritten
   here to recreate the same class of bug against the message shape that
   replaced it.)
-- Skipping the AppendEntries consistency check entirely: 33/50 detected
-  -- 32 via check_log_matching, 1 via check_leader_completeness (see that
-  test for why one seed's report differs from the rest).
+- Skipping the AppendEntries consistency check entirely: 31/50 detected
+  (was 33/50 before `STALE_REDELIVER` joined `DEFAULT_WEIGHTS` -- see
+  that entry above for why a new action shifts counts for mutations it
+  has nothing to do with, by perturbing the shared RNG stream, not a
+  regression) -- 30 via check_log_matching, 1 via check_leader_completeness
+  (see that test for why one seed's report differs from the rest).
 - Leader-side next_index initialized to 1 instead of last_log_index + 1:
   0/50 detected -- GAP, and on reflection this one may not be a safety
   gap at all, just a wasteful one (see its test for why).
+- Applying past commit_index -- ignoring Figure 2's "apply" boundary
+  entirely and replaying straight to the end of the log, committed or
+  not (Milestone 5's replicated state machine and `last_applied`
+  wiring): 11/50 detected, always via `check_state_machine_safety` --
+  the **first real detection this checker has ever produced** in this
+  project (see BUGS.md). An entry applied before it was actually safe
+  can still be truncated and overwritten by a later, honestly elected
+  leader that never saw it as committed; when that happens, whatever
+  next applies that same index sees different content than what an
+  earlier, premature application already recorded there, and the
+  checker's cross-observation comparison catches exactly that.
 """
 
 import pytest
@@ -86,6 +100,7 @@ from raft.messages import AppendEntries, AppendEntriesReply, Message
 from raft.node import RaftNode, Role, raft_node_factory
 from raft.sim.cluster import Cluster
 from raft.sim.fuzz import Fuzzer
+from raft.statemachine import Delete, Get, Put
 from raft.storage import LogEntry
 
 N_NODES = 5
@@ -539,3 +554,61 @@ def test_mutation_pessimistic_next_index_is_not_detected(
     violations = _sweep()
 
     assert violations == {}, f"expected this known gap to stay undetected; found: {violations}"
+
+
+def _mutation_5_apply_past_commit_index(self: RaftNode) -> None:
+    """Mutation 5: ignore commit_index's safety boundary entirely and
+    apply straight to the end of the log -- whatever is currently there,
+    committed or not -- instead of stopping at commit_index. Otherwise
+    identical to the real `_apply_committed_entries`: still advances
+    `last_applied` one index at a time, still skips non-`Command`
+    entries. The one thing missing is the one thing that makes applying
+    safe at all.
+    """
+    unsafe_bound = self.storage.last_log_index()
+    if self.last_applied >= unsafe_bound:
+        return
+    log = self.storage.load_log()
+    for index in range(self.last_applied + 1, unsafe_bound + 1):
+        command = log[index].command
+        if isinstance(command, Put | Get | Delete):
+            self.state_machine.apply(command)
+        self.last_applied = index
+
+
+def test_mutation_apply_past_commit_index_is_detected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mutation 5: apply everything currently in the log, not just what's
+    actually committed -- the one bug this milestone's own new checker,
+    `check_state_machine_safety`, exists to catch.
+
+    Why this is unsafe and "out of order" (the example given for this
+    positive control) wouldn't be, given how the checker actually works:
+    `check_state_machine_safety` compares `node.storage.load_log()[index]`
+    -- the log's own content -- against whatever any node has previously
+    recorded as applied at that index; it never inspects the state
+    machine's own resulting dict. Calling `state_machine.apply()` in the
+    wrong order (but still bounded by commit_index) can produce a wrong
+    *value* in the KV store, but produces no *log*-content divergence at
+    any index for the checker to ever see -- Raft's Log Matching Property
+    already guarantees the log itself agrees at any shared, committed
+    index. Applying PAST commit_index is different: an entry applied
+    before it was actually safe can still be truncated and overwritten
+    by a later, honestly elected leader that never saw it as committed
+    (Figure 8's whole reason for existing) -- and when that happens,
+    whatever next reads that index sees genuinely different log content
+    than an earlier, premature application already recorded.
+
+    DETECTED: 11/50 seeds, always via `check_state_machine_safety` -- the
+    first real detection this checker has ever produced (see BUGS.md;
+    every prior mention of it in this project was either "vacuously
+    satisfied" or a hand-constructed unit test in test_invariants.py that
+    never went through real `RaftNode` apply logic at all).
+    """
+    monkeypatch.setattr(RaftNode, "_apply_committed_entries", _mutation_5_apply_past_commit_index)
+
+    violations = _sweep()
+
+    assert len(violations) == 11, f"detection rate shifted: {violations}"
+    assert all(
+        "applied" in reason and "already applied there" in reason for reason in violations.values()
+    )
