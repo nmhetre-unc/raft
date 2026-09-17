@@ -54,6 +54,24 @@ each action here now writes its resolved parameters (`node_id`,
 `group_a`/`group_b`, `ms`) into the same record, so `Fuzzer.trace` -- the
 thing you actually have on hand after a run -- is directly replayable
 with no extra bookkeeping.
+
+STALE_REDELIVER deliberately constructs the one precondition that used
+to depend entirely on the Network's own random reordering (see BUGS.md's
+diagnosis of Mutation 1, a mutation still only in
+`tests/test_mutation_detection.py`, never real code): an `AppendEntries`
+that a follower already received and has since moved past -- because a
+strictly *larger* one arrived after it -- gets redelivered. On unmutated
+code this is a proven no-op (the real handler's "already matches" check
+handles it exactly like any other harmless resend); the whole reason to
+add it is that Mutation 1 does *not* handle it safely, and 7/50 seeds
+in the fixed sweep never happened to hit this precondition through
+reordering alone within 300 steps. Candidates come from `Network`'s own
+bounded, per-link delivery history (`Network.history_by_link`), never
+from anything this module tracks separately -- picking one and recording
+its `msg_id` (`TraceEntry.msg_id`) is enough for `replay()` to find the
+identical record again later via `Network.recall`, deterministically,
+with no RNG of any kind (neither this module's own `self._rng` nor
+`Network`'s) needed to reproduce it.
 """
 
 from __future__ import annotations
@@ -74,8 +92,10 @@ from raft.invariants import (
     check_no_spurious_truncation,
     check_state_machine_safety,
 )
+from raft.messages import AppendEntries
 from raft.node import RaftClusterNode, Role, raft_node_factory
 from raft.sim.cluster import Cluster
+from raft.sim.network import DEFAULT_HISTORY_DEPTH, DeliveryRecord
 from raft.storage import LogEntry
 
 
@@ -87,6 +107,7 @@ class Action(Enum):
     HEAL = "heal"
     ADVANCE_CLOCK = "advance_clock"
     CLIENT_REQUEST = "client_request"
+    STALE_REDELIVER = "stale_redeliver"
 
 
 DEFAULT_WEIGHTS: dict[Action, float] = {
@@ -97,6 +118,13 @@ DEFAULT_WEIGHTS: dict[Action, float] = {
     Action.HEAL: 8.0,
     Action.ADVANCE_CLOCK: 2.0,
     Action.CLIENT_REQUEST: 10.0,
+    # Same weight class as CRASH/RESTART: a targeted, occasional fault,
+    # not a constant presence (like STEP) and not as central to exercising
+    # replication as CLIENT_REQUEST. It only ever does anything once at
+    # least one link has two AppendEntries deliveries to compare, so
+    # weighting it any higher would mostly waste draws as no-ops early in
+    # a run, before there's anything to redeliver.
+    Action.STALE_REDELIVER: 7.0,
 }
 
 # How long (in fuzzer steps) a newly-formed partition refuses to heal.
@@ -113,15 +141,18 @@ class TraceEntry:
 
     `detail` always starts with "skipped" when the drawn action turned
     out to be ineligible (nothing to crash, a partition still in its
-    persistence window, no leader to send a client request to, ...) and
-    was a no-op; anything else means it actually took effect. The
-    remaining fields hold whichever resolved parameters that action
-    needed -- `node_id` for CRASH/RESTART/CLIENT_REQUEST (the leader it
-    targeted), `group_a`/`group_b`/`duration` for PARTITION, `ms` for
-    ADVANCE_CLOCK, `command` for CLIENT_REQUEST -- and stay `None` both
-    for STEP/HEAL (never parameterized; HEAL's outcome is fully
-    determined by state this record's predecessors already pin down) and
-    for any no-op occurrence of an action that normally would carry one.
+    persistence window, no leader to send a client request to, no
+    stale-and-superseded message to redeliver, ...) and was a no-op;
+    anything else means it actually took effect. The remaining fields
+    hold whichever resolved parameters that action needed -- `node_id`
+    for CRASH/RESTART/CLIENT_REQUEST (the leader it targeted),
+    `group_a`/`group_b`/`duration` for PARTITION, `ms` for ADVANCE_CLOCK,
+    `command` for CLIENT_REQUEST, `msg_id` for STALE_REDELIVER (which
+    delivered message, by `Network`'s own id, gets redelivered) -- and
+    stay `None` both for STEP/HEAL (never parameterized; HEAL's outcome
+    is fully determined by state this record's predecessors already pin
+    down) and for any no-op occurrence of an action that normally would
+    carry one.
 
     `command` is recorded, not recomputed from `step_index` on replay,
     even though it's originally *derived* from `step_index`
@@ -130,6 +161,12 @@ class TraceEntry:
     original run's, and recomputing from the new number would silently
     send a different command than the one that actually reproduced
     whatever this trace is being kept to reproduce.
+
+    `msg_id` is recorded for the identical reason, not derived: it names
+    a specific entry in `Network`'s own bounded delivery history, which
+    only `Network.recall` can resolve back into an actual message, and
+    only deterministically so as long as nothing but `msg_id` is used to
+    find it again (see `_do_stale_redeliver`).
     """
 
     step: int
@@ -141,6 +178,7 @@ class TraceEntry:
     duration: int | None = None
     ms: int | None = None
     command: object | None = None
+    msg_id: int | None = None
 
 
 class Fuzzer:
@@ -152,6 +190,7 @@ class Fuzzer:
         seed: int,
         steps: int,
         weights: dict[Action, float] | None = None,
+        network_history_depth: int = DEFAULT_HISTORY_DEPTH,
     ) -> None:
         if n < 1:
             raise ValueError("n must be >= 1")
@@ -165,6 +204,7 @@ class Fuzzer:
         self.seed = seed
         self.steps = steps
         self.weights = effective_weights
+        self._network_history_depth = network_history_depth
         self.trace: list[TraceEntry] = []
 
         self._rng = random.Random(seed)
@@ -276,7 +316,10 @@ class Fuzzer:
 
     def _reset(self) -> None:
         self.cluster = Cluster(
-            n=self.n, seed=self.seed, node_factory=raft_node_factory(self.n, self.seed)
+            n=self.n,
+            seed=self.seed,
+            node_factory=raft_node_factory(self.n, self.seed),
+            network_history_depth=self._network_history_depth,
         )
         self.trace = []
         self._partition_active = False
@@ -308,6 +351,8 @@ class Fuzzer:
             return self._do_advance_clock(step_index, forced)
         if action is Action.CLIENT_REQUEST:
             return self._do_client_request(step_index, forced)
+        if action is Action.STALE_REDELIVER:
+            return self._do_stale_redeliver(step_index, forced)
         raise AssertionError(f"unhandled action: {action!r}")  # pragma: no cover
 
     def _do_step(self, step_index: int) -> TraceEntry:
@@ -508,6 +553,97 @@ class Fuzzer:
             detail=detail,
             node_id=leader_id,
             command=command,
+        )
+
+    def _stale_redeliver_candidates(self) -> list[DeliveryRecord]:
+        """Every retained `AppendEntries` delivery that some *later*
+        delivery to the same link has since covered a larger final index
+        than -- exactly the precondition the Mutation 1 diagnosis found:
+        a stale, shorter `AppendEntries`, delivered after a longer one
+        already extended the destination past it.
+
+        Scoped to `AppendEntries` only (see the module docstring and
+        BUGS.md): a `RequestVote`/`RequestVoteReply`/`AppendEntriesReply`
+        has no equivalent "coverage" a later delivery could supersede in
+        the same sense, and redelivering one of those isn't what this
+        action's diagnosis-driven precondition is about. `Network`'s own
+        retained history stays payload-agnostic (see `raft.sim.network`);
+        this filtering is this module's own Raft-specific interpretation
+        of it, not something `Network` does on its own.
+
+        Each per-link history is oldest-first (`Network.history_by_link`),
+        so an earlier record only needs one later, larger sibling on the
+        same link to qualify -- checked left to right, stopping at the
+        first such sibling, so a record already known to qualify is never
+        added twice.
+        """
+        candidates: list[DeliveryRecord] = []
+        for records in self.cluster.network.history_by_link().values():
+            entries_only = [r for r in records if isinstance(r.msg, AppendEntries)]
+            for index, earlier in enumerate(entries_only):
+                assert isinstance(earlier.msg, AppendEntries)  # narrowed by the filter above
+                earlier_covers = earlier.msg.prev_log_index + len(earlier.msg.entries)
+                for later in entries_only[index + 1 :]:
+                    assert isinstance(later.msg, AppendEntries)
+                    later_covers = later.msg.prev_log_index + len(later.msg.entries)
+                    if later_covers > earlier_covers:
+                        candidates.append(earlier)
+                        break
+        return candidates
+
+    def _apply_stale_redeliver(self, record: DeliveryRecord) -> str:
+        # Goes through Cluster.route(), exactly like CLIENT_REQUEST's
+        # output does -- the only correct way to inject a message that
+        # isn't itself the direct return value of a tick()/handle() call,
+        # so a destination that's since crashed drops it here, the same
+        # liveness check every other message gets, rather than bypassing
+        # it via a raw Network.send().
+        now = self.cluster.clock.now()
+        self.cluster.route(record.src, [(record.dst, record.msg)], now)
+        return (
+            f"redelivered message {record.msg_id} ({record.src} -> {record.dst}), "
+            f"now stale and superseded on that link"
+        )
+
+    def _do_stale_redeliver(self, step_index: int, forced: TraceEntry | None) -> TraceEntry:
+        if forced is not None:
+            if forced.msg_id is not None:
+                record = self.cluster.network.recall(forced.msg_id)
+                if record is None:
+                    # Not a skip: this entry is recorded as having actually
+                    # redelivered something, so failing to recall it here
+                    # means the trace being replayed doesn't reproduce the
+                    # same history anymore -- a shrink-induced structural
+                    # inconsistency, exactly the class _signature() already
+                    # treats as "not a valid reproduction" via its own
+                    # blanket `except Exception`. Silently downgrading this
+                    # to a skip instead would replay a *different* event
+                    # than what was recorded, which is exactly what
+                    # replay()'s "identical" contract forbids.
+                    raise ValueError(
+                        f"cannot replay STALE_REDELIVER at step {step_index}: "
+                        f"message id {forced.msg_id} is no longer in Network's "
+                        f"retained history"
+                    )
+                detail = self._apply_stale_redeliver(record)
+            else:
+                detail = forced.detail
+            return TraceEntry(
+                step=step_index,
+                action=Action.STALE_REDELIVER,
+                detail=detail,
+                msg_id=forced.msg_id,
+            )
+
+        candidates = self._stale_redeliver_candidates()
+        if not candidates:
+            detail = "skipped (no stale-and-superseded message to redeliver)"
+            return TraceEntry(step=step_index, action=Action.STALE_REDELIVER, detail=detail)
+
+        record = self._rng.choice(candidates)
+        detail = self._apply_stale_redeliver(record)
+        return TraceEntry(
+            step=step_index, action=Action.STALE_REDELIVER, detail=detail, msg_id=record.msg_id
         )
 
     def _check_invariants(self, step_index: int) -> None:

@@ -141,6 +141,17 @@ def test_crash_and_partition_skip_when_structurally_impossible() -> None:
     assert cluster._do_advance_clock(0, forced=None).detail.startswith("advanced clock by")
 
 
+def test_apply_client_request_skips_a_recorded_leader_that_has_since_crashed() -> None:
+    # Only reachable on a forced (replay) path: a shrunk candidate can
+    # legitimately no longer share the original run's crash history, so
+    # a recorded leader id that was alive when this entry was captured
+    # may not be by the time it's replayed.
+    fuzzer = Fuzzer(n=3, seed=1, steps=1)
+    fuzzer.cluster.crash(0)
+
+    assert fuzzer._apply_client_request(0, "cmd") == "skipped (recorded leader is no longer alive)"
+
+
 # -- replay() and shrink() --
 #
 # RaftNode's election implementation never actually violates Election

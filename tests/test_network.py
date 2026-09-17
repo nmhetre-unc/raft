@@ -167,3 +167,115 @@ def test_messages_are_never_inspected_only_routed() -> None:
     assert src == "a"
     assert dst == "b"
     assert msg is payload
+
+
+# -- Delivery history (msg_id / recall / history_by_link) --
+#
+# Added for Fuzzer's STALE_REDELIVER action. deliver_next() and pending()
+# keep their exact pre-existing return shapes throughout (every assertion
+# above this section is unmodified and still passes) -- history tracking
+# is purely additive, internal bookkeeping plus new, separate accessors.
+
+
+def test_deliver_next_return_shape_is_unchanged_by_history_tracking() -> None:
+    net = Network(seed=1)
+    net.send("a", "b", "hello", now=0)
+
+    result = net.deliver_next(now=0)
+
+    assert result == ("a", "b", "hello")  # still a plain 3-tuple
+
+
+def test_recall_finds_a_delivered_message_by_its_id() -> None:
+    net = Network(seed=1)
+    net.send("a", "b", "first", now=0)
+    net.send("a", "b", "second", now=0)
+    net.deliver_next(now=0)
+    net.deliver_next(now=0)
+
+    history = net.history_by_link()[("a", "b")]
+    assert [record.msg for record in history] == ["first", "second"]  # oldest first
+
+    first_record = history[0]
+    recalled = net.recall(first_record.msg_id)
+    assert recalled == first_record
+    assert recalled is not None
+    assert recalled.src == "a"
+    assert recalled.dst == "b"
+    assert recalled.msg == "first"
+
+
+def test_recall_returns_none_for_an_id_never_assigned() -> None:
+    net = Network(seed=1)
+    net.send("a", "b", "hello", now=0)
+    net.deliver_next(now=0)
+
+    assert net.recall(999) is None
+
+
+def test_recall_returns_none_for_a_message_still_pending_not_yet_delivered() -> None:
+    # History is populated on DELIVERY, not on send -- a queued-but-not-
+    # yet-delivered message has no history entry to recall, by design
+    # (it isn't "already delivered and superseded" yet; it hasn't been
+    # delivered at all).
+    net = Network(seed=1)
+    net.set_delay("a", "b", 10)
+    net.send("a", "b", "hello", now=0)
+
+    assert net.pending() != []
+    assert net.recall(0) is None
+
+
+def test_recall_returns_none_for_a_dropped_message() -> None:
+    net = Network(seed=1)
+    net.partition({"a"}, {"b"})
+    net.send("a", "b", "hello", now=0)
+    net.deliver_next(now=0)  # dropped, per the partition -- never delivered
+
+    assert net.recall(0) is None
+
+
+def test_msg_id_is_assigned_monotonically_per_send_call() -> None:
+    net = Network(seed=1)
+    net.send("a", "b", "one", now=0)
+    net.send("a", "b", "two", now=0)
+    net.send("a", "b", "three", now=0)
+
+    ids = []
+    for _ in range(3):
+        src, dst, msg = net.deliver_next(now=0)  # type: ignore[misc]
+        ids.append(net.history_by_link()[(src, dst)][-1].msg_id)
+
+    assert ids == sorted(ids)
+    assert len(set(ids)) == 3  # all distinct
+
+
+def test_history_by_link_snapshot_does_not_expose_internal_state() -> None:
+    net = Network(seed=1)
+    net.send("a", "b", "hello", now=0)
+    net.deliver_next(now=0)
+
+    snapshot = net.history_by_link()
+    snapshot[("a", "b")].clear()  # mutate the returned copy
+
+    assert len(net.history_by_link()[("a", "b")]) == 1  # internal state untouched
+
+
+def test_history_evicts_oldest_once_a_links_buffer_is_full() -> None:
+    net = Network(seed=1, history_depth=2)
+    net.send("a", "b", "one", now=0)
+    net.send("a", "b", "two", now=0)
+    net.send("a", "b", "three", now=0)
+    for _ in range(3):
+        net.deliver_next(now=0)
+
+    retained = net.history_by_link()[("a", "b")]
+    assert [r.msg for r in retained] == ["two", "three"]  # "one" evicted
+
+    assert net.recall(0) is None  # "one"'s id, evicted
+    assert net.recall(2) is not None  # "three"'s id, still retained
+
+
+def test_history_depth_rejects_less_than_one() -> None:
+    with pytest.raises(ValueError, match="history_depth"):
+        Network(seed=1, history_depth=0)

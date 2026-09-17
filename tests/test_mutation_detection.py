@@ -20,45 +20,45 @@ Summary from the actual run (n=5, steps=300, seeds 0..49), after
 4's commit-index-dependent checks) were wired in:
 
 - Always truncating on a resend, even when it fully matches (the
-  duplicate-message bug): **43/50 detected, all via
+  duplicate-message bug): **45/50 detected, all via
   `check_no_spurious_truncation`** (0 via `check_leader_completeness`,
   which runs later in the fixed check order and never gets a chance to
   fire on these seeds -- a `SafetyViolation` stops the run at the first
-  property that catches it). This supersedes an earlier finding recorded
-  here (and in `BUGS.md`) that read 2/50, always via
-  `check_leader_completeness`, and treated `check_no_spurious_
-  truncation`'s own trigger as a fuzzer-reachability gap. That reading
-  was wrong about the checker, not the mutation: `check_no_spurious_
-  truncation` used to compare log entries by *object identity*
-  ("different object, same value"), a signature that really is
-  unreachable through this simulator -- no `LogEntry` is ever cloned, so
-  a resend built from a leader's own unchanged storage always carries
-  the exact same object references a follower already stored, regardless
-  of delivery order. But the mutation's actual damage was never about
-  identity: always truncating from `prev_log_index + 1`, even when
-  nothing conflicts, means a *stale, shorter* `AppendEntries` -- built
-  from an earlier, smaller `next_index`, delivered by the (reordering)
-  `Network` *after* a longer one already extended a follower past it --
-  discards everything that follower held beyond the stale message's own
-  range, with nothing put back. That is a genuine, *value*-level loss
-  (an index present before is simply gone after, or changed with no term
-  conflict to justify it), not an identity mismatch, and it went
-  undetected by the old identity-based checker for the same structural
-  reason its own designed-for signature was unreachable: no cloning means
-  no "different object" ever appears, whether an entry survives, changes
-  legitimately, or is silently dropped. `check_no_spurious_truncation`
-  was rewritten to compare by value instead (see `raft/invariants.py` and
-  `BUGS.md`), and now catches this directly -- including seeds 3 and 35,
-  the two seeds the old `check_leader_completeness`-only reading found,
-  now caught 140 and 37 steps earlier respectively, right when the loss
-  happens instead of only once a much later election exposes it.
+  property that catches it). This supersedes two earlier findings: 2/50
+  (always via `check_leader_completeness`, before `check_no_spurious_
+  truncation` was rewritten to compare by value instead of object
+  identity -- see `raft/invariants.py` and `BUGS.md` for that fix) and
+  then 43/50 (once the rewrite landed, but before `STALE_REDELIVER`
+  joined `DEFAULT_WEIGHTS`). `check_no_spurious_truncation`'s own
+  signature was never actually unreachable -- object identity was; no
+  `LogEntry` is ever cloned, so a resend built from a leader's own
+  unchanged storage always carries the exact same object references a
+  follower already stored, regardless of delivery order, but a *stale,
+  shorter* `AppendEntries` -- built from an earlier, smaller `next_index`,
+  delivered by the (reordering) `Network` *after* a longer one already
+  extended a follower past it -- still discards everything that follower
+  held beyond the stale message's own range, with nothing put back: a
+  genuine *value*-level loss the identity check couldn't see, not because
+  it was rare, but because it was watching the wrong thing.
+  `STALE_REDELIVER` (see `raft/sim/fuzz.py`) exists specifically to stop
+  relying on that reordering happening by luck: it deliberately
+  redelivers an already-delivered `AppendEntries` a destination has since
+  moved past, reconstructing the exact precondition on purpose. With it
+  wired into the default action mix, detection rose from 43/50 to 45/50.
+  The *specific set* of caught seeds shifted, not just grew -- weaving a
+  new action into the shared, weighted `self._rng` stream perturbs every
+  seed's entire subsequent random walk, not only the ones that need the
+  new action, so a handful of seeds that used to trigger this via lucky
+  native reordering no longer do, while a larger number that never did
+  now do via deliberate redelivery instead. That's expected fuzzer
+  behavior, not a regression: what matters is the aggregate count went up
+  and seeds 3 and 35 -- the two this diagnosis was built around -- are
+  still both in the caught set.
   `test_mutation_1_stale_shorter_delivery_is_caught_by_new_checker_not_old`
-  constructs that exact large-then-small delivery by hand and proves the
-  old checker misses it while the new one doesn't, so this isn't just a
-  sweep-count coincidence. The remaining 7/50 undetected seeds
-  (1, 2, 8, 9, 10, 43, 45) simply never happen to produce the triggering
-  reorder within 300 steps -- a fuzzer-coverage question, not a checker
-  blind spot.
+  constructs the exact large-then-small delivery by hand (independent of
+  any fuzzer randomness) and proves the old, identity-based checker
+  misses it while the new, value-based one doesn't, so none of this is a
+  sweep-count coincidence.
 - Advancing match_index/next_index on a rejected reply, trusting it
   regardless of the reply's success flag: 4/50 detected, always via
   `check_leader_completeness` -- some later, honestly elected leader
@@ -193,24 +193,29 @@ def test_mutation_always_truncate_on_resend_is_now_caught_directly(
     extended a follower past it: everything beyond the stale message's
     own range is discarded and never restored.
 
-    43/50 seeds now catch this, all via `check_no_spurious_truncation`
-    (0 via `check_leader_completeness`, which runs later in the fixed
-    check order in `Fuzzer._check_invariants` and never gets a chance --
-    a `SafetyViolation` stops the run at the first property that catches
+    45/50 seeds now catch this (was 43/50 before `STALE_REDELIVER` joined
+    `DEFAULT_WEIGHTS` -- see the module docstring for why the *set* of
+    caught seeds shifts, not just grows, once a new action is woven into
+    the shared RNG stream), all via `check_no_spurious_truncation` (0 via
+    `check_leader_completeness`, which runs later in the fixed check
+    order in `Fuzzer._check_invariants` and never gets a chance -- a
+    `SafetyViolation` stops the run at the first property that catches
     it). Seeds 3 and 35 -- the two seeds the previous, identity-based
     checker missed entirely and only `check_leader_completeness` used to
-    catch, 168 and 164 steps in respectively -- are both in this set,
-    caught at step 28 and 127: 140 and 37 steps earlier, right when the
-    loss happens instead of only once a much later election exposes it.
-    See `test_mutation_1_stale_shorter_delivery_is_caught_by_new_checker_not_old`
-    for a hand-constructed proof that this is the new checker actually
-    discriminating, not a coincidence of the sweep.
+    catch, 168 and 164 steps in respectively -- are both still in this
+    set. See
+    `test_mutation_1_stale_shorter_delivery_is_caught_by_new_checker_not_old`
+    for a hand-constructed proof (independent of any fuzzer randomness)
+    that this is the new checker actually discriminating, and
+    `test_stale_redeliver_reproduces_the_diagnosis_scenario` for the same
+    proof driven through `STALE_REDELIVER` itself rather than native
+    delivery.
     """
     monkeypatch.setattr(RaftNode, "_handle_append_entries", _mutation_1_always_truncate_on_resend)
 
     violations = _sweep()
 
-    assert len(violations) == 43, f"detection rate shifted: {violations}"
+    assert len(violations) == 45, f"detection rate shifted: {violations}"
     assert all(
         "log entry at index" in reason and "lost or changed" in reason
         for reason in violations.values()
@@ -279,6 +284,107 @@ def test_mutation_1_stale_shorter_delivery_is_caught_by_new_checker_not_old(
         check_no_spurious_truncation(cluster, history_new)
 
 
+def _drain_until_idle(fuzzer: Fuzzer) -> None:
+    """Step until nothing is queued in the Network.
+
+    Each delivery this test injects produces a reply, which would
+    otherwise sit pending and compete (by delivery time, resolved by
+    Network's own RNG when tied) with the *next* message this test
+    injects -- exactly the kind of nondeterminism a controlled,
+    hand-built scenario needs to avoid. Bounded by construction: a
+    delivery here produces at most one reply, and that reply produces
+    nothing further (see the calling tests), so this always terminates
+    long before the cluster-wide tick timer (default first tick at
+    t=100) would ever come due and start ticking nodes on its own.
+    """
+    while fuzzer.cluster.network.pending():
+        assert fuzzer.cluster.step()
+
+
+def _construct_large_then_small_precondition(fuzzer: Fuzzer):
+    """Deliver a small AppendEntries, then a larger one, both natively
+    through the real Network -- so its own delivery history ends up with
+    exactly one stale-and-superseded candidate (the small one) for
+    STALE_REDELIVER to find and redeliver a second time. Returns the
+    follower wrapper node.
+    """
+    e1 = LogEntry(term=1, command="a")
+    e2 = LogEntry(term=1, command="b")
+    e3 = LogEntry(term=1, command="c")
+    e4 = LogEntry(term=1, command="d")
+
+    small = AppendEntries(
+        term=1, leader_id="0", prev_log_index=0, prev_log_term=0, entries=(e1, e2), leader_commit=0
+    )
+    large = AppendEntries(
+        term=1, leader_id="0", prev_log_index=0, prev_log_term=0,
+        entries=(e1, e2, e3, e4), leader_commit=0,
+    )
+
+    fuzzer.cluster.route(0, [(1, small)], now=0)
+    _drain_until_idle(fuzzer)  # delivers "small" (and its reply); recorded into history
+    fuzzer.cluster.route(0, [(1, large)], now=1)
+    _drain_until_idle(fuzzer)  # delivers "large" (and its reply); "small" now superseded
+
+    follower = fuzzer.cluster.get_node(1)
+    assert follower is not None
+    assert follower.storage.last_log_index() == 4
+    return follower
+
+
+def test_stale_redeliver_reproduces_the_diagnosis_scenario_on_unmutated_code() -> None:
+    """The diagnosis's large-then-small scenario, this time constructed
+    the way STALE_REDELIVER itself would encounter it -- through
+    Network's real delivery history and `Fuzzer._do_stale_redeliver` --
+    rather than by calling `RaftNode.handle()` twice by hand (see
+    `test_mutation_1_stale_shorter_delivery_is_caught_by_new_checker_not_old`
+    for that hand-built version). On unmutated code, the real handler's
+    "already matches" check makes the redelivery a pure no-op, exactly as
+    verified independently before this action was ever wired into the
+    fuzzer (see BUGS.md's diagnosis) -- confirmed here end-to-end through
+    the actual action machinery.
+    """
+    fuzzer = Fuzzer(n=2, seed=1, steps=1)
+    follower = _construct_large_then_small_precondition(fuzzer)
+
+    history: dict[str, list[LogEntry]] = {follower.node_id: follower.storage.load_log()}
+    check_no_spurious_truncation(fuzzer.cluster, history)  # baseline, nothing wrong yet
+
+    entry = fuzzer._do_stale_redeliver(0, forced=None)
+    assert not entry.detail.startswith("skipped"), entry.detail
+    assert entry.msg_id is not None
+    _drain_until_idle(fuzzer)  # actually processes the redelivered message
+
+    assert follower.storage.last_log_index() == 4  # unchanged -- a real no-op
+    check_no_spurious_truncation(fuzzer.cluster, history)  # must not raise
+
+
+def test_stale_redeliver_reproduces_mutation_1_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same construction as the test above, under Mutation 1: the
+    redelivered, now-stale message causes the real damage the diagnosis
+    found -- e3 and e4 silently discarded -- and the (now value-based)
+    check_no_spurious_truncation catches it, entirely through
+    STALE_REDELIVER's own machinery rather than a hand-built message pair.
+    """
+    monkeypatch.setattr(RaftNode, "_handle_append_entries", _mutation_1_always_truncate_on_resend)
+
+    fuzzer = Fuzzer(n=2, seed=1, steps=1)
+    follower = _construct_large_then_small_precondition(fuzzer)
+
+    history: dict[str, list[LogEntry]] = {follower.node_id: follower.storage.load_log()}
+    check_no_spurious_truncation(fuzzer.cluster, history)  # baseline, nothing wrong yet
+
+    entry = fuzzer._do_stale_redeliver(0, forced=None)
+    assert not entry.detail.startswith("skipped"), entry.detail
+    assert entry.msg_id is not None
+    _drain_until_idle(fuzzer)  # actually processes the redelivered (stale) message
+
+    assert follower.storage.last_log_index() == 2, "e3 and e4 should be silently discarded"
+
+    with pytest.raises(SafetyViolation, match="lost or changed"):
+        check_no_spurious_truncation(fuzzer.cluster, history)
+
+
 def test_mutation_match_index_advances_on_failure_is_detected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -344,9 +450,14 @@ def test_mutation_skipping_the_consistency_check_is_detected(
     position the follower's log happens to currently end at, regardless
     of what Raft index the leader thinks they're at.
 
-    DETECTED: 33/50 seeds -- 32 via check_log_matching (the index
-    misalignment this causes reliably produces two nodes disagreeing on
-    what's stored at a shared (index, term)), and 1 via
+    DETECTED: 31/50 seeds (was 33/50 before `STALE_REDELIVER` joined
+    `DEFAULT_WEIGHTS` -- see the module docstring for why weaving a new
+    action into the shared, weighted `self._rng` stream shifts *every*
+    seed's subsequent random walk, not just the ones that need it, so a
+    small count change here reflects a different-but-equally-valid
+    sequence of events, not a regression) -- 30 via check_log_matching
+    (the index misalignment this causes reliably produces two nodes
+    disagreeing on what's stored at a shared (index, term)), and 1 via
     check_leader_completeness, where the same misalignment happens to
     surface as a later leader missing an entry before the log-matching
     divergence it would also eventually cause ever gets checked (a

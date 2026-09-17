@@ -53,7 +53,7 @@ from collections.abc import Callable
 from typing import Protocol
 
 from raft.sim.clock import Clock
-from raft.sim.network import Network
+from raft.sim.network import DEFAULT_HISTORY_DEPTH, Network
 from raft.storage import MemoryStorage, Storage
 
 NodeId = int
@@ -88,6 +88,12 @@ class Cluster[N: Node]:
     so anything that needs to name exactly where a run is -- an invariant
     checker reporting a violation, a fuzzer reproducing one -- can do so
     without threading that bookkeeping through separately.
+
+    `network_history_depth` is forwarded straight to `Network` (see
+    `Network.__init__`) -- Cluster doesn't interpret it, it just owns the
+    only place a `Network` gets constructed, so anything that wants a
+    non-default depth (a fuzzer tuning how long a redeliverable message
+    stays available) has to go through here.
     """
 
     def __init__(
@@ -96,6 +102,7 @@ class Cluster[N: Node]:
         seed: int,
         node_factory: Callable[[NodeId, Storage], N],
         tick_interval_ms: int = 100,
+        network_history_depth: int = DEFAULT_HISTORY_DEPTH,
     ) -> None:
         if n < 0:
             raise ValueError("n must be >= 0")
@@ -103,7 +110,7 @@ class Cluster[N: Node]:
             raise ValueError("tick_interval_ms must be >= 1")
 
         self.clock = Clock()
-        self.network = Network(seed)
+        self.network = Network(seed, history_depth=network_history_depth)
         self.seed = seed
         self.step_count = 0
         self._node_factory = node_factory

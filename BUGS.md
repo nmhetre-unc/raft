@@ -142,25 +142,85 @@ raises. Detection on Mutation 1 went from 2/50 (all via
 expose the gap) to 43/50, all via `check_no_spurious_truncation` itself,
 catching seeds 3 and 35 at the moment of loss — 140 and 37 steps earlier,
 respectively, than the leader-completeness violations that used to be the
-only signal.
+only signal. (Since superseded again by `STALE_REDELIVER` below: 45/50.)
+
+## STALE_REDELIVER: deliberately constructing Mutation 1's precondition instead of waiting on it
+
+The value-based `check_no_spurious_truncation` fix above still left 7/50
+seeds undetected for Mutation 1 — not a checker gap, but a *fuzzer*-
+coverage one: the harmful precondition (a stale, shorter `AppendEntries`
+delivered after a longer one already extended a follower past it) only
+ever arose from `Network`'s own random reordering, and 300 steps wasn't
+always enough for a given seed to produce it by chance.
+
+`Fuzzer` gained a new action, `STALE_REDELIVER`, that constructs this
+precondition on purpose: it scans `Network`'s own bounded, per-link
+delivery history for an `AppendEntries` a *later* delivery to the same
+link has since covered a larger final index than, and redelivers it.
+Verified by hand first, independent of the fuzzer, that this is a
+harmless no-op on real (unmutated) code — the real handler's "already
+matches" logic recognizes it and leaves the log untouched, and the
+resulting stale reply is correctly ignored by the leader's own
+never-move-`match_index`-backward guard — before ever wiring it in.
+
+Three things needed solving to make replay of this action exact, the
+same standard every other action already meets:
+
+- **Identity**: `Network` now assigns each `send()` call a monotonic
+  `msg_id`, kept entirely internal to `Network` (a new `_Pending` field)
+  — nothing about `messages.py`, `RaftNode`, or any of the ~76 existing
+  hand-constructed message call sites across the codebase changed.
+- **History**: `Network` retains delivered messages in a bounded,
+  per-`(src, dst)` ring buffer (`history_depth`, a constructor parameter,
+  not a hard-coded constant) — payload-agnostic, exactly like the rest of
+  `Network`; the `AppendEntries`-specific "is this stale" interpretation
+  lives entirely in `Fuzzer`, not `Network`. The depth was *measured*, not
+  guessed: an initial estimate of 16 was checked against an unbounded
+  ground truth over both sweeps and found to lose 9–6% of genuinely
+  eligible candidates to eviction before a draw could use them (11 out of
+  19,623 draws over 1000 seeds found *zero* candidates despite some truly
+  existing). 32 recovers 99.9–99.97% of them, with zero fully-evicted
+  draws in either sweep, and 64+ showed no further measurable gain — see
+  `raft/sim/network.py`'s `DEFAULT_HISTORY_DEPTH`.
+- **Replay**: `TraceEntry` gained one field, `msg_id`, following the
+  exact resolved-value pattern every other action already uses — recorded
+  on a live draw, applied directly via a new, deterministic
+  `Network.recall(msg_id)` on replay, no RNG of any kind involved. A
+  forced replay whose `msg_id` `recall()` can't find (a shrink candidate
+  that dropped the delivery which created it) raises rather than
+  silently degrading to a skip — replaying a *different* event than what
+  was recorded would break `replay()`'s "identical" contract, and
+  `shrink()`'s own `_signature()` already has a blanket `except Exception`
+  that treats this exactly like any other shrink-induced structural
+  inconsistency.
+
+With `STALE_REDELIVER` weighted at 7.0 (the same class as `CRASH`/
+`RESTART` — a targeted, occasional fault, not a constant presence)
+wired into `DEFAULT_WEIGHTS`, Mutation 1 detection rose from 43/50 to
+**45/50**. The *specific set* of caught seeds shifted, not just grew:
+weaving a new action into the shared, weighted `self._rng` stream
+perturbs every seed's entire subsequent random walk, not only the ones
+that need the new action, so some seeds that used to trigger this via
+lucky native reordering no longer do, while more that never did now do
+via deliberate redelivery. Seeds 3 and 35 — the two this diagnosis was
+built around — are still both caught.
 
 ## Invariant coverage gaps, measured
 
 A mutation test against the 50-seed sweep, re-run after `check_leader_
 completeness` and `check_state_machine_safety` (Milestone 4's
-commit-index-dependent checks) were wired in:
+commit-index-dependent checks) were wired in, and again after
+`check_no_spurious_truncation`'s value-based rewrite and `STALE_REDELIVER`
+(see the two entries above):
 
-- Blind truncate-and-reappend on a duplicate AppendEntries: **43/50
+- Blind truncate-and-reappend on a duplicate AppendEntries: **45/50
   seeds, all via `check_no_spurious_truncation`** (0 via
   `check_leader_completeness`, which runs later in the fixed check order
   and never gets the chance — a `SafetyViolation` stops the run at the
-  first property that catches it). This corrects an earlier reading of
-  2/50, recorded here and now known to have been wrong about the
-  *checker*, not the mutation — see "check_no_spurious_truncation
-  compared log entries by identity, missing real entry loss" above for
-  the full mechanism and fix. The remaining 7/50 seeds (1, 2, 8, 9, 10,
-  43, 45) simply never produce the triggering reorder within 300 steps —
-  a fuzzer-coverage question, not a checker blind spot.
+  first property that catches it). History: 2/50 (identity-based checker,
+  `check_leader_completeness` only) → 43/50 (value-based checker,
+  native reordering only) → 45/50 (with `STALE_REDELIVER` deliberately
+  constructing the precondition too).
 - Advancing match_index/next_index on a rejected reply, trusting it
   regardless of the reply's success flag: **closed**. 4/50 seeds, always via
   `check_leader_completeness` — some later, honestly elected leader ends up
@@ -168,9 +228,12 @@ commit-index-dependent checks) were wired in:
   because of the corrupted match_index. This is exactly the class of real
   bug described above, and exactly the gap Leader Completeness was added to
   close.
-- Skipping the AppendEntries consistency check entirely: 33/50 seeds — 32
-  via log matching, 1 via leader completeness (a `SafetyViolation` stops the
-  run at the first property that catches it, so which one fires first for a
+- Skipping the AppendEntries consistency check entirely: 31/50 seeds (was
+  33/50 before `STALE_REDELIVER` joined `DEFAULT_WEIGHTS` — see above for
+  why a new action shifts counts for mutations it has nothing to do with,
+  by perturbing the shared RNG stream, not a regression) — 30 via log
+  matching, 1 via leader completeness (a `SafetyViolation` stops the run
+  at the first property that catches it, so which one fires first for a
   given seed depends on exactly when each condition becomes checkable).
 - next_index initialized to 1 rather than last_log_index + 1: still 0/50,
   and still not obviously a safety bug — prev_log_index 0 always passes the
