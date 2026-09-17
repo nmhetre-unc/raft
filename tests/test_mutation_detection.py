@@ -20,20 +20,45 @@ Summary from the actual run (n=5, steps=300, seeds 0..49), after
 4's commit-index-dependent checks) were wired in:
 
 - Always truncating on a resend, even when it fully matches (the
-  duplicate-message bug): `check_no_spurious_truncation`'s own specific
-  signature ("different object, same value") still never arises through
-  the sweep -- confirmed exactly as before, by directly instrumenting
-  `Storage.truncate_from` and by
-  `test_mutation_1_triggering_condition_is_caught_when_constructed_directly`,
-  which proves the checker fires on this exact mutated handler once that
-  condition is constructed by hand. But `check_leader_completeness` now
-  catches 2/50 seeds anyway, via a *different* consequence of the same
-  mutation: always truncating from `prev_log_index + 1` discards
-  anything a follower holds beyond the resent range too, and on those 2
-  seeds that collateral damage later mattered to an election. Still a
-  narrower claim than "the checker can't see this": `check_no_spurious_
-  truncation`'s own trigger remains a fuzzer-reachability gap; it's just
-  no longer true that *nothing* catches this mutation.
+  duplicate-message bug): **43/50 detected, all via
+  `check_no_spurious_truncation`** (0 via `check_leader_completeness`,
+  which runs later in the fixed check order and never gets a chance to
+  fire on these seeds -- a `SafetyViolation` stops the run at the first
+  property that catches it). This supersedes an earlier finding recorded
+  here (and in `BUGS.md`) that read 2/50, always via
+  `check_leader_completeness`, and treated `check_no_spurious_
+  truncation`'s own trigger as a fuzzer-reachability gap. That reading
+  was wrong about the checker, not the mutation: `check_no_spurious_
+  truncation` used to compare log entries by *object identity*
+  ("different object, same value"), a signature that really is
+  unreachable through this simulator -- no `LogEntry` is ever cloned, so
+  a resend built from a leader's own unchanged storage always carries
+  the exact same object references a follower already stored, regardless
+  of delivery order. But the mutation's actual damage was never about
+  identity: always truncating from `prev_log_index + 1`, even when
+  nothing conflicts, means a *stale, shorter* `AppendEntries` -- built
+  from an earlier, smaller `next_index`, delivered by the (reordering)
+  `Network` *after* a longer one already extended a follower past it --
+  discards everything that follower held beyond the stale message's own
+  range, with nothing put back. That is a genuine, *value*-level loss
+  (an index present before is simply gone after, or changed with no term
+  conflict to justify it), not an identity mismatch, and it went
+  undetected by the old identity-based checker for the same structural
+  reason its own designed-for signature was unreachable: no cloning means
+  no "different object" ever appears, whether an entry survives, changes
+  legitimately, or is silently dropped. `check_no_spurious_truncation`
+  was rewritten to compare by value instead (see `raft/invariants.py` and
+  `BUGS.md`), and now catches this directly -- including seeds 3 and 35,
+  the two seeds the old `check_leader_completeness`-only reading found,
+  now caught 140 and 37 steps earlier respectively, right when the loss
+  happens instead of only once a much later election exposes it.
+  `test_mutation_1_stale_shorter_delivery_is_caught_by_new_checker_not_old`
+  constructs that exact large-then-small delivery by hand and proves the
+  old checker misses it while the new one doesn't, so this isn't just a
+  sweep-count coincidence. The remaining 7/50 undetected seeds
+  (1, 2, 8, 9, 10, 43, 45) simply never happen to produce the triggering
+  reorder within 300 steps -- a fuzzer-coverage question, not a checker
+  blind spot.
 - Advancing match_index/next_index on a rejected reply, trusting it
   regardless of the reply's success flag: 4/50 detected, always via
   `check_leader_completeness` -- some later, honestly elected leader
@@ -118,82 +143,102 @@ def _mutation_1_always_truncate_on_resend(
     return [(src, reply)]
 
 
-def test_mutation_always_truncate_on_resend_is_occasionally_caught_a_different_way(
+def _old_identity_based_check_no_spurious_truncation(
+    cluster: Cluster, history: dict[str, list[LogEntry]]
+) -> None:
+    """A frozen copy of `check_no_spurious_truncation` as it existed before
+    the value-based rewrite -- kept here ONLY so
+    `test_mutation_1_stale_shorter_delivery_is_caught_by_new_checker_not_old`
+    can prove the rewrite is actually discriminating (catches something
+    real the old version missed), not just differently worded. Never
+    imported from `raft.invariants`; this is a historical artifact, not
+    live code.
+    """
+    for node_id in cluster.node_ids():
+        node = cluster.get_node(node_id)
+        if node is None:
+            continue
+        current_log = node.storage.load_log()
+        previous_log = history.get(node.node_id)
+        if previous_log is not None:
+            for index in range(min(len(current_log), len(previous_log))):
+                old_entry = previous_log[index]
+                new_entry = current_log[index]
+                if new_entry is not old_entry and new_entry == old_entry:
+                    raise SafetyViolation(
+                        f"node {node.node_id!r} log entry at index {index} was "
+                        f"replaced by a different (but equal) object -- torn down "
+                        f"and rebuilt rather than left alone",
+                        seed=cluster.seed,
+                        step=cluster.step_count,
+                    )
+        history[node.node_id] = current_log
+
+
+def test_mutation_always_truncate_on_resend_is_now_caught_directly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Mutation 1 against the 50-seed sweep: relies on the fuzzer's chaos
     to construct the triggering condition on its own.
 
-    `check_no_spurious_truncation` (added specifically for this gap,
-    comparing log entry object identity, not just value) is wired into
-    every sweep run. It works: `tests/test_invariants.py` proves it fires
-    on a hand-constructed "different object, same value" swap, and
-    `test_mutation_1_triggering_condition_is_caught_when_constructed_directly`
-    below proves it fires on this *exact* mutated handler, not just the
-    checker in isolation. But *that specific signature* still never
-    arises here, confirmed the same way as before: instrumenting
-    `Storage.truncate_from` directly across thousands of fuzzer-driven
-    truncations turned up plenty of real truncations, but every single
-    one was either (a) the exact same object being removed and put back
-    -- a resend from the *same* leader's own unchanged storage always
-    carries the same references, since nothing ever clones a `LogEntry`
-    -- or (b) a genuine value change from real conflict resolution.
-    Never (c), a different object holding an equal value. That part of
-    the original finding stands: `next_index` only ever walks backward
-    one step at a time, on rejection, so the walk necessarily lands
-    exactly on the point of genuine agreement before any entries are
-    ever included in a message -- structurally, not just by chance,
-    `check_no_spurious_truncation`'s own trigger is unreachable here.
+    `check_no_spurious_truncation` is now value-based (see
+    `raft/invariants.py` and `BUGS.md`): it no longer looks for a
+    "different object, same value" swap (a signature this simulator
+    structurally never produces, since no `LogEntry` is ever cloned), and
+    instead flags any index that lost or changed value with no term
+    conflict to justify it. That is exactly what always truncating from
+    `prev_log_index + 1` produces the moment a stale, shorter
+    `AppendEntries` -- built from an earlier, smaller `next_index` -- is
+    delivered by the (reordering) `Network` after a longer one already
+    extended a follower past it: everything beyond the stale message's
+    own range is discarded and never restored.
 
-    What's changed since `check_leader_completeness` was wired in: this
-    mutation also always truncates from `prev_log_index + 1` even when
-    nothing conflicts, discarding anything a follower holds *beyond* the
-    resent range too -- collateral damage the real handler's "already
-    matches" check exists specifically to prevent. 2/50 seeds now catch
-    that collateral damage, via `check_leader_completeness`, when the
-    discarded entries on that follower turn out to matter to a later
-    election. This is a materially narrower finding than "the checker
-    can't see this bug": `check_no_spurious_truncation`'s own signature
-    remains unreached, and this new detection is a *different* checker
-    catching a *different* (also real) consequence of the same mutation.
+    43/50 seeds now catch this, all via `check_no_spurious_truncation`
+    (0 via `check_leader_completeness`, which runs later in the fixed
+    check order in `Fuzzer._check_invariants` and never gets a chance --
+    a `SafetyViolation` stops the run at the first property that catches
+    it). Seeds 3 and 35 -- the two seeds the previous, identity-based
+    checker missed entirely and only `check_leader_completeness` used to
+    catch, 168 and 164 steps in respectively -- are both in this set,
+    caught at step 28 and 127: 140 and 37 steps earlier, right when the
+    loss happens instead of only once a much later election exposes it.
+    See `test_mutation_1_stale_shorter_delivery_is_caught_by_new_checker_not_old`
+    for a hand-constructed proof that this is the new checker actually
+    discriminating, not a coincidence of the sweep.
     """
     monkeypatch.setattr(RaftNode, "_handle_append_entries", _mutation_1_always_truncate_on_resend)
 
     violations = _sweep()
 
-    assert 0 < len(violations) < 10, f"detection rate shifted materially: {violations}"
-    assert all("missing entry" in reason for reason in violations.values())
+    assert len(violations) == 43, f"detection rate shifted: {violations}"
+    assert all(
+        "log entry at index" in reason and "lost or changed" in reason
+        for reason in violations.values()
+    )
+    assert 3 in violations and 35 in violations
 
 
-def test_mutation_1_triggering_condition_is_caught_when_constructed_directly(
+def test_mutation_1_stale_shorter_delivery_is_caught_by_new_checker_not_old(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Mutation 1, given its exact triggering condition by hand instead of
-    hoping the fuzzer's chaos produces it: does check_no_spurious_truncation
-    actually fire?
+    """The diagnosis's hand-constructed scenario, driven through the real,
+    mutated `_handle_append_entries` entry point: a leader's own log grows
+    from 2 entries to 4, and two `AppendEntries` built at those two
+    different moments are delivered out of order -- the longer one first
+    (as `Network` reordering can always do), then the shorter, now-stale
+    one. No rejection, no retry, no leadership change: the follower's own
+    `next_index`-driven growth alone produces two legitimately-built
+    messages that a real leader would send, and delivery order does the
+    rest.
 
-    The condition is an AppendEntries carrying an entry the follower
-    already holds, where the entry in the message and the one already
-    stored are *different Python objects* despite being value-equal --
-    which the sweep test above establishes essentially never arises
-    through this simulator's normal leader/follower traffic (a resend
-    from the same leader's own storage always carries the same object
-    references). The most plausible real-world shape for it anyway is a
-    duplicated message redelivered after the follower already applied an
-    earlier copy of the same logical entry, but that redelivered copy
-    was reconstructed from a source other than what the follower already
-    has -- e.g. two leaders who each independently inherited the same
-    already-committed entry from a common ancestor, one of them now
-    retrying what it believes is still an unacknowledged send. This test
-    constructs exactly that end state directly: no election, no second
-    node's storage involved, just a follower that already has an entry
-    and a message that resends "the same" one as a distinct object.
-
-    If this fires, `check_no_spurious_truncation` is proven sound end to
-    end -- through the real, mutated `_handle_append_entries` entry
-    point, not just against a hand-edited `Storage` -- and the sweep
-    test's gap is purely about the fuzzer never reaching this state, a
-    materially narrower claim than "the checker can't see this bug."
+    Proves the rewrite is actually discriminating, not just differently
+    worded: the OLD, identity-based checker (frozen above as
+    `_old_identity_based_check_no_spurious_truncation`) does NOT raise on
+    this exact sequence, because the reappended entries are the same
+    `LogEntry` objects the leader already held (nothing is ever cloned) --
+    while the NEW, value-based `check_no_spurious_truncation` does,
+    because two of the follower's entries are simply gone with no term
+    conflict to justify it.
     """
     monkeypatch.setattr(RaftNode, "_handle_append_entries", _mutation_1_always_truncate_on_resend)
 
@@ -201,42 +246,37 @@ def test_mutation_1_triggering_condition_is_caught_when_constructed_directly(
     follower = cluster.get_node(1)
     assert follower is not None
 
-    # The follower already applied this entry, from an earlier delivery.
-    already_applied = LogEntry(term=1, command="x")
-    follower.storage.append_entries([already_applied])
+    e1 = LogEntry(term=1, command="a")
+    e2 = LogEntry(term=1, command="b")
+    e3 = LogEntry(term=1, command="c")
+    e4 = LogEntry(term=1, command="d")
 
-    # check_no_spurious_truncation's baseline, exactly as the fuzzer would
-    # have recorded it after observing this state on an earlier step.
-    history = {follower.node_id: follower.storage.load_log()}
-    check_no_spurious_truncation(cluster, history)  # sanity: nothing wrong yet
-
-    # A redelivered "duplicate" of the same logical entry -- but a
-    # genuinely different object, as if reconstructed from a different
-    # origin than what the follower already has. Value-equal,
-    # object-different: exactly what a message duplicated in flight looks
-    # like from the receiving end.
-    resent = LogEntry(term=1, command="x")
-    assert resent is not already_applied
-    assert resent == already_applied
-
-    retry_message = AppendEntries(
-        term=1,
-        leader_id="0",
-        prev_log_index=0,
-        prev_log_term=0,
-        entries=(resent,),
-        leader_commit=0,
+    send_later_large = AppendEntries(
+        term=1, leader_id="0", prev_log_index=0, prev_log_term=0,
+        entries=(e1, e2, e3, e4), leader_commit=0,
     )
-    follower.raft_node.handle(retry_message, src="0", now=0)
+    send_early_small = AppendEntries(
+        term=1, leader_id="0", prev_log_index=0, prev_log_term=0,
+        entries=(e1, e2), leader_commit=0,
+    )
 
-    # Confirm the mutated handler actually did tear the entry down and
-    # rebuild it -- same value, different object -- before checking.
-    rebuilt = follower.storage.load_log()[1]
-    assert rebuilt == already_applied
-    assert rebuilt is not already_applied
+    # Delivered large-then-small: the Network reordering that produced
+    # seeds 3 and 35.
+    follower.raft_node.handle(send_later_large, src="0", now=0)
+    assert follower.storage.last_log_index() == 4
 
-    with pytest.raises(SafetyViolation, match="torn down and rebuilt"):
-        check_no_spurious_truncation(cluster, history)
+    history_old: dict[str, list[LogEntry]] = {follower.node_id: follower.storage.load_log()}
+    history_new: dict[str, list[LogEntry]] = {follower.node_id: follower.storage.load_log()}
+
+    follower.raft_node.handle(send_early_small, src="0", now=1)
+    assert follower.storage.last_log_index() == 2, "e3 and e4 should be silently discarded"
+
+    # OLD checker: identity-based, misses it.
+    _old_identity_based_check_no_spurious_truncation(cluster, history_old)  # must not raise
+
+    # NEW checker: value-based, catches it.
+    with pytest.raises(SafetyViolation, match="lost or changed"):
+        check_no_spurious_truncation(cluster, history_new)
 
 
 def test_mutation_match_index_advances_on_failure_is_detected(

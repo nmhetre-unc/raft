@@ -86,32 +86,81 @@ matching *which* value must be present) and `established_at_term` (the
 committing leader's current term at the moment this index was first covered,
 for deciding *which future leaders are bound at all*).
 
+## check_no_spurious_truncation compared log entries by identity, missing real entry loss
+
+Found by: diagnosing why Mutation 1 (`test_mutation_detection.py`'s blind
+truncate-and-reappend on every `AppendEntries`, never committed to
+`src/raft/node.py`) was reported caught in only 2/50 seeds, and only via
+`check_leader_completeness` — never via `check_no_spurious_truncation`,
+the checker that mutation was specifically added for. Shrinking those two
+seeds (3 and 35) and instrumenting every truncating `AppendEntries`
+delivery pinned the mechanism down exactly (see the diagnosis this fix is
+based on): a *stale, shorter* `AppendEntries` — built from an earlier,
+smaller `next_index`, before the leader's own log grew further — arrives,
+via the `Network`'s own reordering, *after* a longer one already extended
+the follower past it. Mutation 1's blind truncate-from-`prev_log_index+1`
+then discards everything the follower held beyond that stale message's
+range, including entries already covered by a leader's commit decision —
+in seed 3, an entry a majority had already made safe under the
+current-term rule, gone from the one follower that mattered by the time
+it was later, honestly elected leader.
+
+Root cause, in the checker, not the mutation: `check_no_spurious_
+truncation` compared entries pairwise over
+`range(min(len(current_log), len(previous_log)))` and raised only on
+"different object, same value" — an object-identity check specifically
+aimed at a follower tearing an already-matching entry down and rebuilding
+it. Two structural properties of this codebase, independent of each
+other, kept that signature from ever appearing here: (a) `next_index`
+genuinely never walks backward past a point of real agreement, so a
+*rejection*-driven retry can never resend something already
+known-matching; and (b) `LogEntry` is never cloned anywhere, so a resend
+built from a given leader's own storage is always identity-equal to
+whatever that leader sent before, regardless of `next_index`, delivery
+order, or how many times it's resent. (a) is a true claim about which
+index ranges a leader will ever construct into a message; it says nothing
+about (b), and it was (b) alone that made the identity signature
+unreachable — a fact the original reasoning stated as one combined
+argument rather than two independent ones. Meanwhile the `min(...)`-bounded
+loop meant that even value-level loss was invisible by construction: once
+`current_log` is shorter than `previous_log`, the discarded indices are
+never in range to compare at all, identity or otherwise.
+
+Fix: `check_no_spurious_truncation` now compares by *value* (`LogEntry`
+equality: `term` and `command`), not identity, and its scan is anchored
+to `previous_log`'s own length rather than the shorter of the two, so an
+index that disappears entirely is itself a difference, not something the
+loop bound quietly excuses. It finds the first index where the two logs
+diverge — including an index `previous_log` had that `current_log` no
+longer reaches — and passes only if `current_log` still has an entry
+there whose `term` differs (Figure 2 rule 3's conflict, immediately
+followed by rule 4's append: the one truncation Figure 2 actually
+permits). Anything else — gone entirely, unchanged in term but different
+in value, or unchanged in both but still removed and never restored —
+raises. Detection on Mutation 1 went from 2/50 (all via
+`check_leader_completeness`, only once a much later election happened to
+expose the gap) to 43/50, all via `check_no_spurious_truncation` itself,
+catching seeds 3 and 35 at the moment of loss — 140 and 37 steps earlier,
+respectively, than the leader-completeness violations that used to be the
+only signal.
+
 ## Invariant coverage gaps, measured
 
 A mutation test against the 50-seed sweep, re-run after `check_leader_
 completeness` and `check_state_machine_safety` (Milestone 4's
 commit-index-dependent checks) were wired in:
 
-- Blind truncate-and-reappend on a duplicate AppendEntries:
-  `check_no_spurious_truncation`'s own specific signature ("different
-  object, same value") still never arises through the sweep — confirmed
-  exactly as before, by instrumenting `Storage.truncate_from` directly and
-  by constructing that triggering condition by hand
-  (`test_mutation_1_triggering_condition_is_caught_when_constructed_directly`),
-  which proves the checker fires the moment that state exists. The reason
-  is structural: `next_index` only ever walks backward one rejection at a
-  time, and a rejection means the follower's entry at `prev_log_index`
-  doesn't match — so by construction the walk lands exactly on the point of
-  genuine agreement before any entries are ever sent. Whatever a leader
-  sends past that point is therefore always either new or a real conflict,
-  never "the follower already has this, from someone else." But
-  `check_leader_completeness` now catches 2/50 seeds anyway, via a
-  *different* consequence of the same mutation: always truncating from
-  `prev_log_index + 1` also discards anything a follower holds *beyond* the
-  resent range, and on those 2 seeds that collateral damage later mattered
-  to an election. Narrower than "the checker can't see this bug": the
-  specific signature remains a fuzzer-reachability gap; it's just no longer
-  true that nothing catches this mutation.
+- Blind truncate-and-reappend on a duplicate AppendEntries: **43/50
+  seeds, all via `check_no_spurious_truncation`** (0 via
+  `check_leader_completeness`, which runs later in the fixed check order
+  and never gets the chance — a `SafetyViolation` stops the run at the
+  first property that catches it). This corrects an earlier reading of
+  2/50, recorded here and now known to have been wrong about the
+  *checker*, not the mutation — see "check_no_spurious_truncation
+  compared log entries by identity, missing real entry loss" above for
+  the full mechanism and fix. The remaining 7/50 seeds (1, 2, 8, 9, 10,
+  43, 45) simply never produce the triggering reorder within 300 steps —
+  a fuzzer-coverage question, not a checker blind spot.
 - Advancing match_index/next_index on a rejected reply, trusting it
   regardless of the reply's success flag: **closed**. 4/50 seeds, always via
   `check_leader_completeness` — some later, honestly elected leader ends up
