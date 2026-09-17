@@ -407,6 +407,7 @@ def test_raft_cluster_node_exposes_typed_fields_and_falls_back_for_the_rest() ->
     assert adapter.current_term == 0
     assert adapter.voted_for is None
     assert adapter.leader_id is None
+    assert adapter.leader_hint is None
     assert adapter.storage is storage
     assert adapter.commit_index == 0
 

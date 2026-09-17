@@ -29,40 +29,53 @@ CLIENT_REQUEST is what actually exercises replication -- without it, the
 cluster's log stays at the sentinel forever, and `check_log_matching`,
 `check_leader_append_only`, and `check_no_spurious_truncation` all pass
 on every run for the same reason a test with no assertions passes:
-there's nothing there to be wrong. It calls `append_command` on
-whichever node is currently leader (skipped, not an error, if there
-isn't one), and it now sends a real `raft.statemachine.ClientRequest` --
-a `Put` or `Delete`, wrapped with a `client_id`/`serial_number` -- rather
-than the opaque placeholder string it used to (see BUGS.md): committed
-entries now actually reach `KVStateMachine.apply()` through ordinary
-fuzzer-driven traffic, not just hand-built tests. Both the request's
-`client_id`/`serial_number` and its underlying key/value/op are derived
-from `step_index` and one piece of persistent, replay-irrelevant
-bookkeeping (`_client_serial`, `_outstanding_request`) rather than a
-fresh RNG draw, so the same seed sends the same requests even after
-shrinking has renumbered the steps around it. `append_command` only
-*produces* messages -- it never sends them, exactly like `tick`/`handle`
--- so its output is routed through `Cluster.route()`, the same path
-`step()` uses internally; skipping that and leaving the messages unsent
-would mean every entry sits in the leader's own log forever and never
-reaches a single peer.
+there's nothing there to be wrong. It calls `append_command` on a node
+this fuzzer, acting as a client, currently *believes* is the leader --
+not necessarily the node that actually holds the role (see
+`_choose_client_request_target`) -- and sends a real
+`raft.statemachine.ClientRequest`: a `Put` or `Delete`, wrapped with a
+`client_id`/`serial_number`, rather than the opaque placeholder string it
+used to (see BUGS.md). Both the request's `client_id`/`serial_number`
+and its underlying key/value/op are derived from `step_index` and a
+little persistent, replay-irrelevant bookkeeping (`_client_serial`,
+`_outstanding_request`, `_believed_leader_id`) rather than a fresh RNG
+draw, so the same seed sends the same requests to the same targets even
+after shrinking has renumbered the steps around it. `append_command`
+only *produces* messages -- it never sends them, exactly like
+`tick`/`handle` -- so a successful call's output is routed through
+`Cluster.route()`, the same path `step()` uses internally; skipping that
+and leaving the messages unsent would mean every entry sits in the
+leader's own log forever and never reaches a single peer.
 
-Every draw that finds a live leader either retries the last request --
-if it isn't yet known to have been applied anywhere -- or, once it is,
-starts a new one with the next serial number: a real client has no way
-to know whether an unacknowledged request ever committed (its leader
-may have crashed, or just be slow), so it must be free to resend the
-identical `(client_id, serial_number, command)` rather than risk
-double-applying by picking a new serial number out of caution. Checking
-"is it applied anywhere yet" against every live node's own
+The target is picked the way a real client actually has to: with no
+omniscient knowledge of who has won an election, only by following
+`raft.node.NotLeader`'s own `leader_hint` when a guess turns out wrong,
+falling back to the first live node whenever there's no belief yet (see
+`_choose_client_request_target`). This is deliberate, not an
+oversight -- it's what actually exercises `NotLeader`/`leader_hint`
+through ordinary fuzzer-driven traffic instead of only hand-built tests,
+the same gap `ClientRequest` itself once had (see BUGS.md): a command
+can now genuinely be sent to a non-leader first and still eventually
+commit, once enough NOT_LEADER redirects and retries land on the real
+leader.
+
+Every draw either retries the last request -- if it isn't yet known to
+have been applied anywhere -- or, once it is, starts a new one with the
+next serial number: a real client has no way to know whether an
+unacknowledged request ever committed (its leader may have crashed, lost
+the role, or just be slow), so it must be free to resend the identical
+`(client_id, serial_number, command)` rather than risk double-applying
+by picking a new serial number out of caution. Checking "is it applied
+anywhere yet" against every live node's own
 `state_machine.last_applied_serial` is deliberately omniscient -- a real
 client could never do this -- but it only decides *this fuzzer's own*
-retry timing, not anything about correctness, so the simplification
-costs nothing. This is what actually gives `STALE_REDELIVER`, crashes,
-and elections something meaningful to interact with: the same logical
-request can end up appended to the log more than once, and
-`apply_client_request`'s own dedup (see `raft.statemachine`) is what has
-to make sure that never applies it twice.
+retry timing, not anything about correctness or which node it targets
+next, so the simplification costs nothing. This is what actually gives
+`STALE_REDELIVER`, crashes, and elections something meaningful to
+interact with: the same logical request can end up appended to the log
+more than once, and `apply_client_request`'s own dedup (see
+`raft.statemachine`) is what has to make sure that never applies it
+twice.
 
 Replay and shrinking (`replay`, `shrink`) both work on `list[TraceEntry]`,
 not `list[Action]`. A bare action *kind* -- "crash", with no word on
@@ -117,7 +130,7 @@ from raft.invariants import (
     check_state_machine_safety,
 )
 from raft.messages import AppendEntries
-from raft.node import RaftClusterNode, Role, raft_node_factory
+from raft.node import NotLeader, RaftClusterNode, raft_node_factory
 from raft.sim.cluster import Cluster
 from raft.sim.network import DEFAULT_HISTORY_DEPTH, DeliveryRecord
 from raft.statemachine import ClientRequest, Delete, Put
@@ -360,6 +373,12 @@ class Fuzzer:
         self._client_id = "fuzz-client"
         self._client_serial = 0
         self._outstanding_request: ClientRequest | None = None
+        # This fuzzer's own belief about which node is currently leader,
+        # acting as a client would -- refined only by following
+        # NOT_LEADER hints (see _apply_client_request), never by
+        # omnisciently checking who has actually won an election. Also a
+        # live-draw-only decision aid.
+        self._believed_leader_id: int | None = None
 
     def _choose_action(self) -> Action:
         actions = list(Action)
@@ -533,26 +552,54 @@ class Fuzzer:
         detail = self._apply_advance_clock(ms)
         return TraceEntry(step=step_index, action=Action.ADVANCE_CLOCK, detail=detail, ms=ms)
 
-    def _current_leader_id(self) -> int | None:
+    def _choose_client_request_target(self) -> int | None:
+        """Which node this fuzzer, acting as a client, currently believes
+        is the leader -- refined only by following NOT_LEADER hints (see
+        `_apply_client_request`), never by omnisciently checking who has
+        actually won an election. Falls back to the first live node as a
+        bootstrap guess whenever there's no belief yet, or the believed
+        node is no longer live -- a real client has to start somewhere,
+        and is just as capable of guessing wrong as this is.
+        """
+        believed = self._believed_leader_id
+        if believed is not None and self.cluster.get_node(believed) is not None:
+            return believed
         for node_id in self.cluster.node_ids():
-            node = self.cluster.get_node(node_id)
-            if node is not None and node.role is Role.LEADER:
+            if self.cluster.get_node(node_id) is not None:
                 return node_id
-        return None
+        return None  # every node is down
 
-    def _apply_client_request(self, leader_id: int, request: ClientRequest) -> str:
-        leader = self.cluster.get_node(leader_id)
-        if leader is None:
-            return "skipped (recorded leader is no longer alive)"
+    def _apply_client_request(self, target_id: int, request: ClientRequest) -> str:
+        target = self.cluster.get_node(target_id)
+        if target is None:
+            self._believed_leader_id = None  # that guess is gone; start over next time
+            return f"skipped (node {target_id} is no longer alive)"
 
         # append_command() only produces messages, it never sends them --
-        # exactly like tick()/handle() -- so this must go through the same
-        # Cluster.route() every other action's output does, or the entry
-        # sits in the leader's own log and never reaches a single peer.
+        # exactly like tick()/handle() -- so a successful result must go
+        # through the same Cluster.route() every other action's output
+        # does, or the entry sits in the leader's own log and never
+        # reaches a single peer.
         now = self.cluster.clock.now()
-        produced = leader.append_command(request, now)
-        self.cluster.route(leader_id, produced, now)
-        return f"leader {leader_id} appended {request!r}"
+        result = target.append_command(request, now)
+        if isinstance(result, NotLeader):
+            hint = result.leader_hint
+            # RaftClusterNode.append_command always translates a hint to
+            # Cluster's own int addressing (or leaves it None) -- this
+            # holds by construction, not by any check on this end.
+            assert hint is None or isinstance(hint, int), f"unexpected hint type: {hint!r}"
+            # Follow the hint for next time -- possibly None, meaning
+            # "no idea yet", which is exactly what a real client would
+            # be left with too (see raft.node's module docstring on why
+            # a hint is never fabricated). This can legitimately bounce
+            # between a couple of nodes right after an election before
+            # it settles on the real leader.
+            self._believed_leader_id = hint
+            return f"skipped (node {target_id} is not the leader; hint={hint!r})"
+
+        self._believed_leader_id = target_id  # confirmed: this node just accepted it as leader
+        self.cluster.route(target_id, result, now)
+        return f"leader {target_id} appended {request!r}"
 
     def _request_is_resolved(self, request: ClientRequest) -> bool:
         """Has `request` already been applied on some live node?
@@ -614,18 +661,18 @@ class Fuzzer:
                 command=forced.command,
             )
 
-        leader_id = self._current_leader_id()
-        if leader_id is None:
-            detail = "skipped (no leader)"
+        target_id = self._choose_client_request_target()
+        if target_id is None:
+            detail = "skipped (no live node to try)"
             return TraceEntry(step=step_index, action=Action.CLIENT_REQUEST, detail=detail)
 
         request = self._next_client_request(step_index)
-        detail = self._apply_client_request(leader_id, request)
+        detail = self._apply_client_request(target_id, request)
         return TraceEntry(
             step=step_index,
             action=Action.CLIENT_REQUEST,
             detail=detail,
-            node_id=leader_id,
+            node_id=target_id,
             command=request,
         )
 

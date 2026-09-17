@@ -58,7 +58,23 @@ Summary from the actual run (n=5, steps=300, seeds 0..49), after
   constructs the exact large-then-small delivery by hand (independent of
   any fuzzer randomness) and proves the old, identity-based checker
   misses it while the new, value-based one doesn't, so none of this is a
-  sweep-count coincidence.
+  sweep-count coincidence. Detection then moved again, 45/50 -> 41/50,
+  once CLIENT_REQUEST stopped omnisciently targeting the actual leader
+  and started following `raft.node.NotLeader`'s own `leader_hint`
+  instead, the way a real client has to (see `raft/sim/fuzz.py`'s
+  `_choose_client_request_target`). No randomness was added anywhere --
+  but a request that now needs one or more NOT_LEADER round trips before
+  it lands on the real leader replicates on a different, generally
+  slower cadence, which shifts which seeds happen to land a stale,
+  shorter `AppendEntries` inside the reordering window this mutation
+  needs. Seed 3 -- one of the two this diagnosis was originally built
+  around -- is still in the caught set; seed 35, the other, no longer is,
+  for the same reason: its own traffic pattern shifted enough that the
+  precondition this mutation needs no longer arises within 300 steps.
+  That's expected fuzzer behavior, not a regression in either the
+  mutation or the checker -- the hand-constructed proof above is
+  untouched by any of this, and remains the actual guarantee that the
+  new checker discriminates correctly.
 - Advancing match_index/next_index on a rejected reply, trusting it
   regardless of the reply's success flag: 4/50 detected, always via
   `check_leader_completeness` -- some later, honestly elected leader
@@ -83,14 +99,19 @@ Summary from the actual run (n=5, steps=300, seeds 0..49), after
 - Applying past commit_index -- ignoring Figure 2's "apply" boundary
   entirely and replaying straight to the end of the log, committed or
   not (Milestone 5's replicated state machine and `last_applied`
-  wiring): 11/50 detected, always via `check_state_machine_safety` --
-  the **first real detection this checker has ever produced** in this
-  project (see BUGS.md). An entry applied before it was actually safe
-  can still be truncated and overwritten by a later, honestly elected
-  leader that never saw it as committed; when that happens, whatever
-  next applies that same index sees different content than what an
-  earlier, premature application already recorded there, and the
-  checker's cross-observation comparison catches exactly that.
+  wiring): 8/50 detected (was 11/50 before CLIENT_REQUEST started
+  following `raft.node.NotLeader`'s own `leader_hint` instead of
+  omnisciently targeting the actual leader -- see the truncate-on-resend
+  entry above for why that traffic-pattern change shifts sweep counts
+  without touching either the mutation or the checker), always via
+  `check_state_machine_safety` -- the **first real detection this
+  checker has ever produced** in this project (see BUGS.md). An entry
+  applied before it was actually safe can still be truncated and
+  overwritten by a later, honestly elected leader that never saw it as
+  committed; when that happens, whatever next applies that same index
+  sees different content than what an earlier, premature application
+  already recorded there, and the checker's cross-observation comparison
+  catches exactly that.
 """
 
 import pytest
@@ -208,17 +229,21 @@ def test_mutation_always_truncate_on_resend_is_now_caught_directly(
     extended a follower past it: everything beyond the stale message's
     own range is discarded and never restored.
 
-    45/50 seeds now catch this (was 43/50 before `STALE_REDELIVER` joined
-    `DEFAULT_WEIGHTS` -- see the module docstring for why the *set* of
-    caught seeds shifts, not just grows, once a new action is woven into
-    the shared RNG stream), all via `check_no_spurious_truncation` (0 via
-    `check_leader_completeness`, which runs later in the fixed check
-    order in `Fuzzer._check_invariants` and never gets a chance -- a
+    41/50 seeds now catch this (was 45/50 before CLIENT_REQUEST stopped
+    omnisciently targeting the actual leader and started following
+    `raft.node.NotLeader`'s own `leader_hint` instead -- see the module
+    docstring for why that traffic-pattern change shifts sweep counts,
+    same as `STALE_REDELIVER` joining `DEFAULT_WEIGHTS` did before it,
+    without touching either the mutation or the checker), all via
+    `check_no_spurious_truncation` (0 via `check_leader_completeness`,
+    which runs later in the fixed check order in
+    `Fuzzer._check_invariants` and never gets a chance -- a
     `SafetyViolation` stops the run at the first property that catches
-    it). Seeds 3 and 35 -- the two seeds the previous, identity-based
+    it). Seed 3 -- one of the two seeds the previous, identity-based
     checker missed entirely and only `check_leader_completeness` used to
-    catch, 168 and 164 steps in respectively -- are both still in this
-    set. See
+    catch -- is still in this set; seed 35, the other, no longer is, its
+    own traffic pattern having shifted enough that this mutation's
+    precondition no longer arises for it within 300 steps. See
     `test_mutation_1_stale_shorter_delivery_is_caught_by_new_checker_not_old`
     for a hand-constructed proof (independent of any fuzzer randomness)
     that this is the new checker actually discriminating, and
@@ -230,12 +255,13 @@ def test_mutation_always_truncate_on_resend_is_now_caught_directly(
 
     violations = _sweep()
 
-    assert len(violations) == 45, f"detection rate shifted: {violations}"
+    assert len(violations) == 41, f"detection rate shifted: {violations}"
     assert all(
         "log entry at index" in reason and "lost or changed" in reason
         for reason in violations.values()
     )
-    assert 3 in violations and 35 in violations
+    assert 3 in violations
+    assert 35 not in violations
 
 
 def test_mutation_1_stale_shorter_delivery_is_caught_by_new_checker_not_old(
@@ -598,17 +624,23 @@ def test_mutation_apply_past_commit_index_is_detected(monkeypatch: pytest.Monkey
     whatever next reads that index sees genuinely different log content
     than an earlier, premature application already recorded.
 
-    DETECTED: 11/50 seeds, always via `check_state_machine_safety` -- the
-    first real detection this checker has ever produced (see BUGS.md;
-    every prior mention of it in this project was either "vacuously
-    satisfied" or a hand-constructed unit test in test_invariants.py that
-    never went through real `RaftNode` apply logic at all).
+    DETECTED: 8/50 seeds (was 11/50 before CLIENT_REQUEST started
+    following `raft.node.NotLeader`'s own `leader_hint` instead of
+    omnisciently targeting the actual leader -- see the module docstring
+    and the truncate-on-resend mutation's own test for why that
+    traffic-pattern change shifts sweep counts without touching either
+    the mutation or the checker), always via `check_state_machine_safety`
+    -- the first real detection this checker has ever produced (see
+    BUGS.md; every prior mention of it in this project was either
+    "vacuously satisfied" or a hand-constructed unit test in
+    test_invariants.py that never went through real `RaftNode` apply
+    logic at all).
     """
     monkeypatch.setattr(RaftNode, "_apply_committed_entries", _mutation_5_apply_past_commit_index)
 
     violations = _sweep()
 
-    assert len(violations) == 11, f"detection rate shifted: {violations}"
+    assert len(violations) == 8, f"detection rate shifted: {violations}"
     assert all(
         "applied" in reason and "already applied there" in reason for reason in violations.values()
     )

@@ -38,6 +38,29 @@ milestone -- see `raft.statemachine.KVStateMachine.read` for the
 local-read alternative used instead, and the linearizability limitation
 that comes with it.
 
+A client has no way to know in advance which node is the leader.
+`append_command` on a node that isn't one returns `NotLeader` -- carrying
+`leader_hint`, this node's own best current guess at who is -- instead of
+silently doing nothing. The guess is deliberately loose: it's whichever
+node this one most recently saw a `RequestVote` or `AppendEntries` from
+at a term at least as new as its own (`_maybe_update_leader_hint`,
+called for every incoming message alongside `_maybe_adopt_newer_term`),
+covering a candidate that hasn't won yet as well as a confirmed leader --
+either is a more useful next guess than nothing. It is a HINT, not a
+guarantee, and is never treated as one here: nothing in this file ever
+reads `leader_hint` to decide anything about election or replication --
+that stays exactly `current_term`/`role`/vote-counting, untouched by
+this. A client (or a fuzzer standing in for one -- see `raft.sim.fuzz`)
+that follows a stale hint can perfectly legitimately land on another
+non-leader and get redirected again; this is expected and most likely
+right after an election, when several nodes' hints can briefly point in
+different directions before heartbeats catch everyone up. `leader_hint`
+starts `None` and only ever advances forward in information, never
+guessed at or invented -- a node with nothing informative yet (its own
+first tick, or a candidacy that hasn't heard back from anyone) correctly
+reports `None` rather than a stale or fabricated guess dressed up as
+confident.
+
 Commitment's one rule matters more than everything else in this file
 combined, and it is stated here in full rather than assumed known:
 **a leader may only ever advance `commit_index` to an index whose entry
@@ -135,6 +158,7 @@ from __future__ import annotations
 
 import random
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum
 
 from raft.messages import (
@@ -146,6 +170,25 @@ from raft.messages import (
 )
 from raft.statemachine import ClientRequest, Delete, Get, KVStateMachine, Put
 from raft.storage import LogEntry, Storage
+
+
+@dataclass(frozen=True)
+class NotLeader:
+    """Returned by `append_command` (`RaftNode`'s or `RaftClusterNode`'s)
+    when the node it was called on isn't the leader.
+
+    `leader_hint` is that node's own best current guess at who is --
+    `str` from `RaftNode` (its own node-id addressing), or `int` once
+    `RaftClusterNode` translates it for `Cluster`'s int-addressed world,
+    exactly mirroring the same boundary every other `RaftClusterNode`
+    method already translates across -- or `None` if it has no guess at
+    all yet. See `raft.node`'s module docstring for exactly how the
+    guess is formed and why it's a hint, never a guarantee: a client (or
+    a fuzzer standing in for one) that acts on it can legitimately be
+    redirected again, especially right after an election.
+    """
+
+    leader_hint: str | int | None
 
 
 class Role(Enum):
@@ -164,8 +207,9 @@ class RaftNode:
 
     Volatile (never touches `storage`, reset to nothing meaningful by a
     fresh construction -- i.e. by a simulated crash and restart):
-    `role`, `leader_id`, `election_deadline`, `votes_received`,
-    `commit_index`, `last_applied`, `state_machine`, and -- only
+    `role`, `leader_id`, `leader_hint`, `election_deadline`,
+    `votes_received`, `commit_index`, `last_applied`, `state_machine`,
+    and -- only
     meaningful while `role is Role.LEADER`, reinitialized fresh on every
     election win -- `next_index`, `match_index`. `commit_index` staying
     volatile is deliberate, not an oversight: it is fully reconstructible
@@ -214,6 +258,13 @@ class RaftNode:
         # Volatile state -- gone and rebuilt on every crash/restart.
         self.role = Role.FOLLOWER
         self.leader_id: str | None = None
+        # This node's best current guess at who the leader is, for
+        # NOT_LEADER responses to client requests -- see the module
+        # docstring and NotLeader. Deliberately separate from leader_id
+        # (which tracks only a *confirmed* leader's own AppendEntries):
+        # leader_hint also updates from a mere candidate's RequestVote,
+        # since either is a more useful guess than nothing.
+        self.leader_hint: str | None = None
         self.votes_received: set[str] = set()
         self.election_deadline: int = 0
         self._next_heartbeat: int = 0
@@ -261,6 +312,7 @@ class RaftNode:
     def handle(self, msg: Message, src: str, now: int) -> list[tuple[str, Message]]:
         """Called with one incoming message, addressed to this node, from `src`."""
         self._maybe_adopt_newer_term(msg.term)
+        self._maybe_update_leader_hint(msg)
 
         if isinstance(msg, RequestVote):
             out = self._handle_request_vote(msg, src, now)
@@ -285,6 +337,28 @@ class RaftNode:
             self.voted_for = None
             self.role = Role.FOLLOWER
             self._dirty = True
+
+    def _maybe_update_leader_hint(self, msg: Message) -> None:
+        """Refresh `leader_hint` (see the module docstring and
+        `NotLeader`) from any `RequestVote`/`AppendEntries` at a term at
+        least as new as this node's own -- checked AFTER
+        `_maybe_adopt_newer_term`, so a message that just bumped
+        `current_term` always qualifies against the new value, and a
+        genuinely stale one (behind even before any bump) never does.
+        A reply says nothing about who ITS sender believes is leader --
+        only a request carries that -- so replies are left untouched.
+
+        This never affects an election or replication decision: nothing
+        in this file ever reads `leader_hint` for anything but building
+        a `NotLeader` response, so changing it here changes no behavior
+        but that response's own content.
+        """
+        if msg.term < self.current_term:
+            return
+        if isinstance(msg, AppendEntries):
+            self.leader_hint = msg.leader_id
+        elif isinstance(msg, RequestVote):
+            self.leader_hint = msg.candidate_id
 
     # -- RequestVote --
 
@@ -592,18 +666,22 @@ class RaftNode:
             leader_commit=self.commit_index,
         )
 
-    def append_command(self, command: object, now: int) -> list[tuple[str, Message]]:
+    def append_command(
+        self, command: object, now: int
+    ) -> list[tuple[str, Message]] | NotLeader:
         """A client's request to replicate `command`.
 
-        Returns `[]` and does nothing if this node isn't currently
-        leader -- the caller is expected to redirect to `leader_id`
-        instead of retrying here. Otherwise appends `command` (at this
+        Returns `NotLeader(leader_hint=self.leader_hint)` and does
+        nothing if this node isn't currently leader -- the caller is
+        expected to redirect to that hint instead of retrying here (see
+        the module docstring for exactly what the hint is and its
+        no-guarantee caveat). Otherwise appends `command` (at this
         leader's current term) to its own log and immediately sends it
         on to every peer via the same per-peer AppendEntries logic a
         heartbeat uses.
         """
         if self.role is not Role.LEADER:
-            return []
+            return NotLeader(leader_hint=self.leader_hint)
 
         self.storage.append_entries([LogEntry(term=self.current_term, command=command)])
         # Same reasoning as the lone-leader check in _become_leader: this
@@ -648,10 +726,10 @@ class RaftClusterNode:
     `(dst, payload)` pairs it produces, and otherwise gets entirely out of
     the way. The handful of fields external callers (tests, invariant
     checkers) actually need to inspect -- `role`, `current_term`,
-    `voted_for`, `leader_id`, `node_id`, `storage`, `commit_index`,
-    `last_applied`, `state_machine` -- are typed properties reading
-    straight through to the real node; anything else falls back through
-    `__getattr__`, untyped but still reachable.
+    `voted_for`, `leader_id`, `leader_hint`, `node_id`, `storage`,
+    `commit_index`, `last_applied`, `state_machine` -- are typed
+    properties reading straight through to the real node; anything else
+    falls back through `__getattr__`, untyped but still reachable.
     """
 
     def __init__(self, raft_node: RaftNode) -> None:
@@ -681,6 +759,10 @@ class RaftClusterNode:
         return self.raft_node.leader_id
 
     @property
+    def leader_hint(self) -> str | None:
+        return self.raft_node.leader_hint
+
+    @property
     def storage(self) -> Storage:
         return self.raft_node.storage
 
@@ -704,14 +786,22 @@ class RaftClusterNode:
         produced = self.raft_node.handle(payload, str(src), now)
         return [(int(dst), msg) for dst, msg in produced]
 
-    def append_command(self, command: object, now: int) -> list[tuple[int, object]]:
+    def append_command(self, command: object, now: int) -> list[tuple[int, object]] | NotLeader:
         """Same translation as `tick`/`handle`, for the client entry point.
 
         Without this, `__getattr__` would forward straight to
         `raft_node.append_command`, which addresses peers as `str` --
-        exactly the mismatch this whole class exists to paper over.
+        exactly the mismatch this whole class exists to paper over. A
+        `NotLeader` result gets the identical treatment: its
+        `leader_hint`, if any, is translated from `RaftNode`'s own `str`
+        addressing to `Cluster`'s `int` one, so a caller never has to
+        know this wrapper exists to make sense of the hint.
         """
-        return [(int(dst), msg) for dst, msg in self.raft_node.append_command(command, now)]
+        result = self.raft_node.append_command(command, now)
+        if isinstance(result, NotLeader):
+            hint = int(result.leader_hint) if result.leader_hint is not None else None
+            return NotLeader(leader_hint=hint)
+        return [(int(dst), msg) for dst, msg in result]
 
 
 def raft_node_factory(

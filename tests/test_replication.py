@@ -10,7 +10,7 @@ under the current-term-only restriction, and follower-side adoption of
 import random
 
 from raft.messages import AppendEntries, AppendEntriesReply, RequestVoteReply
-from raft.node import RaftNode, Role
+from raft.node import NotLeader, RaftNode, Role
 from raft.storage import SENTINEL, LogEntry, MemoryStorage
 
 
@@ -135,14 +135,83 @@ def test_peer_at_last_log_index_plus_one_receives_empty_entries() -> None:
     assert msg.entries == ()
 
 
-def test_append_command_on_a_follower_returns_nothing_and_appends_nothing() -> None:
+def test_append_command_on_a_follower_returns_not_leader_and_appends_nothing() -> None:
     storage = MemoryStorage()
     node = RaftNode("0", ["1"], storage, rng=random.Random(1))
     assert node.role is Role.FOLLOWER
 
     result = node.append_command("set x=1", now=0)
 
-    assert result == []
+    assert result == NotLeader(leader_hint=None)
+    assert storage.last_log_index() == 0  # nothing was appended
+
+
+def test_append_command_on_a_follower_hints_the_leader_it_last_saw() -> None:
+    storage = MemoryStorage()
+    node = RaftNode("0", ["1", "2"], storage, rng=random.Random(1))
+    assert node.role is Role.FOLLOWER
+
+    msg = AppendEntries(
+        term=1,
+        leader_id="1",
+        prev_log_index=0,
+        prev_log_term=0,
+        entries=(),
+        leader_commit=0,
+    )
+    node.handle(msg, src="1", now=0)
+
+    result = node.append_command("set x=1", now=1)
+
+    assert result == NotLeader(leader_hint="1")
+    assert storage.last_log_index() == 0  # nothing was appended
+
+
+def test_append_command_hint_ignores_a_stale_message_from_an_earlier_term() -> None:
+    # Positive control for _maybe_update_leader_hint's own term guard: a
+    # naive implementation that updates leader_hint unconditionally --
+    # "the leader I last saw", full stop, with no check that the message
+    # is still at least as new as the node's own current term -- would
+    # let a late, reordered/redelivered message from N terms ago clobber
+    # a fresher, still-good hint with stale information. This has to be
+    # caught by a direct assertion on the hint itself, not incidentally
+    # by some unrelated fuzzer sweep count.
+    storage = MemoryStorage()
+    node = RaftNode("0", ["1", "2"], storage, rng=random.Random(1))
+
+    fresh = AppendEntries(
+        term=5,
+        leader_id="1",
+        prev_log_index=0,
+        prev_log_term=0,
+        entries=(),
+        leader_commit=0,
+    )
+    node.handle(fresh, src="1", now=0)
+    assert node.append_command("set x=1", now=1) == NotLeader(leader_hint="1")
+
+    stale = AppendEntries(
+        term=2,  # older than node's current_term (5, adopted from `fresh`)
+        leader_id="2",
+        prev_log_index=0,
+        prev_log_term=0,
+        entries=(),
+        leader_commit=0,
+    )
+    node.handle(stale, src="2", now=2)
+
+    assert node.append_command("set x=1", now=3) == NotLeader(leader_hint="1")
+
+
+def test_append_command_mid_election_with_no_leader_knowledge_hints_nothing() -> None:
+    storage = MemoryStorage()
+    node = RaftNode("0", ["1", "2"], storage, rng=random.Random(1))
+    node._start_election(now=0)
+    assert node.role is Role.CANDIDATE
+
+    result = node.append_command("set x=1", now=1)
+
+    assert result == NotLeader(leader_hint=None)
     assert storage.last_log_index() == 0  # nothing was appended
 
 

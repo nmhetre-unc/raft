@@ -140,6 +140,16 @@ def test_crash_and_partition_skip_when_structurally_impossible() -> None:
     assert cluster.cluster.next_event_time() is None
     assert cluster._do_advance_clock(0, forced=None).detail.startswith("advanced clock by")
 
+    # Same all-crashed cluster: there's no live node left to even guess is
+    # the leader, so _choose_client_request_target reports that honestly
+    # (None) rather than picking a dead node, and _do_client_request skips
+    # cleanly instead of calling append_command on nothing.
+    assert cluster._choose_client_request_target() is None
+    skip_entry = cluster._do_client_request(0, forced=None)
+    assert skip_entry.detail == "skipped (no live node to try)"
+    assert skip_entry.node_id is None
+    assert skip_entry.command is None
+
 
 def test_apply_client_request_skips_a_recorded_leader_that_has_since_crashed() -> None:
     # Only reachable on a forced (replay) path: a shrunk candidate can
@@ -149,7 +159,68 @@ def test_apply_client_request_skips_a_recorded_leader_that_has_since_crashed() -
     fuzzer = Fuzzer(n=3, seed=1, steps=1)
     fuzzer.cluster.crash(0)
 
-    assert fuzzer._apply_client_request(0, "cmd") == "skipped (recorded leader is no longer alive)"
+    assert fuzzer._apply_client_request(0, "cmd") == "skipped (node 0 is no longer alive)"
+
+
+def test_a_request_sent_to_a_non_leader_still_eventually_commits() -> None:
+    """CLIENT_REQUEST no longer omnisciently targets the actual leader --
+    it follows `raft.node.NotLeader`'s own `leader_hint` instead, exactly
+    the way a real client has to (see the module docstring and
+    `_choose_client_request_target`). This is the fuzzer-driven proof
+    that the redirect mechanism actually works end to end, across a
+    50-seed sweep with real elections happening (crashes, restarts, and
+    election timeouts are all in `DEFAULT_WEIGHTS`; `max_term_seen` below
+    confirms terms climbed well past 1, so this isn't one lucky,
+    election-free run).
+
+    "Eventually commits" is checked from the trace itself, not from
+    final cluster state at the end of a bounded run -- a request that's
+    still outstanding when a run's steps simply run out isn't evidence of
+    anything broken, misdirected or not, so asserting on that would be
+    flaky for reasons unrelated to this feature. What actually proves
+    resolution, robustly, is the fuzzer's own retry contract (see
+    `_next_client_request`): it never starts serial N+1 until serial N is
+    confirmed applied somewhere. So if a trace ever shows a misdirected
+    serial N (a CLIENT_REQUEST entry whose detail names it NOT_LEADER)
+    followed later by a CLIENT_REQUEST for serial N+1, serial N's request
+    must have committed in between -- despite having been sent to a
+    non-leader at least once along the way.
+    """
+    found_example = None
+    max_term_seen = 0
+
+    for seed in range(50):
+        fuzzer = Fuzzer(n=5, seed=seed, steps=300)
+        fuzzer.run()
+
+        for node_id in fuzzer.cluster.node_ids():
+            node = fuzzer.cluster.get_node(node_id)
+            if node is not None:
+                max_term_seen = max(max_term_seen, node.current_term)
+
+        if found_example is not None:
+            continue
+
+        misdirected_serials = set()
+        started_serials = set()
+        for entry in fuzzer.trace:
+            if entry.action is not Action.CLIENT_REQUEST or entry.command is None:
+                continue
+            started_serials.add(entry.command.serial_number)
+            if "is not the leader" in entry.detail:
+                misdirected_serials.add(entry.command.serial_number)
+
+        for serial in misdirected_serials:
+            if serial + 1 in started_serials:
+                found_example = (seed, serial)
+                break
+
+    assert found_example is not None, (
+        "no seed in this sweep ever showed a misdirected request go on to resolve"
+    )
+    # Elections genuinely happened -- this isn't just one election-free run
+    # where the fuzzer's first guess happened to stay right forever.
+    assert max_term_seen > 5
 
 
 # -- replay() and shrink() --
@@ -271,3 +342,18 @@ def test_replay_is_idempotent() -> None:
     assert first_trace == second_trace == trace
     assert first_terms == second_terms
     assert first_clock == second_clock
+
+
+def test_replay_of_a_forced_client_request_skip_reuses_its_recorded_detail() -> None:
+    # A recorded "no live node to try" skip (node_id and command both
+    # None, see _do_client_request) can't be re-derived from anything --
+    # there's no node or request to re-apply -- so replay must just hand
+    # the original detail straight back, not recompute a fresh guess.
+    forced = TraceEntry(
+        step=0, action=Action.CLIENT_REQUEST, detail="skipped (no live node to try)"
+    )
+    fuzzer = Fuzzer(n=3, seed=1, steps=1)
+
+    fuzzer.replay([forced])
+
+    assert fuzzer.trace == [TraceEntry(step=0, action=Action.CLIENT_REQUEST, detail=forced.detail)]
