@@ -231,19 +231,25 @@ mutation or the checker:
   the two seeds this diagnosis was built around, 3 and 35, is still in
   the caught set and which no longer is).
 - Advancing match_index/next_index on a rejected reply, trusting it
-  regardless of the reply's success flag: **closed**. 4/50 seeds, always via
-  `check_leader_completeness` — some later, honestly elected leader ends up
-  missing an entry an earlier leader believed it had committed, purely
-  because of the corrupted match_index. This is exactly the class of real
-  bug described above, and exactly the gap Leader Completeness was added to
-  close.
-- Skipping the AppendEntries consistency check entirely: 31/50 seeds (was
-  33/50 before `STALE_REDELIVER` joined `DEFAULT_WEIGHTS` — see above for
-  why a new action shifts counts for mutations it has nothing to do with,
-  by perturbing the shared RNG stream, not a regression) — 30 via log
-  matching, 1 via leader completeness (a `SafetyViolation` stops the run
-  at the first property that catches it, so which one fires first for a
-  given seed depends on exactly when each condition becomes checkable).
+  regardless of the reply's success flag: **closed**. 2/50 seeds (was
+  4/50 before the leader-hint traffic-pattern shift described above —
+  same cause, same "shifts counts for mutations it has nothing to do
+  with" effect, not a regression), always via `check_leader_completeness`
+  — some later, honestly elected leader ends up missing an entry an
+  earlier leader believed it had committed, purely because of the
+  corrupted match_index. This is exactly the class of real bug described
+  above, and exactly the gap Leader Completeness was added to close.
+- Skipping the AppendEntries consistency check entirely: 25/50 seeds now
+  — history: 33/50 (native) → 31/50 (once `STALE_REDELIVER` joined
+  `DEFAULT_WEIGHTS`; 30 via log matching, 1 via leader completeness) →
+  25/50, all via log matching, 0 via leader completeness (once the
+  leader-hint traffic-pattern shift described above moved the one seed
+  that used to surface via leader completeness onto the log-matching
+  path instead — its own traffic changed enough that log matching now
+  catches it first). A `SafetyViolation` stops the run at the first
+  property that catches it, so which checker fires first for a given
+  seed depends on exactly when each condition becomes checkable, not
+  which bug is "more real."
 - next_index initialized to 1 rather than last_log_index + 1: still 0/50,
   and still not obviously a safety bug — prev_log_index 0 always passes the
   sentinel check, so peers get a redundant resend that correct follower

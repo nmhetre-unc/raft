@@ -76,23 +76,31 @@ Summary from the actual run (n=5, steps=300, seeds 0..49), after
   untouched by any of this, and remains the actual guarantee that the
   new checker discriminates correctly.
 - Advancing match_index/next_index on a rejected reply, trusting it
-  regardless of the reply's success flag: 4/50 detected, always via
-  `check_leader_completeness` -- some later, honestly elected leader
-  ends up missing an entry an earlier leader believed it had committed,
-  purely because of the corrupted match_index. This is exactly the gap
-  Leader Completeness was added to close, and it does. (The original
-  version of this mutation directly corrupted a leader-side
-  `_outstanding` record that no longer exists: fixing the real bug that
-  record turned out to enable, found via this exact checker on
-  *unmutated* code, removed it -- see BUGS.md. The mutation is rewritten
-  here to recreate the same class of bug against the message shape that
-  replaced it.)
-- Skipping the AppendEntries consistency check entirely: 31/50 detected
-  (was 33/50 before `STALE_REDELIVER` joined `DEFAULT_WEIGHTS` -- see
-  that entry above for why a new action shifts counts for mutations it
-  has nothing to do with, by perturbing the shared RNG stream, not a
-  regression) -- 30 via check_log_matching, 1 via check_leader_completeness
-  (see that test for why one seed's report differs from the rest).
+  regardless of the reply's success flag: 2/50 detected (was 4/50 before
+  CLIENT_REQUEST started following `raft.node.NotLeader`'s own
+  `leader_hint` instead of omnisciently targeting the actual leader --
+  see the truncate-on-resend entry above for why that traffic-pattern
+  change shifts sweep counts without touching either the mutation or the
+  checker), always via `check_leader_completeness` -- some later,
+  honestly elected leader ends up missing an entry an earlier leader
+  believed it had committed, purely because of the corrupted
+  match_index. This is exactly the gap Leader Completeness was added to
+  close, and it does. (The original version of this mutation directly
+  corrupted a leader-side `_outstanding` record that no longer exists:
+  fixing the real bug that record turned out to enable, found via this
+  exact checker on *unmutated* code, removed it -- see BUGS.md. The
+  mutation is rewritten here to recreate the same class of bug against
+  the message shape that replaced it.)
+- Skipping the AppendEntries consistency check entirely: 25/50 detected
+  (was 33/50 before `STALE_REDELIVER` joined `DEFAULT_WEIGHTS`, then
+  31/50 with it, then 25/50 once CLIENT_REQUEST started following
+  `leader_hint` instead of omnisciently targeting the actual leader --
+  see the truncate-on-resend entry above for why traffic-pattern changes
+  shift counts for mutations they have nothing to do with, not a
+  regression) -- now all 25 via `check_log_matching`, 0 via
+  `check_leader_completeness` (the one seed that used to surface via
+  leader completeness before this last shift no longer does; see that
+  test for the per-checker breakdown it now pins exactly).
 - Leader-side next_index initialized to 1 instead of last_log_index + 1:
   0/50 detected -- GAP, and on reflection this one may not be a safety
   gap at all, just a wasteful one (see its test for why).
@@ -476,12 +484,17 @@ def test_mutation_match_index_advances_on_failure_is_detected(
     fully replicated to the peer, regardless of what the reply actually
     says.
 
-    DETECTED, always via check_leader_completeness: some later, honestly
-    elected leader lacks an entry an earlier leader believed committed
-    only because of this corruption. This is exactly the gap
-    `check_leader_completeness` was added to close: nothing about
-    election safety, log matching, or append-only-ness inherently
-    depends on match_index being trustworthy, but commitment does.
+    DETECTED: 2/50 seeds (was 4/50 before CLIENT_REQUEST started
+    following `raft.node.NotLeader`'s own `leader_hint` instead of
+    omnisciently targeting the actual leader -- see the truncate-on-resend
+    mutation's own test for why that traffic-pattern change shifts sweep
+    counts without touching either the mutation or the checker), always
+    via check_leader_completeness: some later, honestly elected leader
+    lacks an entry an earlier leader believed committed only because of
+    this corruption. This is exactly the gap `check_leader_completeness`
+    was added to close: nothing about election safety, log matching, or
+    append-only-ness inherently depends on match_index being trustworthy,
+    but commitment does.
     """
 
     def mutated(self: RaftNode, msg: Message, src: str, now: int) -> list[tuple[str, Message]]:
@@ -510,7 +523,7 @@ def test_mutation_match_index_advances_on_failure_is_detected(
 
     violations = _sweep()
 
-    assert len(violations) > 0, "expected this to be detected; check_leader_completeness regressed"
+    assert len(violations) == 2, f"detection rate shifted: {violations}"
     assert all("missing entry" in reason for reason in violations.values())
 
 
@@ -522,22 +535,25 @@ def test_mutation_skipping_the_consistency_check_is_detected(
     position the follower's log happens to currently end at, regardless
     of what Raft index the leader thinks they're at.
 
-    DETECTED: 31/50 seeds (was 33/50 before `STALE_REDELIVER` joined
-    `DEFAULT_WEIGHTS` -- see the module docstring for why weaving a new
-    action into the shared, weighted `self._rng` stream shifts *every*
-    seed's subsequent random walk, not just the ones that need it, so a
-    small count change here reflects a different-but-equally-valid
-    sequence of events, not a regression) -- 30 via check_log_matching
-    (the index misalignment this causes reliably produces two nodes
-    disagreeing on what's stored at a shared (index, term)), and 1 via
-    check_leader_completeness, where the same misalignment happens to
-    surface as a later leader missing an entry before the log-matching
-    divergence it would also eventually cause ever gets checked (a
-    `SafetyViolation` stops the run at the first property that catches
-    it, so which one fires first for a given seed depends on exactly
-    when each condition becomes checkable, not which bug is "more
-    real"). Both are genuine invariant coverage of the same underlying
-    mutation, not a coincidence.
+    DETECTED: 25/50 seeds now (history: 33/50 before `STALE_REDELIVER`
+    joined `DEFAULT_WEIGHTS` -- see the module docstring for why weaving a
+    new action into the shared, weighted `self._rng` stream shifts
+    *every* seed's subsequent random walk, not just the ones that need
+    it -- then 31/50 with it, 30 via check_log_matching and 1 via
+    check_leader_completeness; then 25/50, all via check_log_matching,
+    0 via check_leader_completeness, once CLIENT_REQUEST stopped
+    omnisciently targeting the actual leader and started following
+    `raft.node.NotLeader`'s own `leader_hint` instead -- see the
+    truncate-on-resend mutation's own test for why that traffic-pattern
+    change shifts sweep counts without touching either the mutation or
+    the checker). The one seed that used to surface via
+    check_leader_completeness -- because the same misalignment happened
+    to surface there first, before the log-matching divergence it would
+    also eventually cause ever got checked -- no longer does: its own
+    traffic pattern shifted enough that check_log_matching now catches it
+    first instead. check_log_matching is the reliable signal here: the
+    index misalignment this mutation causes produces two nodes
+    disagreeing on what's stored at a shared (index, term), every time.
     """
 
     def mutated(self: RaftNode, msg: Message, src: str, now: int) -> list[tuple[str, Message]]:
@@ -573,10 +589,13 @@ def test_mutation_skipping_the_consistency_check_is_detected(
 
     violations = _sweep()
 
-    assert len(violations) > 0, "expected this to be reliably caught; detection ability regressed"
-    assert all(
-        "log matching violated" in reason or "missing entry" in reason
-        for reason in violations.values()
+    assert len(violations) == 25, f"detection rate shifted: {violations}"
+    via_log_matching = sum(1 for reason in violations.values() if "log matching violated" in reason)
+    via_leader_completeness = sum(1 for reason in violations.values() if "missing entry" in reason)
+    assert via_log_matching == 25, f"per-checker split shifted: {violations}"
+    assert via_leader_completeness == 0, f"per-checker split shifted: {violations}"
+    assert via_log_matching + via_leader_completeness == len(violations), (
+        f"a violation reason went unclassified: {violations}"
     )
 
 
