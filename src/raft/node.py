@@ -18,15 +18,23 @@ the same reason: a restarted node's `Storage` is untouched by the crash
 (see `raft.storage`'s module docstring), so replaying the same committed
 log from index 1 into a fresh `KVStateMachine` after a restart
 reconstructs the identical final state a real disk-backed state machine
-would have kept -- redundant durability, not a gap. A command reaching
-`_apply_committed_entries` that isn't a real `raft.statemachine.Command`
+would have kept -- redundant durability, not a gap. A real client
+request is logged as a `raft.statemachine.ClientRequest` (carrying the
+client's own `client_id`/`serial_number` alongside its `Command`) and
+applied through `state_machine.apply_client_request`, which deduplicates
+a retried request instead of re-running it -- see that method's own
+docstring for the exact rule, and for why living on `KVStateMachine`
+itself, not anywhere leader-specific, is what makes it safe across a
+leader change. A bare `Command` (no client wrapper) still goes straight
+through `state_machine.apply`, exactly as before `ClientRequest` existed.
+A command reaching `_apply_committed_entries` that is neither of those
 (the log's own index-0 sentinel, `_become_leader`'s content-free no-op,
-or -- outside this file -- a test or fuzzer using an opaque placeholder
-command to exercise replication without caring about state-machine
-semantics) is treated as inert: `last_applied` still advances past it,
-one index at a time, exactly like any other entry, but nothing is fed to
-the state machine for it. `get` is NOT put through this path at all in
-this milestone -- see `raft.statemachine.KVStateMachine.read` for the
+or -- outside this file -- a test using an opaque placeholder command to
+exercise replication without caring about state-machine semantics) is
+treated as inert: `last_applied` still advances past it, one index at a
+time, exactly like any other entry, but nothing is fed to the state
+machine for it. `get` is NOT put through this path at all in this
+milestone -- see `raft.statemachine.KVStateMachine.read` for the
 local-read alternative used instead, and the linearizability limitation
 that comes with it.
 
@@ -136,7 +144,7 @@ from raft.messages import (
     RequestVote,
     RequestVoteReply,
 )
-from raft.statemachine import Delete, Get, KVStateMachine, Put
+from raft.statemachine import ClientRequest, Delete, Get, KVStateMachine, Put
 from raft.storage import LogEntry, Storage
 
 
@@ -478,9 +486,14 @@ class RaftNode:
         the committed log it already has.
 
         `entry.command` reaching an unrecognized type (not a real
-        `raft.statemachine.Command`) is treated as inert, not an error --
-        see the module docstring for exactly which entries take this path
-        and why applying nothing for them is still correct.
+        `raft.statemachine.Command` or `ClientRequest`) is treated as
+        inert, not an error -- see the module docstring for exactly which
+        entries take this path and why applying nothing for them is still
+        correct. A `ClientRequest` goes through `state_machine.
+        apply_client_request` (the deduplicating path); a bare `Command`
+        goes through `state_machine.apply` directly (no session tracking
+        at all -- this is what every entry built before `ClientRequest`
+        existed still looks like, and stays fully supported).
         """
         if self.last_applied >= self.commit_index:
             return
@@ -488,7 +501,9 @@ class RaftNode:
         log = self.storage.load_log()
         for index in range(self.last_applied + 1, self.commit_index + 1):
             command = log[index].command
-            if isinstance(command, Put | Get | Delete):
+            if isinstance(command, ClientRequest):
+                self.state_machine.apply_client_request(command)
+            elif isinstance(command, Put | Get | Delete):
                 self.state_machine.apply(command)
             self.last_applied = index
 

@@ -73,6 +73,19 @@ def test_read_is_a_direct_local_lookup_matching_get() -> None:
     assert sm.read("missing") is NOT_FOUND
 
 
+def test_read_distinguishes_a_stored_none_from_a_missing_key() -> None:
+    # test_stored_none_is_distinguishable_from_missing already proves this
+    # for apply(Get(...)); read() is a separate code path (a plain dict
+    # lookup, not routed through apply() at all -- see KVStateMachine.read's
+    # own docstring) and needed its own, direct confirmation before
+    # anything else relies on read()'s NOT_FOUND-vs-None contract.
+    sm = KVStateMachine()
+    sm.apply(Put(key="x", value=None))
+
+    assert sm.read("x") is None
+    assert sm.read("never-set") is NOT_FOUND
+
+
 def test_read_never_mutates_state() -> None:
     sm = KVStateMachine()
 

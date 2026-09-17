@@ -29,16 +29,40 @@ CLIENT_REQUEST is what actually exercises replication -- without it, the
 cluster's log stays at the sentinel forever, and `check_log_matching`,
 `check_leader_append_only`, and `check_no_spurious_truncation` all pass
 on every run for the same reason a test with no assertions passes:
-there's nothing there to be wrong. It
-calls `append_command` on whichever node is currently leader (skipped,
-not an error, if there isn't one), with a command derived from
-`step_index` rather than a counter or a random draw, so the same seed
-sends the same commands even after shrinking has renumbered the steps
-around it. `append_command` only *produces* messages -- it never sends
-them, exactly like `tick`/`handle` -- so its output is routed through
-`Cluster.route()`, the same path `step()` uses internally; skipping that
-and leaving the messages unsent would mean every entry sits in the
-leader's own log forever and never reaches a single peer.
+there's nothing there to be wrong. It calls `append_command` on
+whichever node is currently leader (skipped, not an error, if there
+isn't one), and it now sends a real `raft.statemachine.ClientRequest` --
+a `Put` or `Delete`, wrapped with a `client_id`/`serial_number` -- rather
+than the opaque placeholder string it used to (see BUGS.md): committed
+entries now actually reach `KVStateMachine.apply()` through ordinary
+fuzzer-driven traffic, not just hand-built tests. Both the request's
+`client_id`/`serial_number` and its underlying key/value/op are derived
+from `step_index` and one piece of persistent, replay-irrelevant
+bookkeeping (`_client_serial`, `_outstanding_request`) rather than a
+fresh RNG draw, so the same seed sends the same requests even after
+shrinking has renumbered the steps around it. `append_command` only
+*produces* messages -- it never sends them, exactly like `tick`/`handle`
+-- so its output is routed through `Cluster.route()`, the same path
+`step()` uses internally; skipping that and leaving the messages unsent
+would mean every entry sits in the leader's own log forever and never
+reaches a single peer.
+
+Every draw that finds a live leader either retries the last request --
+if it isn't yet known to have been applied anywhere -- or, once it is,
+starts a new one with the next serial number: a real client has no way
+to know whether an unacknowledged request ever committed (its leader
+may have crashed, or just be slow), so it must be free to resend the
+identical `(client_id, serial_number, command)` rather than risk
+double-applying by picking a new serial number out of caution. Checking
+"is it applied anywhere yet" against every live node's own
+`state_machine.last_applied_serial` is deliberately omniscient -- a real
+client could never do this -- but it only decides *this fuzzer's own*
+retry timing, not anything about correctness, so the simplification
+costs nothing. This is what actually gives `STALE_REDELIVER`, crashes,
+and elections something meaningful to interact with: the same logical
+request can end up appended to the log more than once, and
+`apply_client_request`'s own dedup (see `raft.statemachine`) is what has
+to make sure that never applies it twice.
 
 Replay and shrinking (`replay`, `shrink`) both work on `list[TraceEntry]`,
 not `list[Action]`. A bare action *kind* -- "crash", with no word on
@@ -96,6 +120,7 @@ from raft.messages import AppendEntries
 from raft.node import RaftClusterNode, Role, raft_node_factory
 from raft.sim.cluster import Cluster
 from raft.sim.network import DEFAULT_HISTORY_DEPTH, DeliveryRecord
+from raft.statemachine import ClientRequest, Delete, Put
 from raft.storage import LogEntry
 
 
@@ -328,6 +353,13 @@ class Fuzzer:
         self._no_spurious_truncation_history: dict[str, list[LogEntry]] = {}
         self._leader_completeness_history: dict[int, CommittedEntry] = {}
         self._state_machine_safety_history = AppliedEntryHistory()
+        # CLIENT_REQUEST's own bookkeeping -- see _next_client_request.
+        # Live-draw-decision aids only: replay never reconstructs or
+        # consults these, since a forced entry already carries the full,
+        # resolved ClientRequest it submitted.
+        self._client_id = "fuzz-client"
+        self._client_serial = 0
+        self._outstanding_request: ClientRequest | None = None
 
     def _choose_action(self) -> Action:
         actions = list(Action)
@@ -508,7 +540,7 @@ class Fuzzer:
                 return node_id
         return None
 
-    def _apply_client_request(self, leader_id: int, command: object) -> str:
+    def _apply_client_request(self, leader_id: int, request: ClientRequest) -> str:
         leader = self.cluster.get_node(leader_id)
         if leader is None:
             return "skipped (recorded leader is no longer alive)"
@@ -518,15 +550,61 @@ class Fuzzer:
         # Cluster.route() every other action's output does, or the entry
         # sits in the leader's own log and never reaches a single peer.
         now = self.cluster.clock.now()
-        produced = leader.append_command(command, now)
+        produced = leader.append_command(request, now)
         self.cluster.route(leader_id, produced, now)
-        return f"leader {leader_id} appended {command!r}"
+        return f"leader {leader_id} appended {request!r}"
+
+    def _request_is_resolved(self, request: ClientRequest) -> bool:
+        """Has `request` already been applied on some live node?
+
+        Deliberately omniscient -- scans every live node's own
+        `state_machine.last_applied_serial`, something a real client
+        could never do -- but this only steers *this fuzzer's* retry
+        timing (see the module docstring), never anything about
+        correctness, so the simplification is free.
+        """
+        for node_id in self.cluster.node_ids():
+            node = self.cluster.get_node(node_id)
+            if node is None:
+                continue
+            applied = node.state_machine.last_applied_serial(request.client_id)
+            if applied is not None and applied >= request.serial_number:
+                return True
+        return False
+
+    def _next_client_request(self, step_index: int) -> ClientRequest:
+        """Retry the last request if it isn't yet known to be applied
+        anywhere; otherwise start a new one. See the module docstring for
+        why retrying the identical request (rather than always picking a
+        fresh serial number) is the realistic choice here.
+        """
+        if self._outstanding_request is not None and not self._request_is_resolved(
+            self._outstanding_request
+        ):
+            return self._outstanding_request
+
+        self._client_serial += 1
+        # Derived from step_index, not a counter or an RNG draw, so the
+        # same step always produces the same command on replay -- without
+        # this, two runs of the same seed could append different requests
+        # at the same point and still call it "identical". A small,
+        # reused set of keys (rather than a fresh one per request) means
+        # Put and Delete actually interact with each other's prior state,
+        # not just accumulate independently.
+        key = f"key-{step_index % 5}"
+        command = Delete(key=key) if step_index % 3 == 0 else Put(key=key, value=step_index)
+        request = ClientRequest(
+            client_id=self._client_id, serial_number=self._client_serial, command=command
+        )
+        self._outstanding_request = request
+        return request
 
     def _do_client_request(self, step_index: int, forced: TraceEntry | None) -> TraceEntry:
         if forced is not None:
             if forced.node_id is None or forced.command is None:
                 detail = forced.detail
             else:
+                assert isinstance(forced.command, ClientRequest)
                 detail = self._apply_client_request(forced.node_id, forced.command)
             return TraceEntry(
                 step=step_index,
@@ -541,18 +619,14 @@ class Fuzzer:
             detail = "skipped (no leader)"
             return TraceEntry(step=step_index, action=Action.CLIENT_REQUEST, detail=detail)
 
-        # Derived from step_index, not a counter or an RNG draw, so the
-        # same step always produces the same command on replay -- without
-        # this, two runs of the same seed could append different commands
-        # at the same point and still call it "identical".
-        command = f"cmd-{step_index}"
-        detail = self._apply_client_request(leader_id, command)
+        request = self._next_client_request(step_index)
+        detail = self._apply_client_request(leader_id, request)
         return TraceEntry(
             step=step_index,
             action=Action.CLIENT_REQUEST,
             detail=detail,
             node_id=leader_id,
-            command=command,
+            command=request,
         )
 
     def _stale_redeliver_candidates(self) -> list[DeliveryRecord]:

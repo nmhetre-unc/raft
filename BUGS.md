@@ -301,3 +301,67 @@ apply as distinct). This was documented in `RaftNode`'s own module
 docstring before this milestone and is not a new gap — it is corrected
 here now that the gap has actually been closed: of the five implemented
 invariants, all five are live.
+
+## CLIENT_REQUEST sent opaque strings, so apply() was never really exercised by fuzzing; client sessions added
+
+The apply-wiring milestone above made `last_applied` advance correctly,
+but the entries it advanced past were never real: `Fuzzer.
+_do_client_request` built `command = f"cmd-{step_index}"` — a plain
+string `RaftNode._apply_committed_entries` correctly treats as inert
+(see that milestone's design choice for why), meaning every committed
+entry the fuzzer ever produced was a no-op from `KVStateMachine`'s point
+of view. `check_state_machine_safety`'s 50-seed sweep numbers above are
+real (last_applied genuinely advances, never exceeds commit_index), but
+`KVStateMachine.apply()` itself had never once actually run through
+ordinary fuzzer-driven traffic — only through hand-built tests.
+
+Fixed: `CLIENT_REQUEST` now sends a real `raft.statemachine.ClientRequest`
+(a `Put` or `Delete`, keyed off a small, reused set of keys so the two
+operations actually interact) instead of a placeholder string. Confirmed
+directly, not by absence of exceptions: across a 6-seed sample, final KV
+state differs by seed (`{'key-1': 61}`, `{'key-1': 16}`, `{'key-1': 46}`,
+...), and across the full 50-seed sweep, 17 seeds end with non-empty KV
+state and produce **17 distinct final states** — `apply()` is now
+genuinely doing varied, seed-dependent work, not returning the same
+answer regardless of input.
+
+Alongside this, per-client session tracking was added — `client_id`,
+`serial_number`, wrapped as `ClientRequest`, deduplicated by
+`KVStateMachine.apply_client_request`. This lives on `KVStateMachine`
+itself (a `_sessions` dict, right beside the KV data), not anywhere
+leader-specific — deliberately, since a naive design that instead tracks
+"have I seen this serial number" only in whichever node happens to be
+leader breaks the moment that leader crashes and a different node takes
+over: the new leader's own memory starts empty, has no way to know the
+old leader already applied it, and re-applies a retried request. Proven
+directly (`tests/test_client_sessions.py`
+`test_naive_leader_only_dedup_applies_the_retried_request_twice` vs.
+`test_correct_design_applies_the_retried_request_exactly_once`, both
+constructing the identical leader-crash-then-retry scenario by hand):
+the naive design double-applies (2 real `apply()` calls, caught by a
+call counter, since the retried `Put` reuses the same value and a
+final-state comparison alone would have missed it entirely), the
+state-machine-side design applies exactly once. Confirmed clean of this
+failure mode across the full 50-seed sweep too
+(`test_no_double_application_across_the_fixed_seed_sweep`), including
+retries that deliberately coincide with crashes and elections (see
+`raft.sim.fuzz`'s own module docstring for how `CLIENT_REQUEST` now
+decides to retry vs. start fresh).
+
+**Known limitation, decided explicitly, not defaulted into**: `_sessions`
+grows by one entry per distinct `client_id` ever seen and is never
+pruned. The safe way to bound this is folding old sessions into a
+snapshot and discarding the log (and the sessions map) before it —
+Raft's own compaction mechanism — but that milestone doesn't exist in
+this project and, per its own stated priorities, may never be built at
+all. A bound implemented without compaction would not actually be safe:
+evicting a session a client might still legitimately retry against
+would silently reopen the exact double-apply hazard this mechanism
+exists to prevent, and making eviction safe would need real
+client-lifecycle machinery (explicit open/close, or a lease tied to some
+liveness signal) this project has no model of anywhere. Decided to
+document this as a permanent, accepted characteristic of an in-memory,
+non-snapshotting implementation rather than build a bound that would
+either be unsafe or be substantially more scope than "minimal" — see
+`raft/statemachine.py`'s own module docstring for the same reasoning in
+place.
