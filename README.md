@@ -1,8 +1,26 @@
 # raft
 
+[![CI](https://github.com/nmhetre-unc/raft/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/nmhetre-unc/raft/actions/workflows/ci.yml)
+
 A Raft consensus implementation in Python, built the other way around: the
 fault-injection harness first, the replication code it exists to catch bugs
 in second.
+
+## At a glance
+
+- **271 tests** in the default suite (50 fuzz seeds), **100% line coverage**
+  across every module.
+- **Zero safety violations** on the unmutated code across the 50-seed default
+  sweep and the 1000-seed sweep (`pytest -m slow`).
+- **Figure 8's commit-safety guard proven in both directions**: with the guard
+  the exact scenario is safe; delete only the guard and the same run commits
+  and then overwrites an entry.
+- **Six deliberately injected bugs**, each graded by the 50-seed sweep: four
+  caught by the invariant checkers (2/50 to 41/50 seeds), one correctly
+  undetected because it is harmless (0/50), and one that all six checkers miss
+  (0/50) but a dedicated apply-counting spy catches (38/50).
+- **Three bugs found in the harness's own code and tests**, one of which hid
+  real log-entry loss.
 
 ## Premise
 
@@ -45,8 +63,8 @@ Machine Safety violation the guard exists to prevent. A test that only ran
 the guarded version would have proven nothing about the guard itself;
 this is deliberately both halves.
 
-**Two bugs found in the harness's own code**, not the code under test —
-worth stating explicitly, since a fault-injection harness that's never
+**Three bugs found in the harness's own code and tests**, not the code under
+test — worth stating explicitly, since a fault-injection harness that's never
 wrong about its own logic would be a first:
 
 - `check_no_spurious_truncation` compared log entries by Python object
@@ -59,6 +77,13 @@ wrong about its own logic would be a first:
   mutation was only caught in 2/50 seeds, and only by an unrelated
   checker. Fixed by rewriting the comparison to be value-based; see
   [BUGS.md](BUGS.md#check_no_spurious_truncation-compared-log-entries-by-identity-missing-real-entry-loss).
+- `check_leader_completeness` gated on an entry's own term instead of the term
+  that made the entry safe. Figure 8's current-term rule lets a leader commit a
+  whole earlier-term prefix in one step, but the checker required every leader
+  elected after the entry's *own* older term to hold it, so it falsely flagged
+  an honestly elected leader (seed 711 of the 1000-seed sweep). Fixed by
+  recording the entry's own term and the term at which it became safe
+  (`established_at_term`) separately; see [BUGS.md](BUGS.md).
 - A sweep-level test verifying no client request is ever double-applied
   tagged each `KVStateMachine` instance by raw `id()` to tell "genuinely
   reused" apart from "crashed and correctly rebuilt." On the first
