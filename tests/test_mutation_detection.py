@@ -145,7 +145,7 @@ Summary from the actual run (n=5, steps=300, seeds 0..49), after
   `(client_id, serial_number)` -- caught, independent of
   `apply_client_request`'s own internal decision, by
   `tests/test_client_sessions.py`'s `apply()`-call-counting spy technique
-  (reused here as `_apply_spy_sweep`): **38/50 seeds** show a real,
+  (reused here as `_apply_spy_sweep`): **40/50 seeds** show a real,
   observable double-application this way. This is the actually
   appropriate detector for this bug class, not `check_state_machine_
   safety` -- see that test's own docstring for the full reasoning.
@@ -674,7 +674,9 @@ def test_mutation_apply_past_commit_index_is_detected(monkeypatch: pytest.Monkey
     whatever next reads that index sees genuinely different log content
     than an earlier, premature application already recorded.
 
-    DETECTED: 8/50 seeds (was 11/50 before CLIENT_REQUEST started
+    DETECTED: 9/50 seeds (8/50 before fast log backtracking changed how
+    quickly a lagging follower is rewritten, and so which seeds reach the
+    truncate-after-premature-apply interleaving; 11/50 before CLIENT_REQUEST started
     following `raft.node.NotLeader`'s own `leader_hint` instead of
     omnisciently targeting the actual leader -- see the module docstring
     and the truncate-on-resend mutation's own test for why that
@@ -690,7 +692,7 @@ def test_mutation_apply_past_commit_index_is_detected(monkeypatch: pytest.Monkey
 
     violations = _sweep()
 
-    assert len(violations) == 8, f"detection rate shifted: {violations}"
+    assert len(violations) == 9, f"detection rate shifted: {violations}"
     assert all(
         "applied" in reason and "already applied there" in reason for reason in violations.values()
     )
@@ -808,9 +810,11 @@ def test_mutation_skip_session_dedup_check_is_detected(monkeypatch: pytest.Monke
     Against `_apply_spy_sweep` -- an `apply()`-call-counting spy,
     independent of this mutation's own (broken) dedup decision, reused
     from `tests/test_client_sessions.py`'s own positive-behavior test for
-    this exact property -- **38/50 seeds** show a real, observable double
-    application. This is the actually appropriate detector for this bug
-    class.
+    this exact property -- **40/50 seeds** show a real, observable double
+    application (38/50 before fast log backtracking: rejections now jump
+    a whole term back instead of one entry, which changes when resends
+    happen and so which seeds produce a retried request). This is the
+    actually appropriate detector for this bug class.
     """
     monkeypatch.setattr(KVStateMachine, "apply_client_request", _mutation_6_skip_session_dedup)
 
@@ -821,7 +825,7 @@ def test_mutation_skip_session_dedup_check_is_detected(monkeypatch: pytest.Monke
     )
 
     double_applications = _apply_spy_sweep(monkeypatch)
-    assert len(double_applications) == 38, f"detection rate shifted: {sorted(double_applications)}"
+    assert len(double_applications) == 40, f"detection rate shifted: {sorted(double_applications)}"
 
 
 def test_mutation_skip_session_dedup_check_is_a_structural_gap_for_existing_checkers() -> None:

@@ -68,7 +68,14 @@ messages: st.SearchStrategy[Message] = st.one_of(
         entries=st.lists(log_entries, max_size=5).map(tuple),
         leader_commit=ints,
     ),
-    st.builds(AppendEntriesReply, term=ints, success=st.booleans(), match_index=ints),
+    st.builds(
+        AppendEntriesReply,
+        term=ints,
+        success=st.booleans(),
+        match_index=ints,
+        conflict_index=ints,
+        conflict_term=ints,
+    ),
 )
 
 

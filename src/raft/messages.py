@@ -74,11 +74,26 @@ class AppendEntriesReply:
     replaced: a leader that instead tracked "what I most recently sent"
     per peer could misattribute an old reply against a newer, larger
     send and believe more was replicated than actually was).
+
+    `conflict_index` and `conflict_term` are set on a consistency-check
+    failure, so the leader can skip back a whole term per round trip
+    instead of one entry (the Raft paper's section 5.3 optimization; see
+    `RaftNode._handle_append_entries_reply`):
+
+    - the follower's log is too short to have `prev_log_index`:
+      `conflict_term = 0`, `conflict_index` = its last index + 1;
+    - it has a different term there: `conflict_term` is that term and
+      `conflict_index` the first index at which it holds that term.
+
+    Both 0 on success, on a stale-term rejection, and on any reply built
+    without them (the leader then falls back to backing off by one).
     """
 
     term: int
     success: bool
     match_index: int = 0
+    conflict_index: int = 0
+    conflict_term: int = 0
 
 
 Message = RequestVote | RequestVoteReply | AppendEntries | AppendEntriesReply

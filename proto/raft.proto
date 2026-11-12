@@ -79,6 +79,10 @@ message AppendEntriesReply {
   int64 term = 1;
   bool success = 2;
   int64 match_index = 3;
+  // On failure only: where the leader should probe next (see
+  // raft.messages.AppendEntriesReply).
+  int64 conflict_index = 4;
+  int64 conflict_term = 5;
 }
 
 // One message from one node to another. A reply travels back as its own

@@ -422,7 +422,7 @@ class RaftNode:
         # prev_log_index=0 carries prev_log_term=0 too, so this passes
         # unconditionally there without needing a special case for it.
         if msg.prev_log_index >= len(log) or log[msg.prev_log_index].term != msg.prev_log_term:
-            return [(src, AppendEntriesReply(term=self.current_term, success=False))]
+            return [(src, self._conflict_reply(log, msg.prev_log_index))]
 
         # 3 & 4. Find the first sent entry (if any) this follower doesn't
         # already hold at that index and term -- Raft's Log Matching
@@ -470,6 +470,24 @@ class RaftNode:
         reply = AppendEntriesReply(term=self.current_term, success=True, match_index=last_new_index)
         return [(src, reply)]
 
+    def _conflict_reply(self, log: list[LogEntry], prev_log_index: int) -> AppendEntriesReply:
+        """A consistency-check failure, telling the leader where to probe
+        next (see `AppendEntriesReply`): past this log's end if it's too
+        short, else the start of the run of the conflicting term."""
+        if prev_log_index >= len(log):
+            conflict_index, conflict_term = len(log), 0
+        else:
+            conflict_term = log[prev_log_index].term
+            conflict_index = prev_log_index
+            while log[conflict_index - 1].term == conflict_term:
+                conflict_index -= 1  # stops at 1 at the latest: log[0].term is 0
+        return AppendEntriesReply(
+            term=self.current_term,
+            success=False,
+            conflict_index=conflict_index,
+            conflict_term=conflict_term,
+        )
+
     def _handle_append_entries_reply(
         self, msg: AppendEntriesReply, src: str, now: int
     ) -> list[tuple[str, Message]]:
@@ -494,12 +512,61 @@ class RaftNode:
             return []
 
         # Failure, and (per the checks above) at our current term, not a
-        # stale-term step-down: back off by exactly one and retry
-        # immediately with the earlier prev_log_index. No conflict-term
-        # optimization yet -- a later refinement, not this milestone.
-        self.next_index[src] = max(1, self.next_index[src] - 1)
+        # stale-term step-down: move next_index back using the follower's
+        # conflict hint and retry immediately.
         log = self.storage.load_log()
+        self.next_index[src] = self._next_index_after_conflict(src, msg, log)
         return [(src, self._build_append_entries_for(src, log))]
+
+    def _next_index_after_conflict(
+        self, peer: str, msg: AppendEntriesReply, log: list[LogEntry]
+    ) -> int:
+        """Where to probe `peer` next after it rejected an AppendEntries.
+
+        With a conflict term this leader also holds, probe just past its
+        own last entry of that term; with one it doesn't hold, skip the
+        follower's whole run of it (`conflict_index`); with a log that's
+        too short (`conflict_term == 0`), go straight to the follower's
+        end. That is one round trip per conflicting term, not one per
+        entry. A reply without a hint (`conflict_index == 0`, only ever
+        hand-built) falls back to backing off by one.
+
+        Why this stays safe: next_index only chooses which
+        `prev_log_index` the next AppendEntries names. The follower still
+        runs the full consistency check on it and accepts entries only
+        where its log matches this leader's at that index and term -- so
+        guessing too far back costs some redundant entries, guessing too
+        far forward costs another rejection, and neither can put an
+        entry anywhere it wouldn't have gone with one-step backoff.
+
+        Why it always makes progress: the rejected probe named some index
+        p where the follower holds conflict_term T and this leader holds
+        a different term T'. T' > T: if T' < T, this leader would hold
+        term-T entries only after p, and by Log Matching any such entry
+        implies it also holds T's entry at p -- a contradiction. So every
+        term-T entry this leader has lies before p, and the new
+        next_index is at most p.
+
+        Never below match_index + 1: a delayed failure reply arriving
+        after a success has already confirmed more is stale, and must
+        not send this peer back over entries it is known to hold.
+        """
+        current = self.next_index[peer]
+        if msg.conflict_index == 0:
+            proposed = current - 1
+        elif msg.conflict_term == 0:
+            proposed = msg.conflict_index
+        else:
+            last_of_term = None
+            for index in range(len(log) - 1, 0, -1):
+                term = log[index].term
+                if term == msg.conflict_term:
+                    last_of_term = index
+                    break
+                if term < msg.conflict_term:
+                    break  # terms only rise along a log: no such entry here
+            proposed = last_of_term + 1 if last_of_term is not None else msg.conflict_index
+        return max(1, self.match_index[peer] + 1, min(proposed, len(log)))
 
     def _advance_commit_index(self) -> None:
         """Figure 2's leader commit rule -- with Figure 2's own last-paragraph

@@ -148,7 +148,11 @@ def encode_message(msg: Message, src: str) -> pb.Envelope:
         return pb.Envelope(
             src=src,
             append_entries_reply=pb.AppendEntriesReply(
-                term=msg.term, success=msg.success, match_index=msg.match_index
+                term=msg.term,
+                success=msg.success,
+                match_index=msg.match_index,
+                conflict_index=msg.conflict_index,
+                conflict_term=msg.conflict_term,
             ),
         )
     raise TypeError(f"not a Message: {msg!r}")
@@ -181,7 +185,13 @@ def decode_envelope(env: pb.Envelope) -> tuple[str, Message]:
         )
     elif kind == "append_entries_reply":
         aer = env.append_entries_reply
-        msg = AppendEntriesReply(term=aer.term, success=aer.success, match_index=aer.match_index)
+        msg = AppendEntriesReply(
+            term=aer.term,
+            success=aer.success,
+            match_index=aer.match_index,
+            conflict_index=aer.conflict_index,
+            conflict_term=aer.conflict_term,
+        )
     else:
         raise CodecError("Envelope has no message set")
     return env.src, msg

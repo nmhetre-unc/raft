@@ -494,3 +494,61 @@ mechanism, all are now exercised — not just wired in — by the complete
 fault model at once. Milestone 5 is complete; snapshotting and cluster
 membership changes remain out of scope, tracked as Milestone 6 (or
 later), not started here.
+## A restarted node could never catch up: one-entry log backtracking
+
+Found by: `bench/cluster_bench.py` leader-kill runs (step 6 baseline), not the
+fuzzer. Regression test: `tests/test_catchup.py`.
+
+**Symptom.** In 2 of 3 leader-kill benchmark runs (16 clients, kill the leader
+at 10 s, restart it at 20 s), the restarted node still had commit index 0
+sixty seconds after the load stopped, while the other four agreed. Re-measured
+on the pre-fix code with catch-up timing added: 0 of 3 runs caught up. Both
+safety checks passed every time; this is liveness, not safety.
+
+**Root cause.** On a rejected AppendEntries, the leader backed `next_index`
+up by exactly one entry and retried (the code said "no conflict-term
+optimization yet"). Three things compounded it:
+
+- the restarted node came back about 4,400 entries behind;
+- every retry carried the whole log tail from `next_index` on, so each of
+  those thousands of round trips encoded and decoded thousands of entries;
+- every leader elected while the node was down (and every election in the
+  restart storm) initializes `next_index` optimistically to its own log end,
+  restarting the walk from the top.
+
+**Why the simulator missed it.** Two reasons, both structural:
+
+1. Fuzzed logs are tiny: across the 1000-seed sweep the longest log at the
+   end of a run has 37 entries (median 10), so even one-entry backtracking
+   needs at most a few dozen round trips.
+2. The simulated network delivers with zero delay, so a round trip costs no
+   simulated time. Thousands of them would still look instantaneous.
+
+The fuzzer now has a liveness phase (`Fuzzer.check_liveness`, run by both
+sweeps): after the last fault, heal, restart everything, give every link
+5 ms of delay, and require that a leader commits its whole log and every
+node reports that commit index within 3,000 simulated ms. The bound was
+fixed before measuring. The pre-fix code **passes** it on all 1000 seeds
+(worst case 1,605 ms) -- the logs are simply too short to expose this. It
+stays as a guard against liveness regressions the fuzzer *can* reach. The
+deterministic test is what reproduces this bug: crash a follower, commit
+5,000 entries, crash the leader so a new one is elected while the follower
+is down, restart the follower with 5 ms links, and require catch-up within
+1,000 simulated ms and 200 messages. Pre-fix it fails: after 500 ms and 201
+messages the follower holds 0 of 5,002 entries. The leader change is
+essential: a leader that was leading when the follower crashed keeps
+`next_index` at the crash point and needs no backtracking at all.
+
+**Fix (1 of 2: fast backtracking).** `AppendEntriesReply` carries
+`conflict_index` and `conflict_term` on failure (the Raft paper's section
+5.3 optimization). The follower reports either "too short: my last index + 1"
+or "I have term T there, starting at index i". The leader probes just past
+its own last entry of T if it has one, else at i. One round trip per
+conflicting term instead of per entry. It stays safe because `next_index`
+only picks which `prev_log_index` to probe; the follower's consistency check
+still gates every append. It always makes progress because the leader's term
+at the rejected index must be newer than T, so all its term-T entries lie
+before it. A delayed failure reply can no longer push `next_index` below
+`match_index + 1`. After the fix the restarted node caught up in all 3 runs,
+in 4.3-6.1 s, finishing 0.1-0.16 s after the last election of the restart
+storm. The remaining seconds are that storm, a separate bug.

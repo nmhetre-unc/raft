@@ -29,7 +29,11 @@ Failover is reported as (a) kill -> first observation of a new leader
 answered by a node other than the killed one. Restart disruption is
 (c) elections triggered after the restart -- the rise in the highest
 term any node reports -- and (d) the longest interval after the restart
-with no write completing.
+with no write completing. Catch-up is the time from the restart to the
+first poll at which the restarted node's commit index reaches the
+highest commit index any node reported at the moment of the restart:
+everything committed while it was down. It is watched until the run's
+final convergence wait ends, so it can land after the load stops.
 
 Not part of the test suite or coverage; ruff and mypy clean.
 """
@@ -179,6 +183,10 @@ class Poller:
         self.leader: str | None = None
         self.leader_term = 0
         self.max_term = 0
+        self.max_commit = 0
+        # (node, commit index it must reach) once a restart is being watched
+        self.catch_up_target: tuple[str, int] | None = None
+        self.caught_up_at: float | None = None
 
     def _record(self, **event: Any) -> None:
         self.events.append({"t": round(time.monotonic() - self.t0, 4), **event})
@@ -190,6 +198,12 @@ class Poller:
                 self.terms[node] = status.current_term
                 self._record(kind="term", node=node, term=status.current_term)
         self.max_term = max([self.max_term, *self.terms.values()])
+        self.max_commit = max([self.max_commit, *(s.commit_index for s in statuses.values())])
+        if self.catch_up_target is not None and self.caught_up_at is None:
+            node, target = self.catch_up_target
+            if node in statuses and statuses[node].commit_index >= target:
+                self.caught_up_at = time.monotonic()
+                self._record(kind="caught_up", node=node, commit_index=target)
         leader, term = current_leader(statuses)
         # A re-election of the same node in a new term is a leadership
         # change too: it stepped down in between.
@@ -300,6 +314,7 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
             await poller.poll_once()
             restart_info["max_term_before"] = poller.max_term
             restart_info["at"] = time.monotonic()
+            poller.catch_up_target = (fault.node, poller.max_commit)
             cluster.start(fault.node)
             poller._record(kind="restart", node=fault.node)
 
@@ -377,8 +392,16 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
             restart_at = restart_info["at"]
             put_ends = [op.end for op in ops if op.ok and op.kind == "put"]
             stall, stall_at = longest_gap(put_ends, restart_at, load_end)
+            caught_up_at = poller.caught_up_at
             result["restart"] = {
                 "restart_at": restart_at - t0,
+                "catch_up_target_commit": poller.catch_up_target[1]
+                if poller.catch_up_target
+                else None,
+                "caught_up": caught_up_at is not None,
+                "e_restart_to_catch_up_s": (
+                    caught_up_at - restart_at if caught_up_at is not None else None
+                ),
                 "c_elections_after_restart": poller.max_term - restart_info["max_term_before"],
                 "d_longest_write_stall_s": stall,
                 "d_stall_starts_at": stall_at - t0,
@@ -413,8 +436,13 @@ def report(name: str, result: dict[str, Any]) -> None:
         )
     if "restart" in result:
         r = result["restart"]
+        catch_up = (
+            f"caught up in {fmt(r['e_restart_to_catch_up_s'], 1000, 0)} ms"
+            if r["caught_up"]
+            else "NEVER caught up"
+        )
         print(
-            f"   restart: (c) {r['c_elections_after_restart']} elections  "
+            f"   restart: {catch_up}  (c) {r['c_elections_after_restart']} elections  "
             f"(d) longest write stall {fmt(r['d_longest_write_stall_s'], 1000, 0)} ms"
         )
     print(

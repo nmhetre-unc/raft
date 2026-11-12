@@ -267,7 +267,10 @@ def test_follower_missing_the_entry_at_prev_log_index_rejects() -> None:
 
     reply = node.handle(msg, src="leader", now=0)
 
-    assert reply == [("leader", AppendEntriesReply(term=1, success=False))]
+    # Too short: point the leader just past this log's end.
+    assert reply == [
+        ("leader", AppendEntriesReply(term=1, success=False, conflict_index=1, conflict_term=0))
+    ]
     assert storage.load_log() == [SENTINEL]  # untouched
 
 
@@ -282,7 +285,10 @@ def test_follower_with_a_different_term_at_prev_log_index_rejects() -> None:
 
     reply = node.handle(msg, src="leader", now=0)
 
-    assert reply == [("leader", AppendEntriesReply(term=2, success=False))]
+    # Wrong term: name it, and where this log's run of it starts.
+    assert reply == [
+        ("leader", AppendEntriesReply(term=2, success=False, conflict_index=1, conflict_term=1))
+    ]
     assert storage.load_log() == [SENTINEL, LogEntry(term=1, command="a")]  # untouched
 
 
@@ -533,7 +539,9 @@ def test_out_of_order_replies_never_move_match_index_backward() -> None:
 
 def test_full_convergence_walks_back_and_overwrites_a_divergent_tail() -> None:
     """A follower whose last 10 entries are stale gets walked back and
-    overwritten to match the leader exactly, one rejection at a time."""
+    overwritten to match the leader exactly -- in one rejection, not ten:
+    the reply names the stale term and where its run starts, the leader
+    holds no entries of that term, so it jumps straight there."""
     leader_storage = MemoryStorage()
     leader_storage.append_entries([LogEntry(term=2, command=f"leader-{i}") for i in range(1, 13)])
 
@@ -569,10 +577,66 @@ def test_full_convergence_walks_back_and_overwrites_a_divergent_tail() -> None:
         now += 1
         produced = leader.handle(reply_msg, src="follower", now=now)
 
-    assert rounds == 11  # 10 rejections walking back past the stale tail, then 1 acceptance
+    assert rounds == 2  # 1 rejection skipping the whole stale term-1 run, then 1 acceptance
     assert leader.match_index["follower"] == last_index
     assert leader.next_index["follower"] == last_index + 1
     assert follower_storage.load_log() == leader_storage.load_log()
+
+
+def _leader_with_log(terms: list[int], next_index: int, match_index: int = 0) -> RaftNode:
+    storage = MemoryStorage()
+    storage.append_entries([LogEntry(term=t, command=f"e{i}") for i, t in enumerate(terms, 1)])
+    node = RaftNode("leader", ["f"], storage, rng=random.Random(1))
+    node.current_term = max(terms)
+    node.role = Role.LEADER
+    node.leader_id = "leader"
+    node.next_index = {"f": next_index}
+    node.match_index = {"f": match_index}
+    return node
+
+
+def _reject(node: RaftNode, conflict_index: int, conflict_term: int) -> int:
+    reply = AppendEntriesReply(
+        term=node.current_term,
+        success=False,
+        conflict_index=conflict_index,
+        conflict_term=conflict_term,
+    )
+    node.handle(reply, src="f", now=0)
+    return node.next_index["f"]
+
+
+def test_conflict_term_the_leader_holds_probes_past_its_last_entry_of_it() -> None:
+    #                         index: 1  2  3  4  5  6  7
+    leader = _leader_with_log([1, 1, 2, 2, 2, 4, 4], next_index=8)
+    # Follower has term 2 from index 3 on (and more of it than the leader).
+    assert _reject(leader, conflict_index=3, conflict_term=2) == 6
+
+
+def test_conflict_term_the_leader_lacks_skips_the_followers_whole_run() -> None:
+    leader = _leader_with_log([1, 1, 2, 2, 4, 4], next_index=7)
+    # Follower has term 3 (never in the leader's log) from index 4 on.
+    assert _reject(leader, conflict_index=4, conflict_term=3) == 4
+    # Also when every leader entry is newer than the conflict term.
+    leader = _leader_with_log([5, 5, 5], next_index=4)
+    assert _reject(leader, conflict_index=1, conflict_term=2) == 1
+
+
+def test_short_follower_log_jumps_to_its_end() -> None:
+    leader = _leader_with_log([1] * 9, next_index=10)
+    assert _reject(leader, conflict_index=3, conflict_term=0) == 3
+
+
+def test_reply_without_a_hint_falls_back_to_one_step() -> None:
+    leader = _leader_with_log([1] * 9, next_index=10)
+    assert _reject(leader, conflict_index=0, conflict_term=0) == 9
+
+
+def test_stale_failure_never_moves_next_index_below_match_index() -> None:
+    # A success already confirmed index 7; a delayed failure from an
+    # earlier probe must not send the leader back over entries 1..7.
+    leader = _leader_with_log([1] * 9, next_index=8, match_index=7)
+    assert _reject(leader, conflict_index=2, conflict_term=0) == 8
 
 
 # -- Commitment: leader-side majority advancement, the current-term-only

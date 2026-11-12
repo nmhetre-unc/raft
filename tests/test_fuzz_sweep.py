@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from raft.invariants import SafetyViolation
-from raft.sim.fuzz import Fuzzer, TraceEntry
+from raft.sim.fuzz import Fuzzer, LivenessViolation, TraceEntry
 
 if TYPE_CHECKING:
     import _pytest.python
@@ -82,7 +82,12 @@ def _run_and_report(seed: int) -> None:
         violation = caught
 
     if violation is None:
-        return  # no violation: this seed passes
+        # Safe throughout; now stop the faults and require convergence.
+        try:
+            fuzzer.check_liveness()
+        except LivenessViolation as stuck:
+            pytest.fail(f"Raft liveness violation, seed {seed}: {stuck.reason}", pytrace=False)
+        return
 
     # Shrink before reporting, per policy -- nobody should have to
     # manually re-run shrink() on a failure this test already saw.

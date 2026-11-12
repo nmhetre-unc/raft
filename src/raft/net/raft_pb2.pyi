@@ -93,14 +93,18 @@ class AppendEntries(_message.Message):
     def __init__(self, term: _Optional[int] = ..., leader_id: _Optional[str] = ..., prev_log_index: _Optional[int] = ..., prev_log_term: _Optional[int] = ..., entries: _Optional[_Iterable[_Union[LogEntry, _Mapping]]] = ..., leader_commit: _Optional[int] = ...) -> None: ...
 
 class AppendEntriesReply(_message.Message):
-    __slots__ = ("term", "success", "match_index")
+    __slots__ = ("term", "success", "match_index", "conflict_index", "conflict_term")
     TERM_FIELD_NUMBER: _ClassVar[int]
     SUCCESS_FIELD_NUMBER: _ClassVar[int]
     MATCH_INDEX_FIELD_NUMBER: _ClassVar[int]
+    CONFLICT_INDEX_FIELD_NUMBER: _ClassVar[int]
+    CONFLICT_TERM_FIELD_NUMBER: _ClassVar[int]
     term: int
     success: bool
     match_index: int
-    def __init__(self, term: _Optional[int] = ..., success: _Optional[bool] = ..., match_index: _Optional[int] = ...) -> None: ...
+    conflict_index: int
+    conflict_term: int
+    def __init__(self, term: _Optional[int] = ..., success: _Optional[bool] = ..., match_index: _Optional[int] = ..., conflict_index: _Optional[int] = ..., conflict_term: _Optional[int] = ...) -> None: ...
 
 class Envelope(_message.Message):
     __slots__ = ("src", "request_vote", "request_vote_reply", "append_entries", "append_entries_reply")
