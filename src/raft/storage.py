@@ -50,7 +50,8 @@ SENTINEL: LogEntry = LogEntry(term=0, command=None)
 
 
 class StorageError(Exception):
-    """Raised by a write call that `MemoryStorage.fail_after` has armed."""
+    """A durable-state failure: a write armed by `MemoryStorage.fail_after`,
+    or on-disk state `raft.net.filestorage.FileStorage` can't trust."""
 
 
 class Storage(Protocol):
