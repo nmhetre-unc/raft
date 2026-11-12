@@ -24,7 +24,7 @@ task per peer drains that queue, one RPC at a time. When a queue is full
 the new message is dropped (and counted in `dropped`): a peer that is
 down or slow then costs a fixed amount of memory, and Raft re-sends
 everything that matters anyway -- heartbeats repeat, and AppendEntries
-always carries everything from the peer's next_index onward. An RPC that
+always carries the next chunk from the peer's next_index. An RPC that
 fails (peer down, deadline exceeded) is likewise a lost packet, counted
 in `failed` and otherwise ignored.
 """

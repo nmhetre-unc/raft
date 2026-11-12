@@ -173,6 +173,22 @@ from raft.messages import (
 from raft.statemachine import ClientRequest, Delete, Get, KVStateMachine, Put
 from raft.storage import LogEntry, Storage
 
+# Caps on one AppendEntries. A follower that is far behind is caught up in
+# chunks -- each the next one sent as soon as the last is acknowledged --
+# rather than with one message carrying the whole gap: over gRPC that
+# message would eventually exceed the receiver's maximum message size and
+# be rejected every time, so the follower would never catch up (BUGS.md).
+DEFAULT_MAX_APPEND_ENTRIES = 512
+DEFAULT_MAX_APPEND_BYTES = 1 << 20
+
+
+def approximate_entry_size(entry: LogEntry) -> int:
+    """A rough, transport-agnostic size for `entry`, used against
+    `max_append_bytes` when no exact encoder-based measure is given. The
+    repr of a command is longer than any compact wire encoding of it, so
+    this errs on the side of smaller chunks."""
+    return 16 + len(repr(entry.command))
+
 
 @dataclass(frozen=True)
 class NotLeader:
@@ -234,12 +250,17 @@ class RaftNode:
         rng: random.Random | None = None,
         append_noop_on_election: bool = False,
         pre_vote: bool = False,
+        max_append_entries: int = DEFAULT_MAX_APPEND_ENTRIES,
+        max_append_bytes: int = DEFAULT_MAX_APPEND_BYTES,
+        entry_size: Callable[[LogEntry], int] = approximate_entry_size,
     ) -> None:
         lo, hi = election_timeout_range
         if lo <= 0 or hi < lo:
             raise ValueError("election_timeout_range must be a positive, non-empty range")
         if heartbeat_interval <= 0:
             raise ValueError("heartbeat_interval must be positive")
+        if max_append_entries <= 0 or max_append_bytes <= 0:
+            raise ValueError("max_append_entries and max_append_bytes must be positive")
 
         self.node_id = node_id
         self.peers = list(peers)
@@ -257,6 +278,13 @@ class RaftNode:
         # first ask whether a majority *would* vote, without touching the
         # term; campaign for real only if so. See _start_pre_vote.
         self.pre_vote = pre_vote
+        # One AppendEntries carries at most `max_append_entries` entries and,
+        # by `entry_size`, at most `max_append_bytes` -- except that it always
+        # carries at least one entry when the peer is behind, so a single
+        # oversized entry still moves (it's the transport's to accept or not).
+        self.max_append_entries = max_append_entries
+        self.max_append_bytes = max_append_bytes
+        self.entry_size = entry_size
 
         # Persistent state -- loaded now, written back by _persist_if_dirty().
         self.current_term, self.voted_for = storage.load_term_and_vote()
@@ -291,6 +319,11 @@ class RaftNode:
         # module docstring for why these are never derived from each other.
         self.next_index: dict[str, int] = {}
         self.match_index: dict[str, int] = {}
+        # Leader-only: the last log index included in the most recent
+        # AppendEntries sent to each peer. A success reply confirming
+        # exactly that far, from a peer still behind, means nothing more is
+        # in flight to it, so the next chunk goes out at once.
+        self._sent_through: dict[str, int] = {}
         # The deadline's first real draw is deferred to the first tick()
         # (see there for why): at construction time this node has no idea
         # what "now" actually is, and a restart can happen arbitrarily far
@@ -601,6 +634,17 @@ class RaftNode:
                 self.match_index[src] = msg.match_index
                 self.next_index[src] = msg.match_index + 1
                 self._advance_commit_index()
+                # Still behind, and this reply confirms everything we last
+                # sent it: the last message was a capped chunk, not the
+                # whole tail. Send the next chunk now instead of leaving
+                # the peer idle until the next heartbeat. (With replies
+                # still outstanding -- the normal pipelined case under
+                # load -- this stays quiet, so no entry is sent twice.)
+                if (
+                    msg.match_index >= self._sent_through.get(src, 0)
+                    and msg.match_index < self.storage.last_log_index()
+                ):
+                    return [(src, self._build_append_entries_for(src, self.storage.load_log()))]
             return []
 
         # Failure, and (per the checks above) at our current term, not a
@@ -772,6 +816,7 @@ class RaftNode:
         last_index = self.storage.last_log_index()
         self.next_index = dict.fromkeys(self.peers, last_index + 1)
         self.match_index = dict.fromkeys(self.peers, 0)
+        self._sent_through = dict.fromkeys(self.peers, 0)
 
         if self.append_noop_on_election:
             # A leader can only ever commit an entry from its OWN current
@@ -801,7 +846,8 @@ class RaftNode:
         Each peer gets a distinct message -- not one shared object -- since
         `prev_log_index`/`prev_log_term` anchor the log-matching check at
         wherever *that* peer is believed to be, and `entries` is whatever
-        this leader has from there onward. A peer already caught up (its
+        this leader has from there onward, up to the chunk caps (see
+        `_build_append_entries_for`). A peer already caught up (its
         next_index one past this leader's last entry) simply gets `entries
         = ()`: a heartbeat is nothing more than that case.
         """
@@ -813,9 +859,18 @@ class RaftNode:
         return out
 
     def _build_append_entries_for(self, peer: str, log: list[LogEntry]) -> AppendEntries:
-        """Build the AppendEntries `peer` should get right now, from its next_index."""
+        """Build the AppendEntries `peer` should get right now: entries from
+        its next_index on, capped by count and approximate size."""
         prev_log_index = self.next_index[peer] - 1
-        entries = tuple(log[self.next_index[peer] :])
+        end = min(len(log), self.next_index[peer] + self.max_append_entries)
+        size = 0
+        for index in range(self.next_index[peer], end):
+            size += self.entry_size(log[index])
+            if size > self.max_append_bytes and index > self.next_index[peer]:
+                end = index  # at least one entry, always
+                break
+        entries = tuple(log[self.next_index[peer] : end])
+        self._sent_through[peer] = end - 1
         return AppendEntries(
             term=self.current_term,
             leader_id=self.node_id,
@@ -974,6 +1029,8 @@ def raft_node_factory(
     heartbeat_interval: int = 50,
     append_noop_on_election: bool = False,
     pre_vote: bool = False,
+    max_append_entries: int = DEFAULT_MAX_APPEND_ENTRIES,
+    max_append_bytes: int = DEFAULT_MAX_APPEND_BYTES,
 ) -> Callable[[int, Storage], RaftClusterNode]:
     """Build a `Cluster`-compatible `node_factory` that produces `RaftNode`s.
 
@@ -1007,6 +1064,8 @@ def raft_node_factory(
             rng=random.Random(node_seeds[name]),
             append_noop_on_election=append_noop_on_election,
             pre_vote=pre_vote,
+            max_append_entries=max_append_entries,
+            max_append_bytes=max_append_bytes,
         )
         return RaftClusterNode(raft_node)
 

@@ -1,0 +1,223 @@
+{
+  "name": "fix2-chunks-run3",
+  "environment": {
+    "cpu_count": 12,
+    "os": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.16 (main, Oct 26 2026, 14:08:45) [Clang 23.1.3 ]",
+    "git": "a721a33-dirty"
+  },
+  "options": {
+    "nodes": 5,
+    "clients": 16,
+    "duration": 30.0,
+    "fsync": "deferred",
+    "kill_at": 10.0,
+    "restart_at": 20.0,
+    "put_ratio": 0.5,
+    "keys": 100,
+    "seed": 0,
+    "out_dir": "/home/neilm/raft/bench/results",
+    "name": "fix2-chunks-run3",
+    "keep": false
+  },
+  "summary": {
+    "window": 30.0,
+    "ops": 6370,
+    "ok": 6370,
+    "failed": 0,
+    "puts_ok": 3184,
+    "gets_ok": 3186,
+    "ops_per_sec": 212.33333333333334,
+    "latency_ms": {
+      "p50": 68.5386910008674,
+      "p99": 124.96119100069336,
+      "p99.9": 316.5187619997596
+    },
+    "longest_gap_s": 0.24851358299929416,
+    "longest_gap_at_s": 10.007621962000485,
+    "first_write_after_fault_s": {
+      "kill": 0.25626283999918087
+    }
+  },
+  "verification": {
+    "converged": true,
+    "final_view": {
+      "n0": {
+        "role": "follower",
+        "term": 2,
+        "commit": 6386,
+        "applied": 6386,
+        "hint": "n4"
+      },
+      "n1": {
+        "role": "follower",
+        "term": 2,
+        "commit": 6386,
+        "applied": 6386,
+        "hint": "n4"
+      },
+      "n2": {
+        "role": "follower",
+        "term": 2,
+        "commit": 6386,
+        "applied": 6386,
+        "hint": "n4"
+      },
+      "n3": {
+        "role": "follower",
+        "term": 2,
+        "commit": 6386,
+        "applied": 6386,
+        "hint": "n4"
+      },
+      "n4": {
+        "role": "leader",
+        "term": 2,
+        "commit": 6386,
+        "applied": 6386,
+        "hint": "n2"
+      },
+      "alive": [
+        "n0",
+        "n1",
+        "n2",
+        "n3",
+        "n4"
+      ]
+    },
+    "nodes_checked": [
+      "n0",
+      "n1",
+      "n2",
+      "n3",
+      "n4"
+    ],
+    "commit_index": 6386,
+    "acknowledged_puts": 3184,
+    "prefix_problems": [],
+    "ack_problems": []
+  },
+  "events": [
+    {
+      "t": 0.002,
+      "kind": "term",
+      "node": "n0",
+      "term": 1
+    },
+    {
+      "t": 0.002,
+      "kind": "term",
+      "node": "n1",
+      "term": 1
+    },
+    {
+      "t": 0.002,
+      "kind": "term",
+      "node": "n2",
+      "term": 1
+    },
+    {
+      "t": 0.002,
+      "kind": "term",
+      "node": "n3",
+      "term": 1
+    },
+    {
+      "t": 0.002,
+      "kind": "term",
+      "node": "n4",
+      "term": 1
+    },
+    {
+      "t": 0.002,
+      "kind": "leader",
+      "leader": "n0",
+      "term": 1,
+      "same_node": false
+    },
+    {
+      "t": 10.011,
+      "kind": "kill",
+      "node": "n0"
+    },
+    {
+      "t": 10.2765,
+      "kind": "term",
+      "node": "n1",
+      "term": 2
+    },
+    {
+      "t": 10.2765,
+      "kind": "term",
+      "node": "n2",
+      "term": 2
+    },
+    {
+      "t": 10.2765,
+      "kind": "term",
+      "node": "n3",
+      "term": 2
+    },
+    {
+      "t": 10.2765,
+      "kind": "term",
+      "node": "n4",
+      "term": 2
+    },
+    {
+      "t": 10.2765,
+      "kind": "leader",
+      "leader": "n4",
+      "term": 2,
+      "same_node": false
+    },
+    {
+      "t": 20.01,
+      "kind": "restart",
+      "node": "n0"
+    },
+    {
+      "t": 20.2131,
+      "kind": "term",
+      "node": "n0",
+      "term": 2
+    },
+    {
+      "t": 20.313,
+      "kind": "caught_up",
+      "node": "n0",
+      "commit_index": 4364
+    }
+  ],
+  "failover": {
+    "killed": "n0",
+    "kill_at": 10.007957089001138,
+    "new_leader": "n4",
+    "a_kill_to_new_leader_s": 0.2685429109988622,
+    "b_kill_to_first_write_s": 0.25626283999918087
+  },
+  "restart": {
+    "restart_at": 20.00931222500003,
+    "catch_up_target_commit": 4364,
+    "caught_up": true,
+    "catch_up_trace": [
+      [
+        20.213,
+        3811
+      ],
+      [
+        20.264,
+        4323
+      ],
+      [
+        20.313,
+        4398
+      ]
+    ],
+    "e_restart_to_catch_up_s": 0.3036577020011464,
+    "c_elections_after_restart": 0,
+    "d_longest_write_stall_s": 0.057664628000566154,
+    "d_stall_starts_at": 28.944621438000468
+  },
+  "history": "fix2-chunks-run3.history.jsonl"
+}

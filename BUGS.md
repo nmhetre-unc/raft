@@ -614,3 +614,58 @@ the leader keeps its term. In the leader-kill bench, where backoff had
 already removed the storm, PreVote changed nothing measurable (0 elections,
 catch-up 246-317 ms). It adds one round trip before each real election, which
 is within noise in kill-to-leader time.
+
+## A follower far enough behind could never catch up: one AppendEntries carried the whole gap
+
+Found by: `bench/large_gap_repro.py`, written to test whether this could
+happen, after reading the code rather than from a failing run. Regression
+tests: `tests/test_chunking.py`.
+
+**Symptom.** Kill a follower, commit 1,500 puts of 4 KiB through the leader,
+restart the follower. It never caught up: it stayed at commit index 0 for the
+full 30 s timeout, while every other node was at 1,501. With 500 such puts
+(2.06 MB to send) it caught up in 0.2 s. While the follower was down, the
+1,500 writes also took 24.7 s, against 2.6 s for 500.
+
+**Root cause.** The leader built every AppendEntries with *everything* from
+the peer's `next_index` to the end of its log. For a follower 1,500 entries
+behind, that is one 6,186,343-byte `Envelope`. Neither our server nor
+`GrpcTransport` sets a message size limit, so gRPC's defaults apply: no limit
+on sending, 4 MiB (4,194,304 bytes) on receiving. The follower's server
+rejected the RPC with `RESOURCE_EXHAUSTED: Received message larger than max`,
+which was confirmed directly against a server process: 4,121,885 bytes
+accepted, 4,534,085 rejected. The transport counts a failed RPC as a lost
+packet, so the leader got no reply and sent the same message, never smaller,
+on every heartbeat and every write. The slow writes have the same cause: every
+client write built and encoded the whole multi-megabyte tail again for the
+dead peer.
+
+**Why the simulator missed it.** The simulator has no message size limit and
+no encoding: a message carrying 5,000 entries costs the same as one carrying
+none. Its logs also stay short (at most a few dozen entries in the fuzzer). The
+leader-kill bench missed it too: its values are about 20 bytes, so a 10 s
+outage left roughly 2,300 entries, about 100 KB to send.
+
+**Fix.** An AppendEntries now carries at most `max_append_entries` entries
+(default 512) and at most `max_append_bytes` (default 1 MiB), by
+`entry_size`. It always carries at least one entry when the peer is behind,
+so a single oversized entry still goes out. The server measures size with the
+real protobuf encoding; `RaftNode` on its own uses an overestimate based on
+`repr`. Both caps are configurable in the cluster config. When a success reply
+confirms everything last sent to a peer that is still behind, the leader sends
+the next chunk immediately instead of waiting for the next heartbeat. When
+newer entries are already in flight, as in normal pipelined replication under
+load, it sends nothing extra, so no entry goes out twice. In the simulator this
+rule never fires unless a chunk was capped, so the fuzz sweeps and pinned
+mutation counts are unchanged.
+
+Results:
+
+- **Large-gap reproduction:** the follower now catches up in 0.26-0.37 s
+  (3 runs), in chunks of about 254 entries, the 1 MiB cap.
+- **Leader-kill bench:** catch-up is 258-401 ms, against 246-317 ms before. A
+  gap of about 2,300 small entries now takes about 5 chunk round trips under
+  load instead of one message.
+- **Still open:** while a peer is down, every write still builds and encodes
+  a chunk of up to 1 MiB for it. The 1,500 writes took 13-14 s, against
+  24.7 s before. Capping bounds this cost, but it doesn't remove it.

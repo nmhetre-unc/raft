@@ -58,9 +58,16 @@ from random import Random
 from typing import Protocol
 
 from raft.messages import Message
-from raft.node import NotLeader, RaftNode, Role
+from raft.node import (
+    DEFAULT_MAX_APPEND_BYTES,
+    DEFAULT_MAX_APPEND_ENTRIES,
+    NotLeader,
+    RaftNode,
+    Role,
+    approximate_entry_size,
+)
 from raft.statemachine import ClientRequest
-from raft.storage import Storage
+from raft.storage import LogEntry, Storage
 
 
 class Transport(Protocol):
@@ -157,6 +164,9 @@ class NodeDriver:
         heartbeat_interval: int = 50,
         rng: Random | None = None,
         pre_vote: bool = True,
+        max_append_entries: int = DEFAULT_MAX_APPEND_ENTRIES,
+        max_append_bytes: int = DEFAULT_MAX_APPEND_BYTES,
+        entry_size: Callable[[LogEntry], int] = approximate_entry_size,
     ) -> None:
         if request_timeout <= 0:
             raise ValueError("request_timeout must be positive")
@@ -169,6 +179,9 @@ class NodeDriver:
             rng=rng,
             append_noop_on_election=True,
             pre_vote=pre_vote,
+            max_append_entries=max_append_entries,
+            max_append_bytes=max_append_bytes,
+            entry_size=entry_size,
         )
         self._storage = storage
         self._transport = transport

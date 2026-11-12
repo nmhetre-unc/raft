@@ -12,8 +12,14 @@ milliseconds::
       "election_timeout_ms": [150, 300],
       "heartbeat_ms": 50,
       "request_timeout_ms": 2000,
-      "pre_vote": true
+      "pre_vote": true,
+      "max_append_entries": 512,
+      "max_append_bytes": 1048576
     }
+
+`max_append_entries` and `max_append_bytes` cap one AppendEntries; the
+byte cap is measured with the real protobuf encoding and must stay well
+under gRPC's 4 MiB default receive limit, which nothing here raises.
 
 The process owns three things: a `NodeDriver`'s `run()` task, a ticker
 task that calls `tick()` every 10 ms (and is therefore also what makes
@@ -66,7 +72,7 @@ from raft.net.driver import DriverStopped, Lost, NodeDriver, Ok, SubmitOutcome, 
 from raft.net.filestorage import FileStorage, FsyncMode
 from raft.net.raft_pb2_grpc import RaftServicer, add_RaftServicer_to_server
 from raft.net.transport import GrpcTransport
-from raft.node import NotLeader
+from raft.node import DEFAULT_MAX_APPEND_BYTES, DEFAULT_MAX_APPEND_ENTRIES, NotLeader
 from raft.storage import LogEntry
 
 log = logging.getLogger(__name__)
@@ -81,6 +87,8 @@ class ClusterConfig:
     heartbeat_ms: int = 50
     request_timeout_ms: int = 2000
     pre_vote: bool = True
+    max_append_entries: int = DEFAULT_MAX_APPEND_ENTRIES
+    max_append_bytes: int = DEFAULT_MAX_APPEND_BYTES
 
     @classmethod
     def load(cls, path: str | Path) -> ClusterConfig:
@@ -93,6 +101,8 @@ class ClusterConfig:
             heartbeat_ms=int(raw.get("heartbeat_ms", defaults.heartbeat_ms)),
             request_timeout_ms=int(raw.get("request_timeout_ms", defaults.request_timeout_ms)),
             pre_vote=bool(raw.get("pre_vote", defaults.pre_vote)),
+            max_append_entries=int(raw.get("max_append_entries", defaults.max_append_entries)),
+            max_append_bytes=int(raw.get("max_append_bytes", defaults.max_append_bytes)),
         )
 
 
@@ -110,6 +120,12 @@ class ServerConfig:
 
 def _encode(entry: LogEntry) -> bytes:
     return encode_log_entry(entry).SerializeToString()
+
+
+def _wire_entry_size(entry: LogEntry) -> int:
+    """`entry`'s size inside an AppendEntries: its encoding plus at most
+    6 bytes of field tag and length prefix."""
+    return encode_log_entry(entry).ByteSize() + 6
 
 
 def _decode(data: bytes) -> LogEntry:
@@ -230,6 +246,9 @@ class RaftServer:
             election_timeout_range=cluster.election_timeout_ms,
             heartbeat_interval=cluster.heartbeat_ms,
             pre_vote=cluster.pre_vote,
+            max_append_entries=cluster.max_append_entries,
+            max_append_bytes=cluster.max_append_bytes,
+            entry_size=_wire_entry_size,
         )
         # SO_REUSEPORT off: a second process on this address must fail to
         # bind, not silently share the port.
