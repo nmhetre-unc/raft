@@ -170,13 +170,14 @@ def test_reply_confirming_a_chunk_sends_the_next_one_at_once() -> None:
     assert node.handle(AppendEntriesReply(1, success=True, match_index=1300), "b", 30) == []
 
 
-def test_no_extra_send_while_newer_entries_are_already_in_flight() -> None:
+def test_entry_appended_while_a_chunk_is_in_flight_follows_the_reply() -> None:
     node = leader(10)
     node._send_append_entries(0)  # carries 1..10
-    node.append_command("e11", 1)  # carries 1..11
-    # The reply to the first message: behind, but 11 is already on its way.
-    assert node.handle(AppendEntriesReply(1, success=True, match_index=10), "b", 2) == []
-    assert node.match_index["b"] == 10
+    assert [dst for dst, _ in node.append_command("e11", 1)] == ["c"]  # b is in flight
+    msg = append_entries_to(
+        node.handle(AppendEntriesReply(1, success=True, match_index=10), "b", 2), "b"
+    )
+    assert (msg.prev_log_index, [e.command for e in msg.entries]) == (10, ["e11"])
 
 
 def test_stale_success_reply_sends_nothing() -> None:

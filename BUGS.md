@@ -668,4 +668,74 @@ Results:
   load instead of one message.
 - **Still open:** while a peer is down, every write still builds and encodes
   a chunk of up to 1 MiB for it. The 1,500 writes took 13-14 s, against
-  24.7 s before. Capping bounds this cost, but it doesn't remove it.
+  24.7 s before. Capping bounds this cost, but it doesn't remove it. *(Resolved by
+  per-peer flow control, below: the same 1,500 writes now take 1.3-1.6 s.)*
+
+## Every write re-sent every unacknowledged entry to every peer
+
+Found by: profiling the leader with py-spy during the no-fault bench (16
+clients, deferred fsync), plus send counters added to `GrpcTransport`
+(`stats()`) and the bench (`resources` in the result JSON). Regression tests:
+`tests/test_flow_control.py`.
+
+**Symptom.** Throughput stayed at 230-310 ops/s from 1 to 32 clients and fell
+at 32. The leader's event-loop thread was at 99-100% CPU from 8 clients up.
+Every client operation is one log entry, and for each one the leader sent 4
+AppendEntries (one per peer) carrying 60-200 entries in total, about
+1.8-5.7 KB encoded. The minimum is 4 entries.
+
+**Root cause.** `append_command` sent each peer everything from its
+`next_index` on. `next_index` only moves when a reply arrives, so with N
+writes arriving within one round trip, each write re-sent all the earlier
+ones still unacknowledged. The number of entries sent per write grew with
+load, and so did the cost of encoding them. That cost came twice: once to
+send and once in Fix 2's `_wire_entry_size`, which encodes each entry to
+measure it. On the leader's main thread, encoding took 31% of busy time and
+per-RPC gRPC overhead 48%. `load_log()` copies took 1.4%.
+
+**Why the simulator missed it.** It isn't a safety or liveness problem:
+duplicate entries are idempotent on the follower, and the simulator charges
+nothing for encoding or sending. The fuzzer's zero-delay network also never
+has more than a write or two in flight.
+
+**Fix: per-peer flow control** in `RaftNode`. At most one AppendEntries
+carrying entries is in flight to each peer. While it is unacknowledged and
+younger than one heartbeat interval, new entries wait. When the success reply
+arrives, everything that waited goes out in one message, up to Fix 2's caps.
+Heartbeats still go out on schedule; a peer with something in flight gets an
+empty one, so it keeps hearing from its leader and learns the commit index.
+
+*Why it's safe:* it only changes *when* an AppendEntries is sent, never what
+it contains. Every message is still built from `next_index` and
+consistency-checked by the follower, and commitment still waits for
+`match_index`, which only replies move. Holding a message back looks to the
+protocol exactly like a slow network.
+
+*Lost messages and replies:* "in flight" expires one heartbeat interval after
+the send. The next heartbeat then re-sends a full chunk from `next_index`, so
+a loss costs at most about two heartbeat intervals. A dead peer gets at most
+one chunk per heartbeat instead of one per write, which also fixes Fix 2's
+open item.
+
+Results (20 s no-fault runs, unprofiled):
+
+- **Load:** at 8-32 clients, entries sent per write are 4.0, the minimum.
+  AppendEntries per write fell from 4.0 to 0.95-1.2, because writes are now
+  batched.
+- **Throughput:** at 16 clients, 891 ops/s (deferred fsync) and 871
+  (per-write), against 295 and 274. p99 fell from 89-103 ms to 29-31 ms. A
+  single client is unchanged (about 250-290 ops/s), since nothing was
+  duplicated there.
+- **Restart:** leader-kill restart catch-up is 519-637 ms, against 258-401 ms.
+  The gap is now 3-6× larger because of the higher write rate, and it closes
+  at 30-38k entries/s against 5-10k.
+- **Large-gap reproduction:** still catches up (0.26-0.32 s).
+
+The leader's main thread is still at 100%. What dominates it now is per-RPC
+gRPC overhead (about 66%, including asyncio scheduling) and `load_log()`
+copies (7.8%, growing with log length).
+
+Five mutation-detection tests had their pinned counts shift (all mutations still detected), because
+fewer resends change which seeds reach each precondition; each test records
+the old and new count. `test_every_send_happens_after_sync` now expects 2
+messages for a burst of 5 instead of 10.

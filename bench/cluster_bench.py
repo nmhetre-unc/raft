@@ -35,6 +35,15 @@ highest commit index any node reported at the moment of the restart:
 everything committed while it was down. It is watched until the run's
 final convergence wait ends, so it can land after the load stops.
 
+Resources, over the load window: every server's CPU time (from /proc),
+and the leader's transport counters (`GrpcTransport.stats`, read with
+SIGUSR1) per committed client operation -- AppendEntries sent, entries
+they carried, bytes encoded. Every client operation, get or put, is one
+log entry. With `--profile`, each server runs under ``py-spy record
+--format raw --idle`` (``--native`` too with `--profile-native`) and the
+profiles land in the result directory as ``<name>.<node>.raw``; py-spy
+pauses the process for each sample, so profiled throughput is lower.
+
 Not part of the test suite or coverage; ruff and mypy clean.
 """
 
@@ -95,8 +104,35 @@ def free_ports(n: int) -> list[int]:
             s.close()
 
 
+def server_cpu_s(pid: int) -> float:
+    """User + system CPU seconds of `pid` so far (/proc/<pid>/stat)."""
+    return server_cpu_s_of(Path(f"/proc/{pid}/stat"))
+
+
+def thread_cpu_s(pid: int) -> dict[str, float]:
+    """CPU seconds so far per thread name (several threads may share one)."""
+    out: dict[str, float] = {}
+    for task in Path(f"/proc/{pid}/task").iterdir():
+        try:
+            comm = (task / "comm").read_text().strip()
+            if task.name == str(pid):
+                comm = "main (event loop)"
+            out[comm] = out.get(comm, 0.0) + server_cpu_s_of(task / "stat")
+        except FileNotFoundError:
+            continue  # thread exited
+    return out
+
+
+def server_cpu_s_of(stat: Path) -> float:
+    fields = stat.read_text().rsplit(")", 1)[1].split()
+    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+
+
 class Cluster:
-    def __init__(self, nodes: int, fsync: str, workdir: Path) -> None:
+    def __init__(
+        self, nodes: int, fsync: str, workdir: Path, profile: list[str] | None = None
+    ) -> None:
+        self.profile = profile
         self.fsync = fsync
         self.workdir = workdir
         self.nodes = {f"n{i}": f"127.0.0.1:{port}" for i, port in enumerate(free_ports(nodes))}
@@ -116,8 +152,14 @@ class Cluster:
     def start(self, node: str) -> None:
         log = (self.workdir / f"{node}.log").open("ab")
         self._logs.append(log)
+        wrapper = []
+        if self.profile is not None:
+            out = self.workdir / f"{node}.raw"
+            wrapper = ["py-spy", "record", "--format", "raw", "--idle", "--threads", "-o", str(out)]
+            wrapper += [*self.profile, "--"]
         self.procs[node] = subprocess.Popen(
             [
+                *wrapper,
                 sys.executable,
                 "-m",
                 "raft.net.server",
@@ -135,9 +177,35 @@ class Cluster:
             stderr=log,
         )
 
+    def server_pid(self, node: str) -> int:
+        """The server process's pid: the Popen's, or under py-spy its child's."""
+        pid = self.procs[node].pid
+        if self.profile is None:
+            return pid
+        for _ in range(100):
+            children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+            if children:
+                return int(children[0])
+            time.sleep(0.05)
+        raise RuntimeError(f"no server process under py-spy for {node}")
+
     def kill(self, node: str) -> None:
+        if self.profile is not None:
+            os.kill(self.server_pid(node), signal.SIGKILL)
         self.procs[node].kill()
         self.procs[node].wait()
+
+    async def leader_stats(self, node: str) -> dict[str, Any]:
+        """Ask `node` to write its stats.json (SIGUSR1) and read it."""
+        path = self.workdir / node / "stats.json"
+        path.unlink(missing_ok=True)
+        os.kill(self.server_pid(node), signal.SIGUSR1)
+        for _ in range(200):
+            if path.exists():
+                stats: dict[str, Any] = json.loads(path.read_text())
+                return stats
+            await asyncio.sleep(0.01)
+        raise TimeoutError(f"{node} wrote no stats")
 
     def alive(self) -> list[str]:
         return [n for n, p in self.procs.items() if p.poll() is None]
@@ -162,9 +230,11 @@ class Cluster:
     async def shutdown(self) -> None:
         for channel in self._channels.values():
             await channel.close()
-        for proc in self.procs.values():
+        for node, proc in self.procs.items():
             if proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
+                # Under py-spy, stop the server itself: py-spy writes its
+                # profile when its child exits.
+                os.kill(self.server_pid(node), signal.SIGTERM)
         for proc in self.procs.values():
             try:
                 proc.wait(timeout=10)
@@ -302,11 +372,18 @@ def git_revision() -> str:
 
 
 async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
-    cluster = Cluster(args.nodes, args.fsync, workdir)
+    profile = None
+    if args.profile:
+        profile = ["--native"] if args.profile_native else []
+    cluster = Cluster(args.nodes, args.fsync, workdir, profile)
     try:
         for node in cluster.nodes:
             cluster.start(node)
-        await wait_for_leader(cluster)
+        load_leader = await wait_for_leader(cluster)
+        pids = {n: cluster.server_pid(n) for n in cluster.nodes}
+        cpu_start = {n: server_cpu_s(pid) for n, pid in pids.items()}
+        stats_start = await cluster.leader_stats(load_leader)
+        threads_start = thread_cpu_s(pids[load_leader])
 
         t0 = time.monotonic()
         poller = Poller(cluster, t0)
@@ -357,6 +434,40 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
             seed=args.seed,
         )
         load_end = t0 + args.duration
+        resources: dict[str, Any] = {}
+        if not args.kill_at:
+            stats_end = await cluster.leader_stats(load_leader)
+            wall = stats_end["monotonic"] - stats_start["monotonic"]
+            cpu = {n: server_cpu_s(pid) - cpu_start[n] for n, pid in pids.items()}
+            threads_end = thread_cpu_s(pids[load_leader])
+            leader_threads = {
+                t: round(100 * (c - threads_start.get(t, 0.0)) / wall, 1)
+                for t, c in sorted(threads_end.items(), key=lambda kv: -kv[1])
+            }
+            committed = stats_end["commit_index"] - stats_start["commit_index"]
+            t_start, t_end = stats_start["transport"], stats_end["transport"]
+            sent_ae = t_end["sent"].get("AppendEntries", 0) - t_start["sent"].get(
+                "AppendEntries", 0
+            )
+            per_entry = max(committed, 1)
+            resources = {
+                "leader": load_leader,
+                "wall_s": wall,
+                "cpu_percent": {n: 100 * c / wall for n, c in cpu.items()},
+                "leader_thread_cpu_percent": leader_threads,
+                "committed_entries": committed,
+                "append_entries_per_entry": sent_ae / per_entry,
+                "append_entries_with_entries_per_entry": (
+                    t_end["append_entries_with_entries"] - t_start["append_entries_with_entries"]
+                )
+                / per_entry,
+                "entries_sent_per_entry": (t_end["entries_sent"] - t_start["entries_sent"])
+                / per_entry,
+                "bytes_encoded_per_entry": (t_end["bytes_encoded"] - t_start["bytes_encoded"])
+                / per_entry,
+                "leader_stats_start": stats_start,
+                "leader_stats_end": stats_end,
+            }
         await asyncio.gather(*fault_tasks)
 
         converged, final_view = await wait_for_convergence(cluster)
@@ -385,6 +496,7 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
         summary = summarize(ops, start=t0, end=load_end, faults=faults)
         result: dict[str, Any] = {
             "summary": dataclasses.asdict(summary),
+            "resources": resources,
             "verification": verification,
             "events": poller.events,
         }
@@ -465,6 +577,20 @@ def report(name: str, result: dict[str, Any]) -> None:
             f"   restart: {catch_up}  (c) {r['c_elections_after_restart']} elections  "
             f"(d) longest write stall {fmt(r['d_longest_write_stall_s'], 1000, 0)} ms"
         )
+    res = result.get("resources")
+    if res:
+        cpu = "  ".join(f"{n} {c:.0f}%" for n, c in sorted(res["cpu_percent"].items()))
+        print(f"   cpu: {cpu}  (leader {res['leader']})")
+        threads = "  ".join(
+            f"{t} {c:.0f}%" for t, c in res["leader_thread_cpu_percent"].items() if c >= 1
+        )
+        print(f"   leader threads: {threads}")
+        print(
+            f"   leader per committed entry: {res['append_entries_per_entry']:.2f} AppendEntries "
+            f"({res['append_entries_with_entries_per_entry']:.2f} carrying entries), "
+            f"{res['entries_sent_per_entry']:.2f} entries sent, "
+            f"{res['bytes_encoded_per_entry']:.0f} bytes encoded"
+        )
     print(
         f"   verify: {'PASS' if ok else 'FAIL'} (converged={v['converged']}, "
         f"{len(v['prefix_problems'])} prefix problems, {len(v['ack_problems'])} missing of "
@@ -486,6 +612,8 @@ def main() -> int:
     parser.add_argument("--out-dir", type=Path, default=Path(__file__).parent / "results")
     parser.add_argument("--name", help="result file stem (default: derived from options)")
     parser.add_argument("--keep", action="store_true", help="keep data dirs and server logs")
+    parser.add_argument("--profile", action="store_true", help="run each server under py-spy")
+    parser.add_argument("--profile-native", action="store_true", help="py-spy --native too")
     args = parser.parse_args()
     if args.restart_at is not None and (args.kill_at is None or args.restart_at <= args.kill_at):
         parser.error("--restart-at needs a --kill-at before it")
@@ -520,6 +648,8 @@ def main() -> int:
     }
     (args.out_dir / f"{name}.json").write_text(json.dumps(output, indent=2) + "\n")
     report(name, output)
+    for raw in sorted(workdir.glob("*.raw")):
+        shutil.copy(raw, args.out_dir / f"{name}.{raw.name}")
 
     if args.keep:
         print(f"   kept {workdir}")

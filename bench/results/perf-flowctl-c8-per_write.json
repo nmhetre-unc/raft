@@ -1,0 +1,203 @@
+{
+  "name": "perf-flowctl-c8-per_write",
+  "environment": {
+    "cpu_count": 12,
+    "os": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.16 (main, Oct 26 2026, 14:08:45) [Clang 23.1.3 ]",
+    "git": "61bb072-dirty"
+  },
+  "options": {
+    "nodes": 5,
+    "clients": 8,
+    "duration": 20.0,
+    "fsync": "per_write",
+    "kill_at": null,
+    "restart_at": null,
+    "put_ratio": 0.5,
+    "keys": 100,
+    "seed": 0,
+    "out_dir": "/home/neilm/raft/bench/results",
+    "name": "perf-flowctl-c8-per_write",
+    "keep": false,
+    "profile": false,
+    "profile_native": false
+  },
+  "summary": {
+    "window": 20.0,
+    "ops": 13571,
+    "ok": 13571,
+    "failed": 0,
+    "puts_ok": 6848,
+    "gets_ok": 6723,
+    "ops_per_sec": 678.55,
+    "latency_ms": {
+      "p50": 10.984104999806732,
+      "p99": 24.511878000339493,
+      "p99.9": 47.02218900092703
+    },
+    "longest_gap_s": 0.018139403000532184,
+    "longest_gap_at_s": 17.57578714400006,
+    "first_write_after_fault_s": {}
+  },
+  "resources": {
+    "leader": "n0",
+    "wall_s": 20.0311093170003,
+    "cpu_percent": {
+      "n0": 164.99335846542772,
+      "n1": 51.96916374054773,
+      "n2": 51.51986261310785,
+      "n3": 51.56978496060117,
+      "n4": 51.420017918121204
+    },
+    "leader_thread_cpu_percent": {
+      "main (event loop)": 99.8,
+      "event_engine": 53.4,
+      "python": 11.2,
+      "grpc_global_tim": 0.0,
+      "lifeguard": 0.0
+    },
+    "committed_entries": 13571,
+    "append_entries_per_entry": 1.2194385085844817,
+    "append_entries_with_entries_per_entry": 1.1100876869795888,
+    "entries_sent_per_entry": 4.0,
+    "bytes_encoded_per_entry": 143.0094318767961,
+    "leader_stats_start": {
+      "node_id": "n0",
+      "role": "leader",
+      "commit_index": 1,
+      "monotonic": 9776.591866877,
+      "cpu_user_s": 0.12,
+      "cpu_system_s": 0.02,
+      "transport": {
+        "sent": {
+          "PreVote": 4,
+          "RequestVote": 4,
+          "AppendEntries": 8
+        },
+        "append_entries_with_entries": 4,
+        "entries_sent": 4,
+        "bytes_encoded": 232,
+        "dropped": 0,
+        "failed": 0
+      }
+    },
+    "leader_stats_end": {
+      "node_id": "n0",
+      "role": "leader",
+      "commit_index": 13572,
+      "monotonic": 9796.622976194,
+      "cpu_user_s": 21.53,
+      "cpu_system_s": 11.65,
+      "transport": {
+        "sent": {
+          "PreVote": 4,
+          "RequestVote": 4,
+          "AppendEntries": 16557
+        },
+        "append_entries_with_entries": 15069,
+        "entries_sent": 54288,
+        "bytes_encoded": 1941013,
+        "dropped": 0,
+        "failed": 0
+      }
+    }
+  },
+  "verification": {
+    "converged": true,
+    "final_view": {
+      "n0": {
+        "role": "leader",
+        "term": 1,
+        "commit": 13572,
+        "applied": 13572,
+        "hint": ""
+      },
+      "n1": {
+        "role": "follower",
+        "term": 1,
+        "commit": 13572,
+        "applied": 13572,
+        "hint": "n0"
+      },
+      "n2": {
+        "role": "follower",
+        "term": 1,
+        "commit": 13572,
+        "applied": 13572,
+        "hint": "n0"
+      },
+      "n3": {
+        "role": "follower",
+        "term": 1,
+        "commit": 13572,
+        "applied": 13572,
+        "hint": "n0"
+      },
+      "n4": {
+        "role": "follower",
+        "term": 1,
+        "commit": 13572,
+        "applied": 13572,
+        "hint": "n0"
+      },
+      "alive": [
+        "n0",
+        "n1",
+        "n2",
+        "n3",
+        "n4"
+      ]
+    },
+    "nodes_checked": [
+      "n0",
+      "n1",
+      "n2",
+      "n3",
+      "n4"
+    ],
+    "commit_index": 13572,
+    "acknowledged_puts": 6848,
+    "prefix_problems": [],
+    "ack_problems": []
+  },
+  "events": [
+    {
+      "t": 0.0019,
+      "kind": "term",
+      "node": "n0",
+      "term": 1
+    },
+    {
+      "t": 0.0019,
+      "kind": "term",
+      "node": "n1",
+      "term": 1
+    },
+    {
+      "t": 0.0019,
+      "kind": "term",
+      "node": "n2",
+      "term": 1
+    },
+    {
+      "t": 0.0019,
+      "kind": "term",
+      "node": "n3",
+      "term": 1
+    },
+    {
+      "t": 0.0019,
+      "kind": "term",
+      "node": "n4",
+      "term": 1
+    },
+    {
+      "t": 0.0019,
+      "kind": "leader",
+      "leader": "n0",
+      "term": 1,
+      "same_node": false
+    }
+  ],
+  "history": "perf-flowctl-c8-per_write.history.jsonl"
+}

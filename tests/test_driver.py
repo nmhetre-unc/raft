@@ -350,15 +350,16 @@ async def test_every_send_happens_after_sync(net: Net) -> None:
         assert await net.submit(leader, "c", serial, Put("k", str(serial))) == Ok(None)
     assert len(net.sent) > 0  # every one of these passed Net.send's assertion
 
-    # A burst queued together is one batch covered by one fsync. (RaftNode
-    # emits an AppendEntries per peer for every append, so 5 submits send
-    # 10 messages -- all after that single sync.)
+    # A burst queued together is one batch covered by one fsync. (RaftNode's
+    # flow control sends each peer the first new entry and holds the rest
+    # until that is acknowledged -- never, here: the leader is isolated --
+    # so 5 submits send 2 messages, one per peer, both after that sync.)
     net.isolate(leader)
     syncs, sent = net.storages[leader].syncs, net.sent_by(leader)
     burst = [net.start_submit(leader, "c", s, Put("k", str(s))) for s in range(4, 9)]
     await net.settle()
     assert net.storages[leader].syncs == syncs + 1
-    assert net.sent_by(leader) == sent + 10
+    assert net.sent_by(leader) == sent + 2
     for task in burst:
         task.cancel()
 

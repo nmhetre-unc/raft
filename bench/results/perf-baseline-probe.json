@@ -1,0 +1,198 @@
+{
+  "name": "perf-baseline-probe",
+  "environment": {
+    "cpu_count": 12,
+    "os": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.16 (main, Oct 26 2026, 14:08:45) [Clang 23.1.3 ]",
+    "git": "61bb072-dirty"
+  },
+  "options": {
+    "nodes": 5,
+    "clients": 16,
+    "duration": 20.0,
+    "fsync": "deferred",
+    "kill_at": null,
+    "restart_at": null,
+    "put_ratio": 0.5,
+    "keys": 100,
+    "seed": 0,
+    "out_dir": "/home/neilm/raft/bench/results",
+    "name": "perf-baseline-probe",
+    "keep": false,
+    "profile": false,
+    "profile_native": false
+  },
+  "summary": {
+    "window": 20.0,
+    "ops": 5864,
+    "ok": 5864,
+    "failed": 0,
+    "puts_ok": 2930,
+    "gets_ok": 2934,
+    "ops_per_sec": 293.2,
+    "latency_ms": {
+      "p50": 35.83112100022845,
+      "p99": 115.9758289995807,
+      "p99.9": 127.06515699937881
+    },
+    "longest_gap_s": 0.016367337999326992,
+    "longest_gap_at_s": 17.924852651000037,
+    "first_write_after_fault_s": {}
+  },
+  "resources": {
+    "leader": "n1",
+    "wall_s": 20.03774998299923,
+    "cpu_percent": {
+      "n0": 46.51220824647195,
+      "n1": 146.97258936251063,
+      "n2": 51.95194075598423,
+      "n3": 56.7428978285822,
+      "n4": 47.1110778805467
+    },
+    "committed_entries": 5864,
+    "append_entries_per_entry": 4.0006821282401095,
+    "append_entries_with_entries_per_entry": 4.0,
+    "entries_sent_per_entry": 171.30576398362894,
+    "bytes_encoded_per_entry": 5090.515859481582,
+    "leader_stats_start": {
+      "node_id": "n1",
+      "role": "leader",
+      "commit_index": 1,
+      "monotonic": 8934.382180302,
+      "cpu_user_s": 0.09,
+      "cpu_system_s": 0.05,
+      "transport": {
+        "sent": {
+          "PreVote": 4,
+          "RequestVote": 4,
+          "AppendEntries": 8,
+          "PreVoteReply": 1
+        },
+        "append_entries_with_entries": 4,
+        "entries_sent": 4,
+        "bytes_encoded": 240,
+        "dropped": 0,
+        "failed": 0
+      }
+    },
+    "leader_stats_end": {
+      "node_id": "n1",
+      "role": "leader",
+      "commit_index": 5865,
+      "monotonic": 8954.419930285,
+      "cpu_user_s": 20.94,
+      "cpu_system_s": 8.64,
+      "transport": {
+        "sent": {
+          "PreVote": 4,
+          "RequestVote": 4,
+          "AppendEntries": 23468,
+          "PreVoteReply": 1
+        },
+        "append_entries_with_entries": 23460,
+        "entries_sent": 1004541,
+        "bytes_encoded": 29851025,
+        "dropped": 0,
+        "failed": 0
+      }
+    }
+  },
+  "verification": {
+    "converged": true,
+    "final_view": {
+      "n0": {
+        "role": "follower",
+        "term": 1,
+        "commit": 5865,
+        "applied": 5865,
+        "hint": "n1"
+      },
+      "n1": {
+        "role": "leader",
+        "term": 1,
+        "commit": 5865,
+        "applied": 5865,
+        "hint": ""
+      },
+      "n2": {
+        "role": "follower",
+        "term": 1,
+        "commit": 5865,
+        "applied": 5865,
+        "hint": "n1"
+      },
+      "n3": {
+        "role": "follower",
+        "term": 1,
+        "commit": 5865,
+        "applied": 5865,
+        "hint": "n1"
+      },
+      "n4": {
+        "role": "follower",
+        "term": 1,
+        "commit": 5865,
+        "applied": 5865,
+        "hint": "n1"
+      },
+      "alive": [
+        "n0",
+        "n1",
+        "n2",
+        "n3",
+        "n4"
+      ]
+    },
+    "nodes_checked": [
+      "n0",
+      "n1",
+      "n2",
+      "n3",
+      "n4"
+    ],
+    "commit_index": 5865,
+    "acknowledged_puts": 2930,
+    "prefix_problems": [],
+    "ack_problems": []
+  },
+  "events": [
+    {
+      "t": 0.0022,
+      "kind": "term",
+      "node": "n0",
+      "term": 1
+    },
+    {
+      "t": 0.0022,
+      "kind": "term",
+      "node": "n1",
+      "term": 1
+    },
+    {
+      "t": 0.0022,
+      "kind": "term",
+      "node": "n2",
+      "term": 1
+    },
+    {
+      "t": 0.0022,
+      "kind": "term",
+      "node": "n3",
+      "term": 1
+    },
+    {
+      "t": 0.0022,
+      "kind": "term",
+      "node": "n4",
+      "term": 1
+    },
+    {
+      "t": 0.0022,
+      "kind": "leader",
+      "leader": "n1",
+      "term": 1,
+      "same_node": false
+    }
+  ],
+  "history": "perf-baseline-probe.history.jsonl"
+}

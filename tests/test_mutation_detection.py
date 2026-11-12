@@ -58,7 +58,9 @@ Summary from the actual run (n=5, steps=300, seeds 0..49), after
   constructs the exact large-then-small delivery by hand (independent of
   any fuzzer randomness) and proves the old, identity-based checker
   misses it while the new, value-based one doesn't, so none of this is a
-  sweep-count coincidence. Detection then moved again, 45/50 -> 41/50,
+  sweep-count coincidence. (Now 29/50: per-peer flow control resends
+  entries far less often, so fewer seeds reach the precondition.)
+  Detection then moved again, 45/50 -> 41/50,
   once CLIENT_REQUEST stopped omnisciently targeting the actual leader
   and started following `raft.node.NotLeader`'s own `leader_hint`
   instead, the way a real client has to (see `raft/sim/fuzz.py`'s
@@ -76,7 +78,8 @@ Summary from the actual run (n=5, steps=300, seeds 0..49), after
   untouched by any of this, and remains the actual guarantee that the
   new checker discriminates correctly.
 - Advancing match_index/next_index on a rejected reply, trusting it
-  regardless of the reply's success flag: 2/50 detected (was 4/50 before
+  regardless of the reply's success flag: 8/50 detected (2/50 before
+  per-peer flow control; was 4/50 before
   CLIENT_REQUEST started following `raft.node.NotLeader`'s own
   `leader_hint` instead of omnisciently targeting the actual leader --
   see the truncate-on-resend entry above for why that traffic-pattern
@@ -91,13 +94,14 @@ Summary from the actual run (n=5, steps=300, seeds 0..49), after
   exact checker on *unmutated* code, removed it -- see BUGS.md. The
   mutation is rewritten here to recreate the same class of bug against
   the message shape that replaced it.)
-- Skipping the AppendEntries consistency check entirely: 25/50 detected
-  (was 33/50 before `STALE_REDELIVER` joined `DEFAULT_WEIGHTS`, then
+- Skipping the AppendEntries consistency check entirely: 21/50 detected
+  (25/50 before per-peer flow control; was 33/50 before
+  `STALE_REDELIVER` joined `DEFAULT_WEIGHTS`, then
   31/50 with it, then 25/50 once CLIENT_REQUEST started following
   `leader_hint` instead of omnisciently targeting the actual leader --
   see the truncate-on-resend entry above for why traffic-pattern changes
   shift counts for mutations they have nothing to do with, not a
-  regression) -- now all 25 via `check_log_matching`, 0 via
+  regression) -- now all 21 via `check_log_matching`, 0 via
   `check_leader_completeness` (the one seed that used to surface via
   leader completeness before this last shift no longer does; see that
   test for the per-checker breakdown it now pins exactly).
@@ -107,7 +111,8 @@ Summary from the actual run (n=5, steps=300, seeds 0..49), after
 - Applying past commit_index -- ignoring Figure 2's "apply" boundary
   entirely and replaying straight to the end of the log, committed or
   not (Milestone 5's replicated state machine and `last_applied`
-  wiring): 8/50 detected (was 11/50 before CLIENT_REQUEST started
+  wiring): 13/50 detected (9/50 before per-peer flow control, 8/50
+  before fast log backtracking, was 11/50 before CLIENT_REQUEST started
   following `raft.node.NotLeader`'s own `leader_hint` instead of
   omnisciently targeting the actual leader -- see the truncate-on-resend
   entry above for why that traffic-pattern change shifts sweep counts
@@ -268,7 +273,10 @@ def test_mutation_always_truncate_on_resend_is_now_caught_directly(
     extended a follower past it: everything beyond the stale message's
     own range is discarded and never restored.
 
-    41/50 seeds now catch this (was 45/50 before CLIENT_REQUEST stopped
+    29/50 seeds now catch this (41/50 before per-peer flow control:
+    an entry is now resent far less often -- only after a reply, or a
+    heartbeat interval without one -- so fewer seeds deliver a stale,
+    shorter resend inside the window this mutation needs; 45/50 before CLIENT_REQUEST stopped
     omnisciently targeting the actual leader and started following
     `raft.node.NotLeader`'s own `leader_hint` instead -- see the module
     docstring for why that traffic-pattern change shifts sweep counts,
@@ -294,7 +302,7 @@ def test_mutation_always_truncate_on_resend_is_now_caught_directly(
 
     violations = _sweep()
 
-    assert len(violations) == 41, f"detection rate shifted: {violations}"
+    assert len(violations) == 29, f"detection rate shifted: {violations}"
     assert all(
         "log entry at index" in reason and "lost or changed" in reason
         for reason in violations.values()
@@ -484,7 +492,11 @@ def test_mutation_match_index_advances_on_failure_is_detected(
     fully replicated to the peer, regardless of what the reply actually
     says.
 
-    DETECTED: 2/50 seeds (was 4/50 before CLIENT_REQUEST started
+    DETECTED: 8/50 seeds (2/50 before per-peer flow control: entries
+    now wait while one AppendEntries is in flight, which changes when
+    entries are resent and so which seeds reach this mutation's
+    precondition;
+    4/50 before CLIENT_REQUEST started
     following `raft.node.NotLeader`'s own `leader_hint` instead of
     omnisciently targeting the actual leader -- see the truncate-on-resend
     mutation's own test for why that traffic-pattern change shifts sweep
@@ -517,13 +529,13 @@ def test_mutation_match_index_advances_on_failure_is_detected(
 
         self.next_index[src] = max(1, self.next_index[src] - 1)
         log = self.storage.load_log()
-        return [(src, self._build_append_entries_for(src, log))]
+        return [(src, self._build_append_entries_for(src, log, now))]
 
     monkeypatch.setattr(RaftNode, "_handle_append_entries_reply", mutated)
 
     violations = _sweep()
 
-    assert len(violations) == 2, f"detection rate shifted: {violations}"
+    assert len(violations) == 8, f"detection rate shifted: {violations}"
     assert all("missing entry" in reason for reason in violations.values())
 
 
@@ -535,7 +547,9 @@ def test_mutation_skipping_the_consistency_check_is_detected(
     position the follower's log happens to currently end at, regardless
     of what Raft index the leader thinks they're at.
 
-    DETECTED: 25/50 seeds now (history: 33/50 before `STALE_REDELIVER`
+    DETECTED: 21/50 seeds now, all via check_log_matching (25/50 before
+    per-peer flow control changed when entries are resent; history before
+    that: 33/50 before `STALE_REDELIVER`
     joined `DEFAULT_WEIGHTS` -- see the module docstring for why weaving a
     new action into the shared, weighted `self._rng` stream shifts
     *every* seed's subsequent random walk, not just the ones that need
@@ -589,10 +603,10 @@ def test_mutation_skipping_the_consistency_check_is_detected(
 
     violations = _sweep()
 
-    assert len(violations) == 25, f"detection rate shifted: {violations}"
+    assert len(violations) == 21, f"detection rate shifted: {violations}"
     via_log_matching = sum(1 for reason in violations.values() if "log matching violated" in reason)
     via_leader_completeness = sum(1 for reason in violations.values() if "missing entry" in reason)
-    assert via_log_matching == 25, f"per-checker split shifted: {violations}"
+    assert via_log_matching == 21, f"per-checker split shifted: {violations}"
     assert via_leader_completeness == 0, f"per-checker split shifted: {violations}"
     assert via_log_matching + via_leader_completeness == len(violations), (
         f"a violation reason went unclassified: {violations}"
@@ -674,7 +688,11 @@ def test_mutation_apply_past_commit_index_is_detected(monkeypatch: pytest.Monkey
     whatever next reads that index sees genuinely different log content
     than an earlier, premature application already recorded.
 
-    DETECTED: 9/50 seeds (8/50 before fast log backtracking changed how
+    DETECTED: 13/50 seeds (9/50 before per-peer flow control: entries
+    now wait while one AppendEntries is in flight, which changes when
+    entries are resent and so which seeds reach this mutation's
+    precondition;
+    8/50 before fast log backtracking changed how
     quickly a lagging follower is rewritten, and so which seeds reach the
     truncate-after-premature-apply interleaving; 11/50 before CLIENT_REQUEST started
     following `raft.node.NotLeader`'s own `leader_hint` instead of
@@ -692,7 +710,7 @@ def test_mutation_apply_past_commit_index_is_detected(monkeypatch: pytest.Monkey
 
     violations = _sweep()
 
-    assert len(violations) == 9, f"detection rate shifted: {violations}"
+    assert len(violations) == 13, f"detection rate shifted: {violations}"
     assert all(
         "applied" in reason and "already applied there" in reason for reason in violations.values()
     )
@@ -810,8 +828,9 @@ def test_mutation_skip_session_dedup_check_is_detected(monkeypatch: pytest.Monke
     Against `_apply_spy_sweep` -- an `apply()`-call-counting spy,
     independent of this mutation's own (broken) dedup decision, reused
     from `tests/test_client_sessions.py`'s own positive-behavior test for
-    this exact property -- **40/50 seeds** show a real, observable double
-    application (38/50 before fast log backtracking: rejections now jump
+    this exact property -- **36/50 seeds** show a real, observable double
+    application (40/50 before per-peer flow control, which resends
+    entries less often; 38/50 before fast log backtracking: rejections now jump
     a whole term back instead of one entry, which changes when resends
     happen and so which seeds produce a retried request). This is the
     actually appropriate detector for this bug class.
@@ -825,7 +844,7 @@ def test_mutation_skip_session_dedup_check_is_detected(monkeypatch: pytest.Monke
     )
 
     double_applications = _apply_spy_sweep(monkeypatch)
-    assert len(double_applications) == 40, f"detection rate shifted: {sorted(double_applications)}"
+    assert len(double_applications) == 36, f"detection rate shifted: {sorted(double_applications)}"
 
 
 def test_mutation_skip_session_dedup_check_is_a_structural_gap_for_existing_checkers() -> None:

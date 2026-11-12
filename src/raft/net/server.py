@@ -51,6 +51,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import signal
 import sys
 import time
@@ -291,6 +292,27 @@ class RaftServer:
         if self.run_task.done():
             self.run_task.result()  # raises the fail-stop error
 
+    def write_stats(self) -> None:
+        """Write this process's counters to ``<data-dir>/stats.json``: what
+        the transport has sent (see `GrpcTransport.stats`), the commit
+        index, and CPU time. For benchmarks: ``kill -USR1`` before and
+        after a load and take the difference."""
+        times = os.times()
+        status = self.driver.status()
+        stats = {
+            "node_id": self.config.node_id,
+            "role": status.role.value,
+            "commit_index": status.commit_index,
+            "monotonic": time.monotonic(),
+            "cpu_user_s": times.user,
+            "cpu_system_s": times.system,
+            "transport": self.transport.stats(),
+        }
+        path = self.config.data_dir / "stats.json"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(stats))
+        tmp.replace(path)
+
     async def stop(self) -> None:
         """Stop the tasks and the gRPC server, then close the transport and
         the storage. Safe whether the driver is alive or has failed."""
@@ -298,10 +320,15 @@ class RaftServer:
         log.info("%s: stopped", self.config.node_id)
 
 
-async def run(config: ServerConfig, stop: asyncio.Event | None = None) -> None:
-    """Serve until `stop` is set (cleanly) or the driver fails (raises)."""
+async def run(
+    config: ServerConfig, stop: asyncio.Event | None = None, *, stats_on_sigusr1: bool = False
+) -> None:
+    """Serve until `stop` is set (cleanly) or the driver fails (raises).
+    With `stats_on_sigusr1`, SIGUSR1 calls `RaftServer.write_stats`."""
     server = RaftServer(config)
     await server.start()
+    if stats_on_sigusr1:
+        asyncio.get_running_loop().add_signal_handler(signal.SIGUSR1, server.write_stats)
     try:
         await server.serve(stop if stop is not None else asyncio.Event())
     finally:
@@ -313,7 +340,7 @@ async def _run_until_signalled(config: ServerConfig) -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
-    await run(config, stop)
+    await run(config, stop, stats_on_sigusr1=True)
 
 
 def main(argv: list[str] | None = None) -> int:

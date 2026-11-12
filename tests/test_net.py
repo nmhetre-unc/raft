@@ -419,6 +419,54 @@ def test_server_keeps_reconnect_backoff_under_the_election_timeout(tmp_path: Pat
     asyncio.run(body())
 
 
+def test_sigusr1_writes_stats(tmp_path: Path) -> None:
+    async def body() -> None:
+        (port,) = free_ports(1)
+        cluster = ClusterConfig(nodes={"solo": f"127.0.0.1:{port}"})
+        stop = asyncio.Event()
+        task = asyncio.create_task(
+            run(ServerConfig("solo", cluster, tmp_path / "solo"), stop, stats_on_sigusr1=True)
+        )
+        path = tmp_path / "solo" / "stats.json"
+        deadline = time.monotonic() + 10
+        while not path.exists():
+            assert time.monotonic() < deadline, "no stats.json"
+            os.kill(os.getpid(), signal.SIGUSR1)  # ignored until the server's handler is in
+            await asyncio.sleep(0.05)
+        stop.set()
+        await task
+        stats = json.loads(path.read_text())
+        assert stats["node_id"] == "solo"
+        assert stats["cpu_user_s"] >= 0 and stats["commit_index"] >= 0
+        assert stats["transport"] == {
+            "sent": {},
+            "append_entries_with_entries": 0,
+            "entries_sent": 0,
+            "bytes_encoded": 0,
+            "dropped": 0,
+            "failed": 0,
+        }
+
+    previous = signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+    try:
+        asyncio.run(body())
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
+
+
+@live
+async def test_transport_counts_what_it_sends(cluster: LiveCluster) -> None:
+    leader = await cluster.leader()
+    await cluster.client().put("k", "v")
+    server = cluster.nodes[leader].server
+    assert server is not None
+    stats = server.transport.stats()
+    assert stats["sent"]["AppendEntries"] > 0
+    assert stats["append_entries_with_entries"] > 0
+    assert stats["entries_sent"] >= stats["append_entries_with_entries"]
+    assert stats["bytes_encoded"] > 0
+
+
 # -- main() --
 
 

@@ -319,11 +319,15 @@ class RaftNode:
         # module docstring for why these are never derived from each other.
         self.next_index: dict[str, int] = {}
         self.match_index: dict[str, int] = {}
-        # Leader-only: the last log index included in the most recent
-        # AppendEntries sent to each peer. A success reply confirming
-        # exactly that far, from a peer still behind, means nothing more is
-        # in flight to it, so the next chunk goes out at once.
+        # Leader-only flow control. `_sent_through[peer]` is the last log
+        # index included in the most recent AppendEntries that carried
+        # entries to `peer`, and `_sent_at[peer]` when it was sent. While
+        # that message is unacknowledged (and younger than a heartbeat
+        # interval), it is "in flight": new entries wait, and go out
+        # together in one message when the reply arrives. See
+        # `_in_flight`.
         self._sent_through: dict[str, int] = {}
+        self._sent_at: dict[str, int] = {}
         # The deadline's first real draw is deferred to the first tick()
         # (see there for why): at construction time this node has no idea
         # what "now" actually is, and a restart can happen arbitrarily far
@@ -349,7 +353,7 @@ class RaftNode:
             out.extend(self._start_pre_vote(now) if self.pre_vote else self._start_election(now))
 
         if self.role is Role.LEADER and now >= self._next_heartbeat:
-            out.extend(self._send_append_entries(now))
+            out.extend(self._send_append_entries(now, heartbeat=True))
 
         self._persist_if_dirty()
         self._apply_committed_entries()
@@ -634,17 +638,18 @@ class RaftNode:
                 self.match_index[src] = msg.match_index
                 self.next_index[src] = msg.match_index + 1
                 self._advance_commit_index()
-                # Still behind, and this reply confirms everything we last
-                # sent it: the last message was a capped chunk, not the
-                # whole tail. Send the next chunk now instead of leaving
-                # the peer idle until the next heartbeat. (With replies
-                # still outstanding -- the normal pipelined case under
-                # load -- this stays quiet, so no entry is sent twice.)
+                # This reply confirms everything in flight to the peer. If
+                # it is still behind -- the last message was a capped
+                # chunk, or entries were appended while it was in flight
+                # and held back -- send what's next now, all of it in one
+                # message (up to the caps), instead of waiting for the
+                # next heartbeat.
                 if (
                     msg.match_index >= self._sent_through.get(src, 0)
                     and msg.match_index < self.storage.last_log_index()
                 ):
-                    return [(src, self._build_append_entries_for(src, self.storage.load_log()))]
+                    log = self.storage.load_log()
+                    return [(src, self._build_append_entries_for(src, log, now))]
             return []
 
         # Failure, and (per the checks above) at our current term, not a
@@ -652,7 +657,7 @@ class RaftNode:
         # conflict hint and retry immediately.
         log = self.storage.load_log()
         self.next_index[src] = self._next_index_after_conflict(src, msg, log)
-        return [(src, self._build_append_entries_for(src, log))]
+        return [(src, self._build_append_entries_for(src, log, now))]
 
     def _next_index_after_conflict(
         self, peer: str, msg: AppendEntriesReply, log: list[LogEntry]
@@ -817,6 +822,7 @@ class RaftNode:
         self.next_index = dict.fromkeys(self.peers, last_index + 1)
         self.match_index = dict.fromkeys(self.peers, 0)
         self._sent_through = dict.fromkeys(self.peers, 0)
+        self._sent_at = {}
 
         if self.append_noop_on_election:
             # A leader can only ever commit an entry from its OWN current
@@ -840,8 +846,10 @@ class RaftNode:
 
         return self._send_append_entries(now)  # sent immediately, per Figure 2
 
-    def _send_append_entries(self, now: int) -> list[tuple[str, Message]]:
-        """Send every peer an AppendEntries built from *its own* next_index.
+    def _send_append_entries(
+        self, now: int, *, heartbeat: bool = False
+    ) -> list[tuple[str, Message]]:
+        """Send each peer an AppendEntries built from *its own* next_index.
 
         Each peer gets a distinct message -- not one shared object -- since
         `prev_log_index`/`prev_log_term` anchor the log-matching check at
@@ -850,19 +858,57 @@ class RaftNode:
         `_build_append_entries_for`). A peer already caught up (its
         next_index one past this leader's last entry) simply gets `entries
         = ()`: a heartbeat is nothing more than that case.
+
+        Flow control: a peer with entries in flight (`_in_flight`) is
+        skipped -- its new entries go out when the reply comes back -- or,
+        when this is a `heartbeat`, sent an empty AppendEntries, so it
+        keeps hearing from its leader and learns the commit index. The
+        heartbeat timer restarts only when every peer was sent something.
         """
         log = self.storage.load_log()
-        out: list[tuple[str, Message]] = [
-            (peer, self._build_append_entries_for(peer, log)) for peer in self.peers
-        ]
-        self._next_heartbeat = now + self.heartbeat_interval
+        out: list[tuple[str, Message]] = []
+        for peer in self.peers:
+            if not self._in_flight(peer, now):
+                out.append((peer, self._build_append_entries_for(peer, log, now)))
+            elif heartbeat:
+                out.append((peer, self._build_append_entries_for(peer, log, now, empty=True)))
+        if len(out) == len(self.peers):
+            self._next_heartbeat = now + self.heartbeat_interval
         return out
 
-    def _build_append_entries_for(self, peer: str, log: list[LogEntry]) -> AppendEntries:
+    def _in_flight(self, peer: str, now: int) -> bool:
+        """Whether an AppendEntries carrying entries to `peer` is still
+        awaiting its reply.
+
+        Why holding entries back is safe: flow control only decides *when*
+        an AppendEntries goes out, never what it contains -- every message
+        is still built by `_build_append_entries_for` from next_index, and
+        the follower still runs the full consistency check. Delaying or
+        not sending a message is indistinguishable, to the protocol, from
+        the network delaying or dropping it, which Raft already tolerates;
+        commitment still waits for match_index, which only replies move.
+
+        Why a lost message or reply can't stall the peer: "in flight"
+        expires one heartbeat interval after the send. The next heartbeat
+        after that finds the peer not in flight and re-sends a full chunk
+        from next_index -- so a loss costs at most about two heartbeat
+        intervals, and a dead peer gets at most one chunk per heartbeat,
+        not one per client write.
+        """
+        unacknowledged = self._sent_through.get(peer, 0) > self.match_index[peer]
+        sent_at = self._sent_at.get(peer)
+        return unacknowledged and sent_at is not None and now - sent_at < self.heartbeat_interval
+
+    def _build_append_entries_for(
+        self, peer: str, log: list[LogEntry], now: int, *, empty: bool = False
+    ) -> AppendEntries:
         """Build the AppendEntries `peer` should get right now: entries from
-        its next_index on, capped by count and approximate size."""
+        its next_index on, capped by count and approximate size -- or, with
+        `empty`, none (a heartbeat that leaves what's in flight alone)."""
         prev_log_index = self.next_index[peer] - 1
         end = min(len(log), self.next_index[peer] + self.max_append_entries)
+        if empty:
+            end = self.next_index[peer]
         size = 0
         for index in range(self.next_index[peer], end):
             size += self.entry_size(log[index])
@@ -870,7 +916,9 @@ class RaftNode:
                 end = index  # at least one entry, always
                 break
         entries = tuple(log[self.next_index[peer] : end])
-        self._sent_through[peer] = end - 1
+        if entries:
+            self._sent_through[peer] = end - 1
+            self._sent_at[peer] = now
         return AppendEntries(
             term=self.current_term,
             leader_id=self.node_id,

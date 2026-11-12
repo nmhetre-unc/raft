@@ -27,16 +27,23 @@ everything that matters anyway -- heartbeats repeat, and AppendEntries
 always carries the next chunk from the peer's next_index. An RPC that
 fails (peer down, deadline exceeded) is likewise a lost packet, counted
 in `failed` and otherwise ignored.
+
+`stats()` reports what this node has put on the wire: messages by type,
+how many AppendEntries carried entries and how many entries in all, and
+the encoded bytes -- counted when a message is encoded, so a message then
+dropped on a full queue still counts.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from collections import Counter
+from typing import Any
 
 import grpc
 
-from raft.messages import Message
+from raft.messages import AppendEntries, Message
 from raft.net import raft_pb2 as pb
 from raft.net.codec import encode_message
 from raft.net.raft_pb2_grpc import RaftStub
@@ -74,6 +81,10 @@ class GrpcTransport:
         self.node_id = node_id
         self.dropped = 0
         self.failed = 0
+        self.sent: Counter[str] = Counter()
+        self.append_entries_with_entries = 0
+        self.entries_sent = 0
+        self.bytes_encoded = 0
         self._rpc_timeout = rpc_timeout
         self._queues: dict[str, asyncio.Queue[pb.Envelope]] = {
             peer: asyncio.Queue(maxsize=queue_size) for peer in peers
@@ -88,10 +99,26 @@ class GrpcTransport:
         ]
 
     def send(self, dst: str, message: Message) -> None:
+        envelope = encode_message(message, self.node_id)
+        self.sent[type(message).__name__] += 1
+        self.bytes_encoded += envelope.ByteSize()
+        if isinstance(message, AppendEntries) and message.entries:
+            self.append_entries_with_entries += 1
+            self.entries_sent += len(message.entries)
         try:
-            self._queues[dst].put_nowait(encode_message(message, self.node_id))
+            self._queues[dst].put_nowait(envelope)
         except asyncio.QueueFull:
             self.dropped += 1
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "sent": dict(self.sent),
+            "append_entries_with_entries": self.append_entries_with_entries,
+            "entries_sent": self.entries_sent,
+            "bytes_encoded": self.bytes_encoded,
+            "dropped": self.dropped,
+            "failed": self.failed,
+        }
 
     async def _sender(self, peer: str) -> None:
         stub = RaftStub(self._channels[peer])
