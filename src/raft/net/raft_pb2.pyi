@@ -148,18 +148,26 @@ class SubmitReply(_message.Message):
     lost: Unit
     def __init__(self, ok: _Optional[_Union[Result, _Mapping]] = ..., not_leader: _Optional[_Union[NotLeader, _Mapping]] = ..., timeout: _Optional[_Union[Unit, _Mapping]] = ..., lost: _Optional[_Union[Unit, _Mapping]] = ...) -> None: ...
 
+class StatusRequest(_message.Message):
+    __slots__ = ("include_log",)
+    INCLUDE_LOG_FIELD_NUMBER: _ClassVar[int]
+    include_log: bool
+    def __init__(self, include_log: _Optional[bool] = ...) -> None: ...
+
 class StatusReply(_message.Message):
-    __slots__ = ("node_id", "role", "current_term", "commit_index", "last_applied", "leader_hint")
+    __slots__ = ("node_id", "role", "current_term", "commit_index", "last_applied", "leader_hint", "log")
     NODE_ID_FIELD_NUMBER: _ClassVar[int]
     ROLE_FIELD_NUMBER: _ClassVar[int]
     CURRENT_TERM_FIELD_NUMBER: _ClassVar[int]
     COMMIT_INDEX_FIELD_NUMBER: _ClassVar[int]
     LAST_APPLIED_FIELD_NUMBER: _ClassVar[int]
     LEADER_HINT_FIELD_NUMBER: _ClassVar[int]
+    LOG_FIELD_NUMBER: _ClassVar[int]
     node_id: str
     role: str
     current_term: int
     commit_index: int
     last_applied: int
     leader_hint: str
-    def __init__(self, node_id: _Optional[str] = ..., role: _Optional[str] = ..., current_term: _Optional[int] = ..., commit_index: _Optional[int] = ..., last_applied: _Optional[int] = ..., leader_hint: _Optional[str] = ...) -> None: ...
+    log: _containers.RepeatedCompositeFieldContainer[LogEntry]
+    def __init__(self, node_id: _Optional[str] = ..., role: _Optional[str] = ..., current_term: _Optional[int] = ..., commit_index: _Optional[int] = ..., last_applied: _Optional[int] = ..., leader_hint: _Optional[str] = ..., log: _Optional[_Iterable[_Union[LogEntry, _Mapping]]] = ...) -> None: ...

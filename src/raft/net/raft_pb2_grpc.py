@@ -46,7 +46,7 @@ class RaftStub:
                 _registered_method=True)
         self.Status = channel.unary_unary(
                 '/raft.Raft/Status',
-                request_serializer=raft__pb2.Unit.SerializeToString,
+                request_serializer=raft__pb2.StatusRequest.SerializeToString,
                 response_deserializer=raft__pb2.StatusReply.FromString,
                 _registered_method=True)
 
@@ -87,7 +87,7 @@ def add_RaftServicer_to_server(servicer, server):
             ),
             'Status': grpc.unary_unary_rpc_method_handler(
                     servicer.Status,
-                    request_deserializer=raft__pb2.Unit.FromString,
+                    request_deserializer=raft__pb2.StatusRequest.FromString,
                     response_serializer=raft__pb2.StatusReply.SerializeToString,
             ),
     }
@@ -170,7 +170,7 @@ class Raft:
             request,
             target,
             '/raft.Raft/Status',
-            raft__pb2.Unit.SerializeToString,
+            raft__pb2.StatusRequest.SerializeToString,
             raft__pb2.StatusReply.FromString,
             options,
             channel_credentials,

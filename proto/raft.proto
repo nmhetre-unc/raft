@@ -126,6 +126,11 @@ message SubmitReply {
   }
 }
 
+message StatusRequest {
+  // The full log is for debugging and tests; it can be large.
+  bool include_log = 1;
+}
+
 message StatusReply {
   string node_id = 1;
   string role = 2;
@@ -133,10 +138,14 @@ message StatusReply {
   int64 commit_index = 4;
   int64 last_applied = 5;
   optional string leader_hint = 6;
+  // Only when StatusRequest.include_log is set; index 0 (the sentinel)
+  // is omitted, so log[0] here is entry 1. May include entries not yet
+  // fsynced.
+  repeated LogEntry log = 7;
 }
 
 service Raft {
   rpc Deliver(Envelope) returns (Unit);
   rpc Submit(ClientRequest) returns (SubmitReply);
-  rpc Status(Unit) returns (StatusReply);
+  rpc Status(StatusRequest) returns (StatusReply);
 }
