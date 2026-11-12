@@ -1,6 +1,15 @@
 """`Storage` on disk: what `MemoryStorage` simulates, made real.
 
-A `FileStorage` owns one directory holding two files:
+A `FileStorage` owns one directory holding three files:
+
+``LOCK``
+    Empty. Held with an exclusive, non-blocking ``flock`` from open to
+    `close()`, so a second `FileStorage` on the same directory -- in
+    another process or this one -- raises `StorageError` instead of two
+    writers interleaving records. The kernel drops the lock when the
+    holder exits, however it exits, so a crash never leaves a stale
+    lock behind. The file itself is never deleted: unlinking a lock
+    file another opener may already have open races.
 
 ``state.json``
     ``{"term": int, "voted_for": str | null}``. Never written in place:
@@ -60,6 +69,7 @@ whatever actually reached disk.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import struct
@@ -75,6 +85,7 @@ FsyncMode = Literal["per_write", "deferred"]
 
 STATE_FILE = "state.json"
 LOG_FILE = "log.bin"
+LOCK_FILE = "LOCK"
 
 _LENGTH = struct.Struct("<I")
 _HEADER = struct.Struct("<II")  # length, crc
@@ -140,6 +151,17 @@ def _fsync_dir(directory: Path) -> None:
         os.close(fd)
 
 
+def _lock(path: Path) -> int:
+    """Open `path` and take an exclusive flock on it; return the fd."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        os.close(fd)
+        raise StorageError(f"{path.parent} is already open in another FileStorage") from exc
+    return fd
+
+
 def _load_state(path: Path) -> tuple[int, str | None]:
     try:
         raw = path.read_bytes()
@@ -179,16 +201,20 @@ class FileStorage(Storage):
         self._broken = False
 
         self._dir.mkdir(parents=True, exist_ok=True)
-        self._term, self._voted_for = _load_state(self._dir / STATE_FILE)
-        self._state_dirty = False
-
-        self._fd = os.open(self._dir / LOG_FILE, os.O_RDWR | os.O_CREAT, 0o644)
+        self._lock_fd = _lock(self._dir / LOCK_FILE)
+        self._fd = -1
         try:
+            self._term, self._voted_for = _load_state(self._dir / STATE_FILE)
+            self._state_dirty = False
+            self._fd = os.open(self._dir / LOG_FILE, os.O_RDWR | os.O_CREAT, 0o644)
             self._log, self._ends = self._recover(decode)
+            _fsync_dir(self._dir)  # new files' directory entries
         except BaseException:
-            os.close(self._fd)
+            if self._fd >= 0:
+                os.close(self._fd)
+                self._fd = -1
+            os.close(self._lock_fd)  # releases the lock
             raise
-        _fsync_dir(self._dir)  # log.bin's directory entry, if just created
 
         # The log file as the in-memory log sees it is
         # disk[:self._keep] + self._pending; only self._disk_len bytes are
@@ -293,7 +319,7 @@ class FileStorage(Storage):
             raise
 
     def close(self) -> None:
-        """`sync()`, then release the log file. Idempotent."""
+        """`sync()`, then release the log file and the lock. Idempotent."""
         if self._fd < 0:
             return
         try:
@@ -302,6 +328,7 @@ class FileStorage(Storage):
         finally:
             os.close(self._fd)
             self._fd = -1
+            os.close(self._lock_fd)
 
     def __enter__(self) -> FileStorage:
         return self

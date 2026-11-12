@@ -28,7 +28,7 @@ from hypothesis import strategies as st
 
 from raft.net import raft_pb2 as pb
 from raft.net.codec import decode_log_entry, encode_log_entry
-from raft.net.filestorage import LOG_FILE, STATE_FILE, FileStorage, FsyncMode
+from raft.net.filestorage import LOCK_FILE, LOG_FILE, STATE_FILE, FileStorage, FsyncMode
 from raft.statemachine import Put
 from raft.storage import SENTINEL, LogEntry, MemoryStorage, Storage, StorageError
 
@@ -49,9 +49,11 @@ def open_storage(directory: Path, fsync: FsyncMode = "per_write") -> FileStorage
 
 
 def crash(storage: FileStorage) -> None:
-    """Drop `storage` the way a killed process would: no sync, no flush."""
+    """Drop `storage` the way a killed process would: no sync, no flush,
+    and the kernel releases its lock."""
     os.close(storage._fd)
     storage._fd = -1
+    os.close(storage._lock_fd)
 
 
 def entries(*commands: str, term: int = 1) -> list[LogEntry]:
@@ -200,7 +202,34 @@ def test_state_file_is_replaced_whole(tmp_path: Path) -> None:
     with open_storage(tmp_path) as storage:
         storage.save_term_and_vote(7, None)
         assert json.loads((tmp_path / STATE_FILE).read_text()) == {"term": 7, "voted_for": None}
-        assert sorted(p.name for p in tmp_path.iterdir()) == [LOG_FILE, STATE_FILE]
+        assert sorted(p.name for p in tmp_path.iterdir()) == [LOCK_FILE, LOG_FILE, STATE_FILE]
+
+
+# -- Locking --
+
+
+def test_second_open_of_a_directory_is_refused(tmp_path: Path) -> None:
+    first = open_storage(tmp_path)
+    first.append_entries(entries("a"))
+    with pytest.raises(StorageError, match="already open"):
+        open_storage(tmp_path)
+    first.append_entries(entries("b"))  # the holder is unaffected
+    first.close()
+
+    with open_storage(tmp_path) as second:  # released on close
+        assert second.load_log() == [SENTINEL, *entries("a", "b")]
+
+
+def test_lock_is_released_when_a_crashed_process_exits(tmp_path: Path) -> None:
+    crash(open_storage(tmp_path))
+    open_storage(tmp_path).close()
+
+
+def test_lock_is_released_when_open_fails(tmp_path: Path) -> None:
+    (tmp_path / STATE_FILE).write_bytes(b"{not json")
+    for _ in range(2):  # not "already open" the second time
+        with pytest.raises(StorageError, match="not valid JSON"):
+            open_storage(tmp_path)
 
 
 # -- Torn tails --
