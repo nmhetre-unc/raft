@@ -17,6 +17,8 @@ from raft.messages import (
     AppendEntries,
     AppendEntriesReply,
     Message,
+    PreVote,
+    PreVoteReply,
     RequestVote,
     RequestVoteReply,
 )
@@ -59,6 +61,8 @@ messages: st.SearchStrategy[Message] = st.one_of(
         last_log_term=ints,
     ),
     st.builds(RequestVoteReply, term=ints, vote_granted=st.booleans()),
+    st.builds(PreVote, term=ints, candidate_id=texts, last_log_index=ints, last_log_term=ints),
+    st.builds(PreVoteReply, term=ints, vote_granted=st.booleans()),
     st.builds(
         AppendEntries,
         term=ints,

@@ -76,6 +76,26 @@ class RequestVoteReply(_message.Message):
     vote_granted: bool
     def __init__(self, term: _Optional[int] = ..., vote_granted: _Optional[bool] = ...) -> None: ...
 
+class PreVote(_message.Message):
+    __slots__ = ("term", "candidate_id", "last_log_index", "last_log_term")
+    TERM_FIELD_NUMBER: _ClassVar[int]
+    CANDIDATE_ID_FIELD_NUMBER: _ClassVar[int]
+    LAST_LOG_INDEX_FIELD_NUMBER: _ClassVar[int]
+    LAST_LOG_TERM_FIELD_NUMBER: _ClassVar[int]
+    term: int
+    candidate_id: str
+    last_log_index: int
+    last_log_term: int
+    def __init__(self, term: _Optional[int] = ..., candidate_id: _Optional[str] = ..., last_log_index: _Optional[int] = ..., last_log_term: _Optional[int] = ...) -> None: ...
+
+class PreVoteReply(_message.Message):
+    __slots__ = ("term", "vote_granted")
+    TERM_FIELD_NUMBER: _ClassVar[int]
+    VOTE_GRANTED_FIELD_NUMBER: _ClassVar[int]
+    term: int
+    vote_granted: bool
+    def __init__(self, term: _Optional[int] = ..., vote_granted: _Optional[bool] = ...) -> None: ...
+
 class AppendEntries(_message.Message):
     __slots__ = ("term", "leader_id", "prev_log_index", "prev_log_term", "entries", "leader_commit")
     TERM_FIELD_NUMBER: _ClassVar[int]
@@ -107,18 +127,22 @@ class AppendEntriesReply(_message.Message):
     def __init__(self, term: _Optional[int] = ..., success: _Optional[bool] = ..., match_index: _Optional[int] = ..., conflict_index: _Optional[int] = ..., conflict_term: _Optional[int] = ...) -> None: ...
 
 class Envelope(_message.Message):
-    __slots__ = ("src", "request_vote", "request_vote_reply", "append_entries", "append_entries_reply")
+    __slots__ = ("src", "request_vote", "request_vote_reply", "append_entries", "append_entries_reply", "pre_vote", "pre_vote_reply")
     SRC_FIELD_NUMBER: _ClassVar[int]
     REQUEST_VOTE_FIELD_NUMBER: _ClassVar[int]
     REQUEST_VOTE_REPLY_FIELD_NUMBER: _ClassVar[int]
     APPEND_ENTRIES_FIELD_NUMBER: _ClassVar[int]
     APPEND_ENTRIES_REPLY_FIELD_NUMBER: _ClassVar[int]
+    PRE_VOTE_FIELD_NUMBER: _ClassVar[int]
+    PRE_VOTE_REPLY_FIELD_NUMBER: _ClassVar[int]
     src: str
     request_vote: RequestVote
     request_vote_reply: RequestVoteReply
     append_entries: AppendEntries
     append_entries_reply: AppendEntriesReply
-    def __init__(self, src: _Optional[str] = ..., request_vote: _Optional[_Union[RequestVote, _Mapping]] = ..., request_vote_reply: _Optional[_Union[RequestVoteReply, _Mapping]] = ..., append_entries: _Optional[_Union[AppendEntries, _Mapping]] = ..., append_entries_reply: _Optional[_Union[AppendEntriesReply, _Mapping]] = ...) -> None: ...
+    pre_vote: PreVote
+    pre_vote_reply: PreVoteReply
+    def __init__(self, src: _Optional[str] = ..., request_vote: _Optional[_Union[RequestVote, _Mapping]] = ..., request_vote_reply: _Optional[_Union[RequestVoteReply, _Mapping]] = ..., append_entries: _Optional[_Union[AppendEntries, _Mapping]] = ..., append_entries_reply: _Optional[_Union[AppendEntriesReply, _Mapping]] = ..., pre_vote: _Optional[_Union[PreVote, _Mapping]] = ..., pre_vote_reply: _Optional[_Union[PreVoteReply, _Mapping]] = ...) -> None: ...
 
 class Unit(_message.Message):
     __slots__ = ()

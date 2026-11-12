@@ -11,7 +11,8 @@ milliseconds::
       "nodes": {"n0": "127.0.0.1:7000", "n1": "127.0.0.1:7001", "n2": "127.0.0.1:7002"},
       "election_timeout_ms": [150, 300],
       "heartbeat_ms": 50,
-      "request_timeout_ms": 2000
+      "request_timeout_ms": 2000,
+      "pre_vote": true
     }
 
 The process owns three things: a `NodeDriver`'s `run()` task, a ticker
@@ -79,6 +80,7 @@ class ClusterConfig:
     election_timeout_ms: tuple[int, int] = (150, 300)
     heartbeat_ms: int = 50
     request_timeout_ms: int = 2000
+    pre_vote: bool = True
 
     @classmethod
     def load(cls, path: str | Path) -> ClusterConfig:
@@ -90,6 +92,7 @@ class ClusterConfig:
             election_timeout_ms=(int(lo), int(hi)),
             heartbeat_ms=int(raw.get("heartbeat_ms", defaults.heartbeat_ms)),
             request_timeout_ms=int(raw.get("request_timeout_ms", defaults.request_timeout_ms)),
+            pre_vote=bool(raw.get("pre_vote", defaults.pre_vote)),
         )
 
 
@@ -206,7 +209,15 @@ class RaftServer:
         stack.callback(self.storage.close)  # syncs unless broken; releases the lock
 
         peers = {i: addr for i, addr in cluster.nodes.items() if i != config.node_id}
-        self.transport = GrpcTransport(config.node_id, peers)
+        # Reconnect backoff a third of the minimum election timeout, and
+        # never above the transport's own 50 ms default (see transport.py).
+        backoff_cap = max(1, min(50, cluster.election_timeout_ms[0] // 3))
+        self.transport = GrpcTransport(
+            config.node_id,
+            peers,
+            reconnect_backoff_ms=(min(20, backoff_cap), backoff_cap),
+            min_connect_timeout_ms=min(20, backoff_cap),
+        )
         stack.push_async_callback(self.transport.close)
 
         self.driver = NodeDriver(
@@ -218,6 +229,7 @@ class RaftServer:
             request_timeout=cluster.request_timeout_ms,
             election_timeout_range=cluster.election_timeout_ms,
             heartbeat_interval=cluster.heartbeat_ms,
+            pre_vote=cluster.pre_vote,
         )
         # SO_REUSEPORT off: a second process on this address must fail to
         # bind, not silently share the port.

@@ -251,6 +251,7 @@ class Fuzzer:
         steps: int,
         weights: dict[Action, float] | None = None,
         network_history_depth: int = DEFAULT_HISTORY_DEPTH,
+        pre_vote: bool = False,
     ) -> None:
         if n < 1:
             raise ValueError("n must be >= 1")
@@ -265,6 +266,7 @@ class Fuzzer:
         self.steps = steps
         self.weights = effective_weights
         self._network_history_depth = network_history_depth
+        self.pre_vote = pre_vote
         self.trace: list[TraceEntry] = []
 
         self._rng = random.Random(seed)
@@ -457,7 +459,7 @@ class Fuzzer:
         self.cluster = Cluster(
             n=self.n,
             seed=self.seed,
-            node_factory=raft_node_factory(self.n, self.seed),
+            node_factory=raft_node_factory(self.n, self.seed, pre_vote=self.pre_vote),
             network_history_depth=self._network_history_depth,
         )
         self.trace = []

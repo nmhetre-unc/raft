@@ -75,6 +75,11 @@ from raft.net.raft_pb2_grpc import RaftStub
 from raft.net.verify import NodeLog, acknowledged_puts_committed, committed_prefixes_agree
 
 POLL_INTERVAL = 0.05
+POLL_CHANNEL_OPTIONS = [
+    ("grpc.initial_reconnect_backoff_ms", 20),
+    ("grpc.max_reconnect_backoff_ms", 50),
+    ("grpc.min_reconnect_backoff_ms", 20),
+]
 STARTUP_TIMEOUT = 60.0
 CONVERGE_TIMEOUT = 60.0
 
@@ -99,7 +104,14 @@ class Cluster:
         self.config.write_text(json.dumps({"nodes": self.nodes}))
         self.procs: dict[str, subprocess.Popen[bytes]] = {}
         self._logs: list[IO[bytes]] = []
-        self._channels = {i: grpc.aio.insecure_channel(a) for i, a in self.nodes.items()}
+        # Short reconnect backoff on the measuring side too: with gRPC's
+        # defaults, after a node has been dead for seconds the poller's own
+        # channel sits in backoff for seconds after it restarts, and every
+        # restart measurement would include that delay.
+        self._channels = {
+            i: grpc.aio.insecure_channel(a, options=POLL_CHANNEL_OPTIONS)
+            for i, a in self.nodes.items()
+        }
 
     def start(self, node: str) -> None:
         log = (self.workdir / f"{node}.log").open("ab")
@@ -187,6 +199,9 @@ class Poller:
         # (node, commit index it must reach) once a restart is being watched
         self.catch_up_target: tuple[str, int] | None = None
         self.caught_up_at: float | None = None
+        # (seconds since t0, commit index) of the watched node, every poll
+        # until it catches up: shows whether catch-up is steady or stalled.
+        self.catch_up_trace: list[tuple[float, int]] = []
 
     def _record(self, **event: Any) -> None:
         self.events.append({"t": round(time.monotonic() - self.t0, 4), **event})
@@ -201,6 +216,10 @@ class Poller:
         self.max_commit = max([self.max_commit, *(s.commit_index for s in statuses.values())])
         if self.catch_up_target is not None and self.caught_up_at is None:
             node, target = self.catch_up_target
+            if node in statuses:
+                self.catch_up_trace.append(
+                    (round(time.monotonic() - self.t0, 3), statuses[node].commit_index)
+                )
             if node in statuses and statuses[node].commit_index >= target:
                 self.caught_up_at = time.monotonic()
                 self._record(kind="caught_up", node=node, commit_index=target)
@@ -399,6 +418,7 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
                 if poller.catch_up_target
                 else None,
                 "caught_up": caught_up_at is not None,
+                "catch_up_trace": poller.catch_up_trace,
                 "e_restart_to_catch_up_s": (
                     caught_up_at - restart_at if caught_up_at is not None else None
                 ),

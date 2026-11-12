@@ -1,0 +1,215 @@
+{
+  "name": "fix3b-prevote-run2",
+  "environment": {
+    "cpu_count": 12,
+    "os": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.16 (main, Oct 26 2026, 14:08:45) [Clang 23.1.3 ]",
+    "git": "0fa374b-dirty"
+  },
+  "options": {
+    "nodes": 5,
+    "clients": 16,
+    "duration": 30.0,
+    "fsync": "deferred",
+    "kill_at": 10.0,
+    "restart_at": 20.0,
+    "put_ratio": 0.5,
+    "keys": 100,
+    "seed": 0,
+    "out_dir": "/home/neilm/raft/bench/results",
+    "name": "fix3b-prevote-run2",
+    "keep": false
+  },
+  "summary": {
+    "window": 30.0,
+    "ops": 6727,
+    "ok": 6727,
+    "failed": 0,
+    "puts_ok": 3369,
+    "gets_ok": 3358,
+    "ops_per_sec": 224.23333333333332,
+    "latency_ms": {
+      "p50": 64.22543200005748,
+      "p99": 184.99068299934152,
+      "p99.9": 303.3306180004729
+    },
+    "longest_gap_s": 0.24055350900016492,
+    "longest_gap_at_s": 10.005637528999614,
+    "first_write_after_fault_s": {
+      "kill": 0.243034780999551
+    }
+  },
+  "verification": {
+    "converged": true,
+    "final_view": {
+      "n0": {
+        "role": "follower",
+        "term": 2,
+        "commit": 6744,
+        "applied": 6744,
+        "hint": "n3"
+      },
+      "n1": {
+        "role": "follower",
+        "term": 2,
+        "commit": 6744,
+        "applied": 6744,
+        "hint": "n3"
+      },
+      "n2": {
+        "role": "follower",
+        "term": 2,
+        "commit": 6744,
+        "applied": 6744,
+        "hint": "n3"
+      },
+      "n3": {
+        "role": "leader",
+        "term": 2,
+        "commit": 6744,
+        "applied": 6744,
+        "hint": "n2"
+      },
+      "n4": {
+        "role": "follower",
+        "term": 2,
+        "commit": 6744,
+        "applied": 6744,
+        "hint": "n3"
+      },
+      "alive": [
+        "n0",
+        "n1",
+        "n2",
+        "n3",
+        "n4"
+      ]
+    },
+    "nodes_checked": [
+      "n0",
+      "n1",
+      "n2",
+      "n3",
+      "n4"
+    ],
+    "commit_index": 6744,
+    "acknowledged_puts": 3369,
+    "prefix_problems": [],
+    "ack_problems": []
+  },
+  "events": [
+    {
+      "t": 0.0033,
+      "kind": "term",
+      "node": "n0",
+      "term": 1
+    },
+    {
+      "t": 0.0033,
+      "kind": "term",
+      "node": "n1",
+      "term": 1
+    },
+    {
+      "t": 0.0033,
+      "kind": "term",
+      "node": "n2",
+      "term": 1
+    },
+    {
+      "t": 0.0034,
+      "kind": "term",
+      "node": "n3",
+      "term": 1
+    },
+    {
+      "t": 0.0034,
+      "kind": "term",
+      "node": "n4",
+      "term": 1
+    },
+    {
+      "t": 0.0034,
+      "kind": "leader",
+      "leader": "n2",
+      "term": 1,
+      "same_node": false
+    },
+    {
+      "t": 10.0176,
+      "kind": "kill",
+      "node": "n2"
+    },
+    {
+      "t": 10.2343,
+      "kind": "term",
+      "node": "n0",
+      "term": 2
+    },
+    {
+      "t": 10.2343,
+      "kind": "term",
+      "node": "n1",
+      "term": 2
+    },
+    {
+      "t": 10.2343,
+      "kind": "term",
+      "node": "n3",
+      "term": 2
+    },
+    {
+      "t": 10.2343,
+      "kind": "term",
+      "node": "n4",
+      "term": 2
+    },
+    {
+      "t": 10.2344,
+      "kind": "leader",
+      "leader": "n3",
+      "term": 2,
+      "same_node": false
+    },
+    {
+      "t": 20.0167,
+      "kind": "restart",
+      "node": "n2"
+    },
+    {
+      "t": 20.3329,
+      "kind": "term",
+      "node": "n2",
+      "term": 2
+    },
+    {
+      "t": 20.3329,
+      "kind": "caught_up",
+      "node": "n2",
+      "commit_index": 4649
+    }
+  ],
+  "failover": {
+    "killed": "n2",
+    "kill_at": 10.008185233999939,
+    "new_leader": "n3",
+    "a_kill_to_new_leader_s": 0.22621476600006218,
+    "b_kill_to_first_write_s": 0.243034780999551
+  },
+  "restart": {
+    "restart_at": 20.016035939000176,
+    "catch_up_target_commit": 4649,
+    "caught_up": true,
+    "catch_up_trace": [
+      [
+        20.333,
+        4665
+      ]
+    ],
+    "e_restart_to_catch_up_s": 0.316865697999674,
+    "c_elections_after_restart": 0,
+    "d_longest_write_stall_s": 0.09081548499943892,
+    "d_stall_starts_at": 20.23172136500034
+  },
+  "history": "fix3b-prevote-run2.history.jsonl"
+}

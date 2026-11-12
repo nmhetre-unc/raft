@@ -388,6 +388,37 @@ def test_transport_rejects_empty_queue() -> None:
         GrpcTransport("n0", {}, queue_size=0)
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"reconnect_backoff_ms": (0, 50)},
+        {"reconnect_backoff_ms": (60, 50)},
+        {"min_connect_timeout_ms": 0},
+    ],
+)
+def test_transport_rejects_bad_backoff(kwargs: dict[str, Any]) -> None:
+    with pytest.raises(ValueError, match="initial backoff"):
+        GrpcTransport("n0", {}, **kwargs)
+
+
+def test_server_keeps_reconnect_backoff_under_the_election_timeout(tmp_path: Path) -> None:
+    async def body() -> None:
+        (port,) = free_ports(1)
+        cluster = ClusterConfig(nodes={"solo": f"127.0.0.1:{port}"}, election_timeout_ms=(90, 180))
+        server = RaftServer(ServerConfig("solo", cluster, tmp_path / "solo"))
+        await server.start()
+        try:
+            assert dict(server.transport.channel_options) == {
+                "grpc.initial_reconnect_backoff_ms": 20,
+                "grpc.max_reconnect_backoff_ms": 30,
+                "grpc.min_reconnect_backoff_ms": 20,
+            }
+        finally:
+            await server.stop()
+
+    asyncio.run(body())
+
+
 # -- main() --
 
 

@@ -66,6 +66,20 @@ message RequestVoteReply {
   bool vote_granted = 2;
 }
 
+// PreVote (thesis section 9.6): `term` is the term the sender would
+// campaign in, never adopted by the receiver.
+message PreVote {
+  int64 term = 1;
+  string candidate_id = 2;
+  int64 last_log_index = 3;
+  int64 last_log_term = 4;
+}
+
+message PreVoteReply {
+  int64 term = 1;
+  bool vote_granted = 2;
+}
+
 message AppendEntries {
   int64 term = 1;
   string leader_id = 2;
@@ -96,6 +110,8 @@ message Envelope {
     RequestVoteReply request_vote_reply = 3;
     AppendEntries append_entries = 4;
     AppendEntriesReply append_entries_reply = 5;
+    PreVote pre_vote = 6;
+    PreVoteReply pre_vote_reply = 7;
   }
 }
 

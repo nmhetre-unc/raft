@@ -7,6 +7,17 @@ produces, so it travels back as its own ``Deliver`` -- never as the
 response to the one that prompted it. That keeps the wire shape exactly
 the shape `RaftNode` already has: `(dst, message)` pairs, nothing more.
 
+Reconnect backoff is kept far below the election timeout. gRPC's
+defaults (1 s initial, growing to 120 s) mean that once a peer has been
+down for a few seconds, the channel to it may sit in backoff for seconds
+after the peer comes back -- and a node that hears nothing from the
+leader for longer than its election timeout starts an election. That
+was the restart election storm the benchmark measured (see BUGS.md):
+the restarted node kept timing out and bumping the term while the
+leader's channel to it was still waiting to retry. With backoff capped
+well under the minimum election timeout, the leader reaches a restarted
+peer within one heartbeat or two of it listening again.
+
 `send()` never blocks and never raises, as `Transport` requires. It
 encodes the message and drops it on the peer's bounded queue; one sender
 task per peer drains that queue, one RPC at a time. When a queue is full
@@ -41,10 +52,25 @@ class GrpcTransport:
         *,
         queue_size: int = 256,
         rpc_timeout: float = 0.5,
+        reconnect_backoff_ms: tuple[int, int] = (20, 50),
+        min_connect_timeout_ms: int = 20,
     ) -> None:
-        """`peers` maps each peer's node id to its ``host:port``."""
+        """`peers` maps each peer's node id to its ``host:port``.
+
+        `reconnect_backoff_ms` is gRPC's (initial, max) reconnect backoff
+        and `min_connect_timeout_ms` its minimum connect timeout; keep all
+        of them well under the minimum election timeout.
+        """
         if queue_size < 1:
             raise ValueError("queue_size must be positive")
+        initial_backoff, max_backoff = reconnect_backoff_ms
+        if not 0 < initial_backoff <= max_backoff or min_connect_timeout_ms <= 0:
+            raise ValueError("need 0 < initial backoff <= max backoff, connect timeout > 0")
+        self.channel_options = [
+            ("grpc.initial_reconnect_backoff_ms", initial_backoff),
+            ("grpc.max_reconnect_backoff_ms", max_backoff),
+            ("grpc.min_reconnect_backoff_ms", min_connect_timeout_ms),
+        ]
         self.node_id = node_id
         self.dropped = 0
         self.failed = 0
@@ -52,7 +78,10 @@ class GrpcTransport:
         self._queues: dict[str, asyncio.Queue[pb.Envelope]] = {
             peer: asyncio.Queue(maxsize=queue_size) for peer in peers
         }
-        self._channels = {peer: grpc.aio.insecure_channel(addr) for peer, addr in peers.items()}
+        self._channels = {
+            peer: grpc.aio.insecure_channel(addr, options=self.channel_options)
+            for peer, addr in peers.items()
+        }
         self._tasks = [
             asyncio.create_task(self._sender(peer), name=f"send-{node_id}-to-{peer}")
             for peer in peers

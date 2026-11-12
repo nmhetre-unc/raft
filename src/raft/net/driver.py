@@ -156,6 +156,7 @@ class NodeDriver:
         election_timeout_range: tuple[int, int] = (150, 300),
         heartbeat_interval: int = 50,
         rng: Random | None = None,
+        pre_vote: bool = True,
     ) -> None:
         if request_timeout <= 0:
             raise ValueError("request_timeout must be positive")
@@ -167,6 +168,7 @@ class NodeDriver:
             heartbeat_interval=heartbeat_interval,
             rng=rng,
             append_noop_on_election=True,
+            pre_vote=pre_vote,
         )
         self._storage = storage
         self._transport = transport

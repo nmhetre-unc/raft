@@ -28,6 +28,8 @@ from raft.messages import (
     AppendEntries,
     AppendEntriesReply,
     Message,
+    PreVote,
+    PreVoteReply,
     RequestVote,
     RequestVoteReply,
 )
@@ -155,6 +157,20 @@ def encode_message(msg: Message, src: str) -> pb.Envelope:
                 conflict_term=msg.conflict_term,
             ),
         )
+    if isinstance(msg, PreVote):
+        return pb.Envelope(
+            src=src,
+            pre_vote=pb.PreVote(
+                term=msg.term,
+                candidate_id=msg.candidate_id,
+                last_log_index=msg.last_log_index,
+                last_log_term=msg.last_log_term,
+            ),
+        )
+    if isinstance(msg, PreVoteReply):
+        return pb.Envelope(
+            src=src, pre_vote_reply=pb.PreVoteReply(term=msg.term, vote_granted=msg.vote_granted)
+        )
     raise TypeError(f"not a Message: {msg!r}")
 
 
@@ -192,6 +208,17 @@ def decode_envelope(env: pb.Envelope) -> tuple[str, Message]:
             conflict_index=aer.conflict_index,
             conflict_term=aer.conflict_term,
         )
+    elif kind == "pre_vote":
+        pv = env.pre_vote
+        msg = PreVote(
+            term=pv.term,
+            candidate_id=pv.candidate_id,
+            last_log_index=pv.last_log_index,
+            last_log_term=pv.last_log_term,
+        )
+    elif kind == "pre_vote_reply":
+        pvr = env.pre_vote_reply
+        msg = PreVoteReply(term=pvr.term, vote_granted=pvr.vote_granted)
     else:
         raise CodecError("Envelope has no message set")
     return env.src, msg

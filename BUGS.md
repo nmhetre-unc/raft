@@ -550,5 +550,67 @@ still gates every append. It always makes progress because the leader's term
 at the rejected index must be newer than T, so all its term-T entries lie
 before it. A delayed failure reply can no longer push `next_index` below
 `match_index + 1`. After the fix the restarted node caught up in all 3 runs,
-in 4.3-6.1 s, finishing 0.1-0.16 s after the last election of the restart
-storm. The remaining seconds are that storm, a separate bug.
+in 4.9-6.2 s. The remaining seconds are the restart election storm, a
+separate bug (next entry).
+
+(Correction: this entry first reported 4.3-6.1 s, finishing 0.1-0.16 s after
+the storm. Those numbers came from a bench whose own Status poller used gRPC's
+default reconnect backoff, so it couldn't see the restarted node for seconds
+after it came up. The poller now uses short backoff, and the figures above are
+re-measured with it on the same Fix-1 code.)
+
+## Restarting a node set off an election storm against a healthy leader
+
+Found by: `bench/cluster_bench.py` leader-kill runs, column (c), once Fix 1
+let the restarted node catch up at all. Regression tests:
+`tests/test_prevote.py`, `tests/test_net.py::test_server_keeps_reconnect_backoff_under_the_election_timeout`.
+
+**Symptom.** After the killed leader was restarted, the cluster went through
+20-26 elections in the next 5-6 seconds, and the restarted node took that long
+to catch up. Every one of those elections made the healthy leader step down
+and win again. Writes kept flowing (stalls of 56-166 ms), but the restarted
+node didn't catch up until the storm ended.
+
+**Root cause.** Two things together:
+
+1. *Transport.* gRPC's default reconnect backoff starts at 1 s and grows.
+   While the old leader was dead for 10 s, every other node's channel to it
+   backed off further and further, so after it restarted the current leader
+   could not reach it for seconds.
+2. *Protocol.* A node that hears no AppendEntries for one election timeout
+   increments its term and campaigns. The restarted node did exactly that,
+   every 150-300 ms. It could never win (its log was behind), but its
+   RequestVote carried a higher term, and every node that received one,
+   leader included, adopted that term and stepped down.
+
+**Why the simulator missed it.** The simulator has no transport: a message to
+a node that has just restarted is delivered as soon as it is sent. Nothing
+models a sender that can't reach a peer that is up. The protocol half (a node
+cut off from the leader disrupts it on return) *is* reproducible in the
+simulator by partitioning one node, and now is:
+`test_partitioned_node_rejoining_does_not_disrupt_a_stable_leader` fails its
+control case (PreVote off) exactly this way. The fuzzer never flagged it
+because it is not a safety violation, and the cluster does converge
+eventually.
+
+**Fix (a): transport.** `GrpcTransport` sets reconnect backoff to 20 ms
+initial, 50 ms max, 20 ms minimum connect timeout. The server caps them at a
+third of the minimum election timeout. The leader now reaches a restarted
+peer within a heartbeat or two. On its own this ended the storm: 0 elections
+after restart in 3 of 3 runs, catch-up 229-276 ms, mostly the server process
+starting.
+
+**Fix (b): PreVote** (Ongaro's thesis, section 9.6). On by default in the
+server, off by default in `RaftNode`, so the simulator's pinned mutation counts
+keep measuring the same protocol. Both fuzz sweeps run both modes. On an
+election timeout a node first sends `PreVote` for its term + 1 without
+changing any state. A voter grants only if that term is newer than its own,
+it is not the leader, it has not accepted an AppendEntries from a current
+leader within the minimum election timeout, and the candidate's log is at
+least as up-to-date as its own. Only a majority of grants starts a real
+election. This covers the cases backoff can't, such as a genuine partition:
+in the simulator, a node cut off for 3 s rejoins with its term unchanged and
+the leader keeps its term. In the leader-kill bench, where backoff had
+already removed the storm, PreVote changed nothing measurable (0 elections,
+catch-up 246-317 ms). It adds one round trip before each real election, which
+is within noise in kill-to-leader time.

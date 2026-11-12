@@ -96,4 +96,32 @@ class AppendEntriesReply:
     conflict_term: int = 0
 
 
-Message = RequestVote | RequestVoteReply | AppendEntries | AppendEntriesReply
+@dataclass(frozen=True)
+class PreVote:
+    """Asks whether a real election would succeed, before starting one
+    (Ongaro's thesis, section 9.6).
+
+    `term` is the term the sender *would* campaign in -- its current term
+    plus one -- not one it holds. A receiver never adopts it, never
+    records a vote for it, and never resets a timer because of it: a
+    pre-vote changes no state anywhere.
+    """
+
+    term: int
+    candidate_id: str
+    last_log_index: int
+    last_log_term: int
+
+
+@dataclass(frozen=True)
+class PreVoteReply:
+    """A response to `PreVote`. `term` is the voter's real current term,
+    so a pre-candidate that's behind learns the newer term from it."""
+
+    term: int
+    vote_granted: bool
+
+
+Message = (
+    RequestVote | RequestVoteReply | AppendEntries | AppendEntriesReply | PreVote | PreVoteReply
+)

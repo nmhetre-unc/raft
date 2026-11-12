@@ -165,6 +165,8 @@ from raft.messages import (
     AppendEntries,
     AppendEntriesReply,
     Message,
+    PreVote,
+    PreVoteReply,
     RequestVote,
     RequestVoteReply,
 )
@@ -231,6 +233,7 @@ class RaftNode:
         heartbeat_interval: int = 50,
         rng: random.Random | None = None,
         append_noop_on_election: bool = False,
+        pre_vote: bool = False,
     ) -> None:
         lo, hi = election_timeout_range
         if lo <= 0 or hi < lo:
@@ -250,6 +253,10 @@ class RaftNode:
         # a leader with nothing at its own current term can never commit
         # anything at all, including entries inherited from earlier terms.
         self.append_noop_on_election = append_noop_on_election
+        # PreVote (Ongaro's thesis, section 9.6): on an election timeout,
+        # first ask whether a majority *would* vote, without touching the
+        # term; campaign for real only if so. See _start_pre_vote.
+        self.pre_vote = pre_vote
 
         # Persistent state -- loaded now, written back by _persist_if_dirty().
         self.current_term, self.voted_for = storage.load_term_and_vote()
@@ -266,6 +273,12 @@ class RaftNode:
         # since either is a more useful guess than nothing.
         self.leader_hint: str | None = None
         self.votes_received: set[str] = set()
+        # PreVote round state, volatile. `_last_leader_contact` is when this
+        # node last accepted an AppendEntries from a current leader; a voter
+        # refuses pre-votes for one minimum election timeout after that.
+        self.pre_voting = False
+        self.pre_votes_received: set[str] = set()
+        self._last_leader_contact: int | None = None
         self.election_deadline: int = 0
         self._next_heartbeat: int = 0
         # The highest index this node believes is committed, and the
@@ -300,7 +313,7 @@ class RaftNode:
         out: list[tuple[str, Message]] = []
 
         if self.role in (Role.FOLLOWER, Role.CANDIDATE) and now >= self.election_deadline:
-            out.extend(self._start_election(now))
+            out.extend(self._start_pre_vote(now) if self.pre_vote else self._start_election(now))
 
         if self.role is Role.LEADER and now >= self._next_heartbeat:
             out.extend(self._send_append_entries(now))
@@ -311,10 +324,15 @@ class RaftNode:
 
     def handle(self, msg: Message, src: str, now: int) -> list[tuple[str, Message]]:
         """Called with one incoming message, addressed to this node, from `src`."""
-        self._maybe_adopt_newer_term(msg.term)
+        if not isinstance(msg, PreVote):  # a PreVote's term is hypothetical
+            self._maybe_adopt_newer_term(msg.term)
         self._maybe_update_leader_hint(msg)
 
-        if isinstance(msg, RequestVote):
+        if isinstance(msg, PreVote):
+            out = self._handle_pre_vote(msg, src, now)
+        elif isinstance(msg, PreVoteReply):
+            out = self._handle_pre_vote_reply(msg, src, now)
+        elif isinstance(msg, RequestVote):
             out = self._handle_request_vote(msg, src, now)
         elif isinstance(msg, RequestVoteReply):
             out = self._handle_request_vote_reply(msg, src, now)
@@ -336,6 +354,7 @@ class RaftNode:
             self.current_term = term
             self.voted_for = None
             self.role = Role.FOLLOWER
+            self.pre_voting = False
             self._dirty = True
 
     def _maybe_update_leader_hint(self, msg: Message) -> None:
@@ -378,7 +397,7 @@ class RaftNode:
 
         return [(src, RequestVoteReply(term=self.current_term, vote_granted=grant))]
 
-    def _challenger_log_is_current(self, msg: RequestVote) -> bool:
+    def _challenger_log_is_current(self, msg: RequestVote | PreVote) -> bool:
         """Figure 2's up-to-date check: compare last_log_term, then last_log_index."""
         our_term = self.storage.last_log_term()
         if msg.last_log_term != our_term:
@@ -400,6 +419,77 @@ class RaftNode:
             return []
         return self._become_leader(now)
 
+    # -- PreVote (Ongaro's thesis, section 9.6) --
+
+    def _start_pre_vote(self, now: int) -> list[tuple[str, Message]]:
+        """Ask every peer whether it would vote for this node in the next
+        term, changing nothing: not the term, not `voted_for`, not the
+        role. A majority of grants starts a real election
+        (`_handle_pre_vote_reply`); anything less leaves this node exactly
+        as it was, to try again at its next election timeout.
+
+        This is what stops a node that was cut off -- and has been timing
+        out the whole time -- from rejoining with an inflated term and
+        forcing a healthy leader to step down.
+        """
+        self._reset_election_deadline(now)
+        self.pre_voting = True
+        self.pre_votes_received = {self.node_id}
+        if self._is_majority(self.pre_votes_received):  # a single-node cluster
+            self.pre_voting = False
+            return self._start_election(now)
+        request = PreVote(
+            term=self.current_term + 1,
+            candidate_id=self.node_id,
+            last_log_index=self.storage.last_log_index(),
+            last_log_term=self.storage.last_log_term(),
+        )
+        return [(peer, request) for peer in self.peers]
+
+    def _handle_pre_vote(self, msg: PreVote, src: str, now: int) -> list[tuple[str, Message]]:
+        """Grant iff a real RequestVote for `msg.term` could be granted
+        here AND this node has no reason to think a leader is alive.
+
+        - `msg.term > current_term`: otherwise the candidate's election
+          term is one this node has already reached; the reply's term
+          tells it so.
+        - the candidate's log is at least as up-to-date as this one --
+          the same Figure 2 check a real vote applies.
+        - this node is not the leader, and hasn't accepted an
+          AppendEntries from a current leader within the minimum election
+          timeout: a follower still hearing from a leader has no reason
+          to help replace it.
+
+        Granting records nothing: no `voted_for`, no timer reset, no term
+        change. A pre-vote promises nothing about the real vote.
+        """
+        grant = (
+            msg.term > self.current_term
+            and self.role is not Role.LEADER
+            and not self._heard_from_leader_recently(now)
+            and self._challenger_log_is_current(msg)
+        )
+        return [(src, PreVoteReply(term=self.current_term, vote_granted=grant))]
+
+    def _heard_from_leader_recently(self, now: int) -> bool:
+        return (
+            self._last_leader_contact is not None
+            and now - self._last_leader_contact < self.election_timeout_range[0]
+        )
+
+    def _handle_pre_vote_reply(
+        self, msg: PreVoteReply, src: str, now: int
+    ) -> list[tuple[str, Message]]:
+        # A reply carrying a newer term has already been adopted above,
+        # which ended the round; anything else outside a round is stale.
+        if not self.pre_voting or not msg.vote_granted:
+            return []
+        self.pre_votes_received.add(src)
+        if not self._is_majority(self.pre_votes_received):
+            return []
+        self.pre_voting = False
+        return self._start_election(now)
+
     # -- AppendEntries (Figure 2's receiver implementation, commit tracking included) --
 
     def _handle_append_entries(
@@ -411,6 +501,8 @@ class RaftNode:
 
         self.role = Role.FOLLOWER
         self.leader_id = msg.leader_id
+        self.pre_voting = False
+        self._last_leader_contact = now
         self._reset_election_deadline(now)
 
         log = self.storage.load_log()
@@ -762,8 +854,11 @@ class RaftNode:
         return out
 
     def _has_majority(self) -> bool:
+        return self._is_majority(self.votes_received)
+
+    def _is_majority(self, voters: set[str]) -> bool:
         cluster_size = len(self.peers) + 1  # +1 for this node
-        return len(self.votes_received) * 2 > cluster_size
+        return len(voters) * 2 > cluster_size
 
     # -- Shared bookkeeping --
 
@@ -878,6 +973,7 @@ def raft_node_factory(
     election_timeout_range: tuple[int, int] = (150, 300),
     heartbeat_interval: int = 50,
     append_noop_on_election: bool = False,
+    pre_vote: bool = False,
 ) -> Callable[[int, Storage], RaftClusterNode]:
     """Build a `Cluster`-compatible `node_factory` that produces `RaftNode`s.
 
@@ -910,6 +1006,7 @@ def raft_node_factory(
             heartbeat_interval=heartbeat_interval,
             rng=random.Random(node_seeds[name]),
             append_noop_on_election=append_noop_on_election,
+            pre_vote=pre_vote,
         )
         return RaftClusterNode(raft_node)
 
