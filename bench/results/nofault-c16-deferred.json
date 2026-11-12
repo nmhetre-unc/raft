@@ -1,0 +1,138 @@
+{
+  "name": "nofault-c16-deferred",
+  "environment": {
+    "cpu_count": 12,
+    "os": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.16 (main, Oct 26 2026, 14:08:45) [Clang 23.1.3 ]",
+    "git": "9bfdd89"
+  },
+  "options": {
+    "nodes": 5,
+    "clients": 16,
+    "duration": 20.0,
+    "fsync": "deferred",
+    "kill_at": null,
+    "restart_at": null,
+    "put_ratio": 0.5,
+    "keys": 100,
+    "seed": 0,
+    "out_dir": "/home/neilm/raft/bench/results",
+    "name": "nofault-c16-deferred",
+    "keep": false
+  },
+  "summary": {
+    "window": 20.0,
+    "ops": 5575,
+    "ok": 5575,
+    "failed": 0,
+    "puts_ok": 2785,
+    "gets_ok": 2790,
+    "ops_per_sec": 278.75,
+    "latency_ms": {
+      "p50": 52.03179000000091,
+      "p99": 109.94007399949624,
+      "p99.9": 127.60644700028934
+    },
+    "longest_gap_s": 0.023405775999890466,
+    "longest_gap_at_s": 0.0,
+    "first_write_after_fault_s": {}
+  },
+  "verification": {
+    "converged": true,
+    "final_view": {
+      "n0": {
+        "role": "follower",
+        "term": 1,
+        "commit": 5576,
+        "applied": 5576,
+        "hint": "n2"
+      },
+      "n1": {
+        "role": "follower",
+        "term": 1,
+        "commit": 5576,
+        "applied": 5576,
+        "hint": "n2"
+      },
+      "n2": {
+        "role": "leader",
+        "term": 1,
+        "commit": 5576,
+        "applied": 5576,
+        "hint": ""
+      },
+      "n3": {
+        "role": "follower",
+        "term": 1,
+        "commit": 5576,
+        "applied": 5576,
+        "hint": "n2"
+      },
+      "n4": {
+        "role": "follower",
+        "term": 1,
+        "commit": 5576,
+        "applied": 5576,
+        "hint": "n2"
+      },
+      "alive": [
+        "n0",
+        "n1",
+        "n2",
+        "n3",
+        "n4"
+      ]
+    },
+    "nodes_checked": [
+      "n0",
+      "n1",
+      "n2",
+      "n3",
+      "n4"
+    ],
+    "commit_index": 5576,
+    "acknowledged_puts": 2785,
+    "prefix_problems": [],
+    "ack_problems": []
+  },
+  "events": [
+    {
+      "t": 0.0036,
+      "kind": "term",
+      "node": "n0",
+      "term": 1
+    },
+    {
+      "t": 0.0036,
+      "kind": "term",
+      "node": "n1",
+      "term": 1
+    },
+    {
+      "t": 0.0037,
+      "kind": "term",
+      "node": "n2",
+      "term": 1
+    },
+    {
+      "t": 0.0037,
+      "kind": "term",
+      "node": "n3",
+      "term": 1
+    },
+    {
+      "t": 0.0037,
+      "kind": "term",
+      "node": "n4",
+      "term": 1
+    },
+    {
+      "t": 0.0037,
+      "kind": "leader",
+      "leader": "n2",
+      "term": 1,
+      "same_node": false
+    }
+  ],
+  "history": "nofault-c16-deferred.history.jsonl"
+}
