@@ -528,8 +528,7 @@ def test_mutation_match_index_advances_on_failure_is_detected(
             return []
 
         self.next_index[src] = max(1, self.next_index[src] - 1)
-        log = self.storage.load_log()
-        return [(src, self._build_append_entries_for(src, log, now))]
+        return [(src, self._build_append_entries_for(src, now))]
 
     monkeypatch.setattr(RaftNode, "_handle_append_entries_reply", mutated)
 

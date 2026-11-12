@@ -739,3 +739,72 @@ Five mutation-detection tests had their pinned counts shift (all mutations still
 fewer resends change which seeds reach each precondition; each test records
 the old and new count. `test_every_send_happens_after_sync` now expects 2
 messages for a burst of 5 instead of 10.
+
+## Throughput fell with uptime: every message copied the whole log
+
+Found by: the 300 s no-fault bench (16 clients, deferred fsync) with the
+leader's stats sampled every 20 s (`--stats-every`). FileStorage now counts
+`load_log()` calls, entries copied and time spent, and reports them in the
+SIGUSR1 stats. Regression tests: `tests/test_log_reads.py`, the new reads in
+`tests/test_storage.py`, and the read operations in `tests/test_filestorage.py`'s
+model test.
+
+**Symptom.** Throughput fell steadily as the log grew: 842 committed
+entries/s in the first 20 s (log 17k), 354 at 52k, and 165 at 94k. The
+leader's event loop stayed at 100%. By the end, `load_log()` was 38% of wall
+time and copied about 400,000 entries per committed entry. That 38% counts
+only the copying itself, not freeing the copy or the callers' work on it. The
+short benches understated all this, because each started with an empty log:
+the 891 ops/s reported for flow control was the average of a rate already
+falling.
+
+**Root cause.** `Storage` had one way to read the log, `load_log()`, which
+returns a copy of the whole log. `RaftNode` called it on every per-message
+path:
+
+- building each AppendEntries;
+- the follower's consistency check;
+- every apply;
+- every commit-index check;
+- every reply that triggered a send.
+
+The driver called it too, to check each resolved client request's term. So
+each message cost time proportional to everything ever committed. Two loops
+were also linear in a run of one term, which can be most of the log:
+
+- the follower's walk back to the start of the conflicting term's run, in
+  `_conflict_reply`;
+- the leader's backward scan for its last entry of the conflict term, in
+  `_next_index_after_conflict`.
+
+**Why the simulator missed it.** Its logs stay short (at most a few dozen
+entries in the fuzzer, 5,000 in the catch-up test), and a copy costs no
+simulated time. Correctness never depended on it.
+
+**Fix.** `Storage` gains bounded reads that cost the same whatever the log's
+length:
+
+- `entry_at(index)` and `term_at(index)`, which raise IndexError out of
+  range, including for negative indexes, which a Python list would silently
+  count from the end;
+- `entries_from(start, max_count)`, a copy of only the requested slice.
+
+Both `MemoryStorage` and `FileStorage` implement them. Every per-message path
+in `RaftNode`, and the driver's waiter check, now uses them. Both conflict
+searches are binary searches; that is valid because terms never decrease
+along a Raft log, which the old scan already relied on. `load_log()` stays
+for callers that need a full copy: tests, the fuzzer's checks, and Status
+with `include_log`. Nothing in the node's behaviour changed: every existing
+test, including the pinned mutation-detection counts, passed unchanged.
+
+Results (same 300 s bench):
+
+- **Throughput:** flat at 1,000-1,130 entries/s from a 22k-entry log to a
+  286k-entry one, with `load_log()` at 0 calls on the hot path. Overall
+  1,024 ops/s, against 325; p99 25 ms, against 130 ms.
+- **Not explained yet:** a dip to 869-895 entries/s at 200-240 s, which then
+  recovered to 1,082 by 280 s and so is not tied to log length. Also one
+  229 ms write gap at t=294 s (p99.9 is 47 ms).
+- **Leader-kill bench:** 0 elections after restart, catch-up at the same
+  per-entry rate as before, verify passed.
+- **Large-gap reproduction:** still catches up (0.26-0.31 s).

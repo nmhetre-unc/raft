@@ -307,6 +307,12 @@ class RaftServer:
             "cpu_user_s": times.user,
             "cpu_system_s": times.system,
             "transport": self.transport.stats(),
+            "storage": {
+                "log_length": self.storage.last_log_index(),
+                "load_log_calls": self.storage.load_log_calls,
+                "load_log_entries": self.storage.load_log_entries,
+                "load_log_seconds": self.storage.load_log_seconds,
+            },
         }
         path = self.config.data_dir / "stats.json"
         tmp = path.with_suffix(".tmp")

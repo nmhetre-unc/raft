@@ -85,6 +85,7 @@ from raft.net.verify import NodeLog, acknowledged_puts_committed, committed_pref
 
 POLL_INTERVAL = 0.05
 POLL_CHANNEL_OPTIONS = [
+    ("grpc.max_receive_message_length", -1),  # the final Status carries whole logs
     ("grpc.initial_reconnect_backoff_ms", 20),
     ("grpc.max_reconnect_backoff_ms", 50),
     ("grpc.min_reconnect_backoff_ms", 20),
@@ -390,6 +391,43 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
         await poller.poll_once()
         poll_task = asyncio.create_task(poller.run())
 
+        timeline: list[dict[str, Any]] = []
+
+        async def sample_leader() -> None:
+            """Every --stats-every seconds, one bucket of leader stats."""
+            previous = stats_start
+            while True:
+                await asyncio.sleep(args.stats_every)
+                current = await cluster.leader_stats(load_leader)
+                dt = current["monotonic"] - previous["monotonic"]
+                ps, cs = previous["storage"], current["storage"]
+                committed = current["commit_index"] - previous["commit_index"]
+                cpu = (current["cpu_user_s"] + current["cpu_system_s"]) - (
+                    previous["cpu_user_s"] + previous["cpu_system_s"]
+                )
+                timeline.append(
+                    {
+                        "t_end_s": round(current["monotonic"] - t0, 2),
+                        "log_length": cs["log_length"],
+                        "committed_per_s": committed / dt,
+                        "leader_cpu_percent": 100 * cpu / dt,
+                        "load_log_percent_of_wall": 100
+                        * (cs["load_log_seconds"] - ps["load_log_seconds"])
+                        / dt,
+                        "load_log_calls_per_entry": (cs["load_log_calls"] - ps["load_log_calls"])
+                        / max(committed, 1),
+                        "entries_copied_per_entry": (
+                            cs["load_log_entries"] - ps["load_log_entries"]
+                        )
+                        / max(committed, 1),
+                    }
+                )
+                previous = current
+
+        sampler = (
+            asyncio.create_task(sample_leader()) if args.stats_every and not args.kill_at else None
+        )
+
         faults: list[Fault] = []
         restart_info: dict[str, Any] = {}
 
@@ -434,7 +472,11 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
             seed=args.seed,
         )
         load_end = t0 + args.duration
-        resources: dict[str, Any] = {}
+        if sampler is not None:
+            sampler.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sampler
+        resources: dict[str, Any] = {"timeline": timeline}
         if not args.kill_at:
             stats_end = await cluster.leader_stats(load_leader)
             wall = stats_end["monotonic"] - stats_start["monotonic"]
@@ -450,7 +492,7 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
                 "AppendEntries", 0
             )
             per_entry = max(committed, 1)
-            resources = {
+            resources |= {
                 "leader": load_leader,
                 "wall_s": wall,
                 "cpu_percent": {n: 100 * c / wall for n, c in cpu.items()},
@@ -578,7 +620,7 @@ def report(name: str, result: dict[str, Any]) -> None:
             f"(d) longest write stall {fmt(r['d_longest_write_stall_s'], 1000, 0)} ms"
         )
     res = result.get("resources")
-    if res:
+    if res and "cpu_percent" in res:
         cpu = "  ".join(f"{n} {c:.0f}%" for n, c in sorted(res["cpu_percent"].items()))
         print(f"   cpu: {cpu}  (leader {res['leader']})")
         threads = "  ".join(
@@ -590,6 +632,13 @@ def report(name: str, result: dict[str, Any]) -> None:
             f"({res['append_entries_with_entries_per_entry']:.2f} carrying entries), "
             f"{res['entries_sent_per_entry']:.2f} entries sent, "
             f"{res['bytes_encoded_per_entry']:.0f} bytes encoded"
+        )
+    for b in (res or {}).get("timeline", []):
+        print(
+            f"   t={b['t_end_s']:6.1f}s  log {b['log_length']:7d}  "
+            f"{b['committed_per_s']:6.0f} entries/s  leader cpu {b['leader_cpu_percent']:4.0f}%  "
+            f"load_log {b['load_log_percent_of_wall']:4.1f}% of wall, "
+            f"{b['entries_copied_per_entry']:8.0f} entries copied per entry"
         )
     print(
         f"   verify: {'PASS' if ok else 'FAIL'} (converged={v['converged']}, "
@@ -613,6 +662,9 @@ def main() -> int:
     parser.add_argument("--name", help="result file stem (default: derived from options)")
     parser.add_argument("--keep", action="store_true", help="keep data dirs and server logs")
     parser.add_argument("--profile", action="store_true", help="run each server under py-spy")
+    parser.add_argument(
+        "--stats-every", type=float, default=0.0, help="leader stats bucket, seconds (0: off)"
+    )
     parser.add_argument("--profile-native", action="store_true", help="py-spy --native too")
     args = parser.parse_args()
     if args.restart_at is not None and (args.kill_at is None or args.restart_at <= args.kill_at):

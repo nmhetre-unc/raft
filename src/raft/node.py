@@ -542,7 +542,8 @@ class RaftNode:
         self._last_leader_contact = now
         self._reset_election_deadline(now)
 
-        log = self.storage.load_log()
+        storage = self.storage
+        last = storage.last_log_index()
 
         # 2. Reply false if the log has no entry at prev_log_index, or has
         # one whose term differs from prev_log_term -- the consistency
@@ -550,8 +551,8 @@ class RaftNode:
         # always 0 everywhere, and any correctly-formed message naming
         # prev_log_index=0 carries prev_log_term=0 too, so this passes
         # unconditionally there without needing a special case for it.
-        if msg.prev_log_index >= len(log) or log[msg.prev_log_index].term != msg.prev_log_term:
-            return [(src, self._conflict_reply(log, msg.prev_log_index))]
+        if msg.prev_log_index > last or storage.term_at(msg.prev_log_index) != msg.prev_log_term:
+            return [(src, self._conflict_reply(msg.prev_log_index))]
 
         # 3 & 4. Find the first sent entry (if any) this follower doesn't
         # already hold at that index and term -- Raft's Log Matching
@@ -570,14 +571,14 @@ class RaftNode:
         first_new = 0
         while first_new < len(msg.entries):
             index = msg.prev_log_index + 1 + first_new
-            if index >= len(log) or log[index].term != msg.entries[first_new].term:
+            if index > last or storage.term_at(index) != msg.entries[first_new].term:
                 break
             first_new += 1
 
         new_entries = msg.entries[first_new:]
         if new_entries:
             conflict_index = msg.prev_log_index + 1 + first_new
-            if conflict_index < len(log):
+            if conflict_index <= last:
                 self.storage.truncate_from(conflict_index)  # 3: delete the conflict onward
             self.storage.append_entries(list(new_entries))  # 4: append what's new
 
@@ -599,17 +600,22 @@ class RaftNode:
         reply = AppendEntriesReply(term=self.current_term, success=True, match_index=last_new_index)
         return [(src, reply)]
 
-    def _conflict_reply(self, log: list[LogEntry], prev_log_index: int) -> AppendEntriesReply:
+    def _conflict_reply(self, prev_log_index: int) -> AppendEntriesReply:
         """A consistency-check failure, telling the leader where to probe
         next (see `AppendEntriesReply`): past this log's end if it's too
-        short, else the start of the run of the conflicting term."""
-        if prev_log_index >= len(log):
-            conflict_index, conflict_term = len(log), 0
+        short, else the start of the run of the conflicting term.
+
+        Terms never decrease along a Raft log, so that run's start is the
+        first index whose term is >= the conflicting term: a binary
+        search, not a walk back over a run that can be the whole log."""
+        last = self.storage.last_log_index()
+        if prev_log_index > last:
+            conflict_index, conflict_term = last + 1, 0
         else:
-            conflict_term = log[prev_log_index].term
+            conflict_term = self.storage.term_at(prev_log_index)
             conflict_index = prev_log_index
-            while log[conflict_index - 1].term == conflict_term:
-                conflict_index -= 1  # stops at 1 at the latest: log[0].term is 0
+            if prev_log_index > 0:  # index 0 only conflicts in a malformed message
+                conflict_index = self._first_index_with_term_at_least(conflict_term, prev_log_index)
         return AppendEntriesReply(
             term=self.current_term,
             success=False,
@@ -648,20 +654,29 @@ class RaftNode:
                     msg.match_index >= self._sent_through.get(src, 0)
                     and msg.match_index < self.storage.last_log_index()
                 ):
-                    log = self.storage.load_log()
-                    return [(src, self._build_append_entries_for(src, log, now))]
+                    return [(src, self._build_append_entries_for(src, now))]
             return []
 
         # Failure, and (per the checks above) at our current term, not a
         # stale-term step-down: move next_index back using the follower's
         # conflict hint and retry immediately.
-        log = self.storage.load_log()
-        self.next_index[src] = self._next_index_after_conflict(src, msg, log)
-        return [(src, self._build_append_entries_for(src, log, now))]
+        self.next_index[src] = self._next_index_after_conflict(src, msg)
+        return [(src, self._build_append_entries_for(src, now))]
 
-    def _next_index_after_conflict(
-        self, peer: str, msg: AppendEntriesReply, log: list[LogEntry]
-    ) -> int:
+    def _first_index_with_term_at_least(self, term: int, hi: int) -> int:
+        """The smallest index in [1, hi] whose term is >= `term`, or hi + 1
+        if none is. Binary search: terms never decrease along a log."""
+        lo = 1
+        hi += 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self.storage.term_at(mid) >= term:
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
+
+    def _next_index_after_conflict(self, peer: str, msg: AppendEntriesReply) -> int:
         """Where to probe `peer` next after it rejected an AppendEntries.
 
         With a conflict term this leader also holds, probe just past its
@@ -693,21 +708,19 @@ class RaftNode:
         not send this peer back over entries it is known to hold.
         """
         current = self.next_index[peer]
+        last = self.storage.last_log_index()
         if msg.conflict_index == 0:
             proposed = current - 1
         elif msg.conflict_term == 0:
             proposed = msg.conflict_index
         else:
-            last_of_term = None
-            for index in range(len(log) - 1, 0, -1):
-                term = log[index].term
-                if term == msg.conflict_term:
-                    last_of_term = index
-                    break
-                if term < msg.conflict_term:
-                    break  # terms only rise along a log: no such entry here
-            proposed = last_of_term + 1 if last_of_term is not None else msg.conflict_index
-        return max(1, self.match_index[peer] + 1, min(proposed, len(log)))
+            # One past this leader's last entry of conflict_term, if it has
+            # any: the first index whose term is above it, found by binary
+            # search (terms never decrease along a log).
+            after = self._first_index_with_term_at_least(msg.conflict_term + 1, last)
+            has_term = after > 1 and self.storage.term_at(after - 1) == msg.conflict_term
+            proposed = after if has_term else msg.conflict_index
+        return max(1, self.match_index[peer] + 1, min(proposed, last + 1))
 
     def _advance_commit_index(self) -> None:
         """Figure 2's leader commit rule -- with Figure 2's own last-paragraph
@@ -725,7 +738,6 @@ class RaftNode:
         match_counts = [*self.match_index.values(), self.storage.last_log_index()]
         majority_needed = len(match_counts) // 2 + 1
 
-        log = self.storage.load_log()
         for candidate in range(self.storage.last_log_index(), self.commit_index, -1):
             confirmations = sum(1 for match_index in match_counts if match_index >= candidate)
             if confirmations < majority_needed:
@@ -740,7 +752,7 @@ class RaftNode:
             # an old-term entry directly, on majority alone, is exactly
             # the unsafe case Figure 8 exists to rule out: a later leader
             # that never saw it as committed can still overwrite it.
-            if log[candidate].term != self.current_term:
+            if self.storage.term_at(candidate) != self.current_term:
                 continue
 
             self.commit_index = candidate
@@ -780,9 +792,10 @@ class RaftNode:
         if self.last_applied >= self.commit_index:
             return
 
-        log = self.storage.load_log()
-        for index in range(self.last_applied + 1, self.commit_index + 1):
-            command = log[index].command
+        first = self.last_applied + 1
+        entries = self.storage.entries_from(first, self.commit_index - self.last_applied)
+        for index, entry in enumerate(entries, first):
+            command = entry.command
             if isinstance(command, ClientRequest):
                 self.state_machine.apply_client_request(command)
             elif isinstance(command, Put | Get | Delete):
@@ -865,13 +878,12 @@ class RaftNode:
         keeps hearing from its leader and learns the commit index. The
         heartbeat timer restarts only when every peer was sent something.
         """
-        log = self.storage.load_log()
         out: list[tuple[str, Message]] = []
         for peer in self.peers:
             if not self._in_flight(peer, now):
-                out.append((peer, self._build_append_entries_for(peer, log, now)))
+                out.append((peer, self._build_append_entries_for(peer, now)))
             elif heartbeat:
-                out.append((peer, self._build_append_entries_for(peer, log, now, empty=True)))
+                out.append((peer, self._build_append_entries_for(peer, now, empty=True)))
         if len(out) == len(self.peers):
             self._next_heartbeat = now + self.heartbeat_interval
         return out
@@ -900,30 +912,29 @@ class RaftNode:
         return unacknowledged and sent_at is not None and now - sent_at < self.heartbeat_interval
 
     def _build_append_entries_for(
-        self, peer: str, log: list[LogEntry], now: int, *, empty: bool = False
+        self, peer: str, now: int, *, empty: bool = False
     ) -> AppendEntries:
         """Build the AppendEntries `peer` should get right now: entries from
         its next_index on, capped by count and approximate size -- or, with
         `empty`, none (a heartbeat that leaves what's in flight alone)."""
-        prev_log_index = self.next_index[peer] - 1
-        end = min(len(log), self.next_index[peer] + self.max_append_entries)
-        if empty:
-            end = self.next_index[peer]
+        start = self.next_index[peer]
+        prev_log_index = start - 1
+        chunk = [] if empty else self.storage.entries_from(start, self.max_append_entries)
         size = 0
-        for index in range(self.next_index[peer], end):
-            size += self.entry_size(log[index])
-            if size > self.max_append_bytes and index > self.next_index[peer]:
-                end = index  # at least one entry, always
+        for count, entry in enumerate(chunk):
+            size += self.entry_size(entry)
+            if size > self.max_append_bytes and count > 0:
+                del chunk[count:]  # at least one entry, always
                 break
-        entries = tuple(log[self.next_index[peer] : end])
+        entries = tuple(chunk)
         if entries:
-            self._sent_through[peer] = end - 1
+            self._sent_through[peer] = start + len(entries) - 1
             self._sent_at[peer] = now
         return AppendEntries(
             term=self.current_term,
             leader_id=self.node_id,
             prev_log_index=prev_log_index,
-            prev_log_term=log[prev_log_index].term,
+            prev_log_term=self.storage.term_at(prev_log_index),
             entries=entries,
             leader_commit=self.commit_index,
         )

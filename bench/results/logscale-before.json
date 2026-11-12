@@ -1,0 +1,346 @@
+{
+  "name": "logscale-before",
+  "environment": {
+    "cpu_count": 12,
+    "os": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.16 (main, Oct 26 2026, 14:08:45) [Clang 23.1.3 ]",
+    "git": "b93da42-dirty"
+  },
+  "options": {
+    "nodes": 5,
+    "clients": 16,
+    "duration": 300.0,
+    "fsync": "deferred",
+    "kill_at": null,
+    "restart_at": null,
+    "put_ratio": 0.5,
+    "keys": 100,
+    "seed": 0,
+    "out_dir": "/home/neilm/raft/bench/results",
+    "name": "logscale-before",
+    "keep": false,
+    "profile": false,
+    "stats_every": 20.0,
+    "profile_native": false
+  },
+  "summary": {
+    "window": 300.0,
+    "ops": 97504,
+    "ok": 97504,
+    "failed": 0,
+    "puts_ok": 48985,
+    "gets_ok": 48519,
+    "ops_per_sec": 325.0133333333333,
+    "latency_ms": {
+      "p50": 46.713316998648224,
+      "p99": 130.06233499982045,
+      "p99.9": 208.93688199976168
+    },
+    "longest_gap_s": 0.08754355800010671,
+    "longest_gap_at_s": 290.91054213299867,
+    "first_write_after_fault_s": {}
+  },
+  "resources": {
+    "timeline": [
+      {
+        "t_end_s": 20.0,
+        "log_length": 16861,
+        "committed_per_s": 842.1389717527057,
+        "leader_cpu_percent": 163.0317095715858,
+        "load_log_percent_of_wall": 9.163863587130692,
+        "load_log_calls_per_entry": 5.3521803619104125,
+        "entries_copied_per_entry": 45461.01020468704
+      },
+      {
+        "t_end_s": 40.01,
+        "log_length": 27217,
+        "committed_per_s": 517.3144440822705,
+        "leader_cpu_percent": 145.01994945196574,
+        "load_log_percent_of_wall": 20.37066592016354,
+        "load_log_calls_per_entry": 5.363601236476043,
+        "entries_copied_per_entry": 117929.75067619783
+      },
+      {
+        "t_end_s": 60.03,
+        "log_length": 36859,
+        "committed_per_s": 481.76322983520294,
+        "leader_cpu_percent": 138.96727955312718,
+        "load_log_percent_of_wall": 26.430568306395543,
+        "load_log_calls_per_entry": 5.348511565190333,
+        "entries_copied_per_entry": 171303.401099471
+      },
+      {
+        "t_end_s": 80.04,
+        "log_length": 44575,
+        "committed_per_s": 385.55522496407474,
+        "leader_cpu_percent": 133.5152360165899,
+        "load_log_percent_of_wall": 29.5800941712907,
+        "load_log_calls_per_entry": 5.214230171073095,
+        "entries_copied_per_entry": 212146.39061689994
+      },
+      {
+        "t_end_s": 100.05,
+        "log_length": 51652,
+        "committed_per_s": 353.71054615857435,
+        "leader_cpu_percent": 129.83046042949653,
+        "load_log_percent_of_wall": 31.673563768742333,
+        "load_log_calls_per_entry": 5.150324950551003,
+        "entries_copied_per_entry": 247736.27098050297
+      },
+      {
+        "t_end_s": 120.06,
+        "log_length": 58062,
+        "committed_per_s": 320.5115104979556,
+        "leader_cpu_percent": 127.12523896270645,
+        "load_log_percent_of_wall": 33.14603300053809,
+        "load_log_calls_per_entry": 5.053632678515747,
+        "entries_copied_per_entry": 277181.386654194
+      },
+      {
+        "t_end_s": 140.07,
+        "log_length": 63977,
+        "committed_per_s": 295.31740423011115,
+        "leader_cpu_percent": 125.42245086591859,
+        "load_log_percent_of_wall": 34.62909665934591,
+        "load_log_calls_per_entry": 5.004060913705584,
+        "entries_copied_per_entry": 305318.80998307955
+      },
+      {
+        "t_end_s": 160.09,
+        "log_length": 69399,
+        "committed_per_s": 271.18066105994535,
+        "leader_cpu_percent": 123.2730220812393,
+        "load_log_percent_of_wall": 35.46175635339544,
+        "load_log_calls_per_entry": 4.903814262023217,
+        "entries_copied_per_entry": 326981.9445365764
+      },
+      {
+        "t_end_s": 180.1,
+        "log_length": 74225,
+        "committed_per_s": 241.06935635324174,
+        "leader_cpu_percent": 122.108498845041,
+        "load_log_percent_of_wall": 36.11893805054338,
+        "load_log_calls_per_entry": 4.781554404145078,
+        "entries_copied_per_entry": 343391.8797927461
+      },
+      {
+        "t_end_s": 200.12,
+        "log_length": 78754,
+        "committed_per_s": 226.07720654593265,
+        "leader_cpu_percent": 121.4571688647874,
+        "load_log_percent_of_wall": 36.603053487797695,
+        "load_log_calls_per_entry": 4.703204419889503,
+        "entries_copied_per_entry": 359657.3714917127
+      },
+      {
+        "t_end_s": 220.13,
+        "log_length": 82680,
+        "committed_per_s": 196.2406295827783,
+        "leader_cpu_percent": 120.73271226686829,
+        "load_log_percent_of_wall": 36.92191402987681,
+        "load_log_calls_per_entry": 4.535268652915712,
+        "entries_copied_per_entry": 366191.12044817925
+      },
+      {
+        "t_end_s": 240.14,
+        "log_length": 86755,
+        "committed_per_s": 203.5936514565724,
+        "leader_cpu_percent": 119.55818599646084,
+        "load_log_percent_of_wall": 37.82376022083538,
+        "load_log_calls_per_entry": 4.577423312883435,
+        "entries_copied_per_entry": 387812.9474846626
+      },
+      {
+        "t_end_s": 260.15,
+        "log_length": 90662,
+        "committed_per_s": 195.4471311909426,
+        "leader_cpu_percent": 118.48763693524023,
+        "load_log_percent_of_wall": 38.393549341374026,
+        "load_log_calls_per_entry": 4.523651240092048,
+        "entries_copied_per_entry": 401284.01227307593
+      },
+      {
+        "t_end_s": 280.17,
+        "log_length": 93972,
+        "committed_per_s": 165.3681826568417,
+        "leader_cpu_percent": 119.35486053389565,
+        "load_log_percent_of_wall": 38.17661895640717,
+        "load_log_calls_per_entry": 4.3075528700906345,
+        "entries_copied_per_entry": 397587.8395770393
+      }
+    ],
+    "leader": "n0",
+    "wall_s": 300.13401345700004,
+    "cpu_percent": {
+      "n0": 128.32934047149627,
+      "n1": 35.36087055831317,
+      "n2": 35.430839302468875,
+      "n3": 35.35087502343378,
+      "n4": 35.497476201664796
+    },
+    "leader_thread_cpu_percent": {
+      "main (event loop)": 100.0,
+      "event_engine": 23.4,
+      "python": 4.9,
+      "grpc_global_tim": 0.0,
+      "lifeguard": 0.0
+    },
+    "committed_entries": 97504,
+    "append_entries_per_entry": 0.9940617820807351,
+    "append_entries_with_entries_per_entry": 0.7767373646209387,
+    "entries_sent_per_entry": 4.066315228093206,
+    "bytes_encoded_per_entry": 143.34350385625206,
+    "leader_stats_start": {
+      "node_id": "n0",
+      "role": "leader",
+      "commit_index": 1,
+      "monotonic": 10608.127907061,
+      "cpu_user_s": 0.08,
+      "cpu_system_s": 0.01,
+      "transport": {
+        "sent": {
+          "PreVote": 4,
+          "RequestVote": 4,
+          "PreVoteReply": 1,
+          "AppendEntries": 4
+        },
+        "append_entries_with_entries": 4,
+        "entries_sent": 4,
+        "bytes_encoded": 168,
+        "dropped": 0,
+        "failed": 0
+      },
+      "storage": {
+        "log_length": 1,
+        "load_log_calls": 7,
+        "load_log_entries": 14,
+        "load_log_seconds": 3.4139993658754975e-06
+      }
+    },
+    "leader_stats_end": {
+      "node_id": "n0",
+      "role": "leader",
+      "commit_index": 97505,
+      "monotonic": 10908.261920518,
+      "cpu_user_s": 313.92,
+      "cpu_system_s": 71.33,
+      "transport": {
+        "sent": {
+          "PreVote": 4,
+          "RequestVote": 4,
+          "PreVoteReply": 1,
+          "AppendEntries": 96929
+        },
+        "append_entries_with_entries": 75739,
+        "entries_sent": 396486,
+        "bytes_encoded": 13976733,
+        "dropped": 0,
+        "failed": 0
+      },
+      "storage": {
+        "log_length": 97505,
+        "load_log_calls": 490913,
+        "load_log_entries": 23063088104,
+        "load_log_seconds": 96.58272685122756
+      }
+    }
+  },
+  "verification": {
+    "converged": true,
+    "final_view": {
+      "n0": {
+        "role": "leader",
+        "term": 1,
+        "commit": 97505,
+        "applied": 97505,
+        "hint": ""
+      },
+      "n1": {
+        "role": "follower",
+        "term": 1,
+        "commit": 97505,
+        "applied": 97505,
+        "hint": "n0"
+      },
+      "n2": {
+        "role": "follower",
+        "term": 1,
+        "commit": 97505,
+        "applied": 97505,
+        "hint": "n0"
+      },
+      "n3": {
+        "role": "follower",
+        "term": 1,
+        "commit": 97505,
+        "applied": 97505,
+        "hint": "n0"
+      },
+      "n4": {
+        "role": "follower",
+        "term": 1,
+        "commit": 97505,
+        "applied": 97505,
+        "hint": "n0"
+      },
+      "alive": [
+        "n0",
+        "n1",
+        "n2",
+        "n3",
+        "n4"
+      ]
+    },
+    "nodes_checked": [
+      "n0",
+      "n1",
+      "n2",
+      "n3",
+      "n4"
+    ],
+    "commit_index": 97505,
+    "acknowledged_puts": 48985,
+    "prefix_problems": [],
+    "ack_problems": []
+  },
+  "events": [
+    {
+      "t": 0.0021,
+      "kind": "term",
+      "node": "n0",
+      "term": 1
+    },
+    {
+      "t": 0.0021,
+      "kind": "term",
+      "node": "n1",
+      "term": 1
+    },
+    {
+      "t": 0.0021,
+      "kind": "term",
+      "node": "n2",
+      "term": 1
+    },
+    {
+      "t": 0.0021,
+      "kind": "term",
+      "node": "n3",
+      "term": 1
+    },
+    {
+      "t": 0.0021,
+      "kind": "term",
+      "node": "n4",
+      "term": 1
+    },
+    {
+      "t": 0.0021,
+      "kind": "leader",
+      "leader": "n0",
+      "term": 1,
+      "same_node": false
+    }
+  ],
+  "history": "logscale-before.history.jsonl"
+}

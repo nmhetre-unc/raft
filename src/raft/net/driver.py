@@ -304,15 +304,12 @@ class NodeDriver:
     ) -> list[tuple[asyncio.Future[SubmitOutcome], SubmitOutcome]]:
         ready: list[tuple[asyncio.Future[SubmitOutcome], SubmitOutcome]] = []
         pending: list[_Waiter] = []
-        log = None
         for waiter in self._waiters:
             outcome: SubmitOutcome
             if waiter.future.done():
                 continue  # cancelled by the caller; forget it
             if self._node.last_applied >= waiter.index:
-                if log is None:
-                    log = self._storage.load_log()
-                if log[waiter.index].term != waiter.term:
+                if self._storage.term_at(waiter.index) != waiter.term:
                     outcome = Lost()
                 else:
                     session = self._node.state_machine.session(waiter.client_id)

@@ -73,13 +73,14 @@ import fcntl
 import json
 import os
 import struct
+import time
 import zlib
 from collections.abc import Callable
 from pathlib import Path
 from types import TracebackType
 from typing import Literal
 
-from raft.storage import SENTINEL, LogEntry, Storage, StorageError
+from raft.storage import SENTINEL, LogEntry, Storage, StorageError, bounded_slice, check_index
 
 FsyncMode = Literal["per_write", "deferred"]
 
@@ -199,6 +200,10 @@ class FileStorage(Storage):
         self._encode = encode
         self._per_write = fsync == "per_write"
         self._broken = False
+        # How much full-log copying callers do (`load_log`), for stats.
+        self.load_log_calls = 0
+        self.load_log_entries = 0
+        self.load_log_seconds = 0.0
 
         self._dir.mkdir(parents=True, exist_ok=True)
         self._lock_fd = _lock(self._dir / LOCK_FILE)
@@ -287,7 +292,22 @@ class FileStorage(Storage):
         self._sync_if_per_write()
 
     def load_log(self) -> list[LogEntry]:
-        return list(self._log)
+        start = time.perf_counter()
+        log = list(self._log)
+        self.load_log_seconds += time.perf_counter() - start
+        self.load_log_calls += 1
+        self.load_log_entries += len(log)
+        return log
+
+    def entry_at(self, index: int) -> LogEntry:
+        check_index(len(self._log), index)
+        return self._log[index]
+
+    def term_at(self, index: int) -> int:
+        return self.entry_at(index).term
+
+    def entries_from(self, start: int, max_count: int) -> list[LogEntry]:
+        return bounded_slice(self._log, start, max_count)
 
     def last_log_index(self) -> int:
         return len(self._log) - 1

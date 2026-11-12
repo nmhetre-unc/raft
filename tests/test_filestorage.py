@@ -94,6 +94,7 @@ operations = st.lists(
             st.tuples(st.integers(-1, 5), st.one_of(st.none(), st.sampled_from(["a", "b", 5]))),
         ),
         st.tuples(st.just("sync"), st.none()),
+        st.tuples(st.just("read"), st.tuples(st.integers(-2, 14), st.integers(-1, 6))),
         st.tuples(st.just("reopen"), st.none()),
         st.tuples(st.just("crash"), st.none()),
     ),
@@ -140,6 +141,13 @@ def test_matches_memory_storage(mode: FsyncMode, ops: list[tuple[str, object]]) 
                 elif op == "vote":
                     assert isinstance(arg, tuple)
                     calls = [lambda s, a=arg: s.save_term_and_vote(*a)]
+                elif op == "read":  # bounded reads, including out-of-range ones
+                    assert isinstance(arg, tuple)
+                    calls = [
+                        lambda s, a=arg: s.entry_at(a[0]),
+                        lambda s, a=arg: s.term_at(a[0]),
+                        lambda s, a=arg: s.entries_from(*a),
+                    ]
                 elif op == "sync":
                     files.sync()
                     durable = snapshot(model)
@@ -164,6 +172,12 @@ def test_matches_memory_storage(mode: FsyncMode, ops: list[tuple[str, object]]) 
                 assert files.load_term_and_vote() == model.load_term_and_vote()
                 assert files.last_log_index() == model.last_log_index()
                 assert files.last_log_term() == model.last_log_term()
+                # The bounded reads agree with the full copy, everywhere.
+                log = files.load_log()
+                assert [files.entry_at(i) for i in range(len(log))] == log
+                assert [files.term_at(i) for i in range(len(log))] == [e.term for e in log]
+                assert files.entries_from(0, len(log)) == log
+                assert files.entries_from(len(log), 3) == []
         finally:
             files.close()
 
