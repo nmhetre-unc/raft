@@ -37,6 +37,9 @@ raft = ["py.typed"]
 [tool.pytest.ini_options]
 markers = [
     "slow: large-sweep fuzz tests, deselected by default (run with -m slow)",
+    # Selected by default, so CI's plain `pytest` runs it. To skip locally:
+    # pytest -m "not slow and not integration"
+    "integration: real multi-process cluster tests (tests/test_integration.py)",
 ]
 addopts = "-m 'not slow'"
 
