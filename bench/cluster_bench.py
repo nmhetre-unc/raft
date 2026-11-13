@@ -462,8 +462,13 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
             fault_tasks.append(asyncio.create_task(restart_killed()))
 
         def make_client(n: int) -> RaftClient:
+            # The client checks its budget only between attempts, so one RPC
+            # must not outlive it: cap the RPC timeout at the op timeout.
             return RaftClient(
-                cluster.nodes, client_id=f"c{n:02d}", rpc_timeout=2.0, op_timeout=30.0
+                cluster.nodes,
+                client_id=f"c{n:02d}",
+                rpc_timeout=min(2.0, args.op_timeout),
+                op_timeout=args.op_timeout,
             )
 
         ops = await run_load(
@@ -547,6 +552,7 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
             "segments": linear.segments,
             "seconds": round(linear.seconds, 3),
             "summary": linear.summary(),
+            "unknown_outcome_puts": unknown_outcome_puts(ops),
         }
         summary = summarize(ops, start=t0, end=load_end, faults=faults)
         result: dict[str, Any] = {
@@ -601,6 +607,15 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
 
 def fmt(value: float | None, scale: float = 1.0, digits: int = 1) -> str:
     return "-" if value is None else f"{value * scale:.{digits}f}"
+
+
+def unknown_outcome_puts(ops: list[OpResult]) -> dict[str, int]:
+    """Failed puts, split by whether a successful get later returned their
+    value (unique per put): if one did, the write took effect."""
+    read = {op.value for op in ops if op.kind == "get" and op.ok}
+    failed = [op for op in ops if op.kind == "put" and not op.ok]
+    observed = sum(1 for op in failed if op.value in read)
+    return {"failed": len(failed), "observed": observed, "unobserved": len(failed) - observed}
 
 
 def verified(v: dict[str, Any]) -> bool:
@@ -669,7 +684,11 @@ def report(name: str, result: dict[str, Any]) -> None:
     )
     lin = v["linearizability"]
     first, *rest = lin["summary"].splitlines()
-    print(f"   {first}  (checked in {lin['seconds']:.2f} s)")
+    unknown = lin["unknown_outcome_puts"]
+    print(
+        f"   {first}  (checked in {lin['seconds']:.2f} s; {unknown['failed']} failed puts: "
+        f"{unknown['observed']} observed by a read, {unknown['unobserved']} not)"
+    )
     for line in rest:
         print(f"   {line}")
 
@@ -685,6 +704,12 @@ def main() -> int:
     parser.add_argument("--put-ratio", type=float, default=0.5)
     parser.add_argument("--keys", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--op-timeout",
+        type=float,
+        default=30.0,
+        help="each client's per-operation budget, seconds; shorter makes ops fail in failover",
+    )
     parser.add_argument("--out-dir", type=Path, default=Path(__file__).parent / "results")
     parser.add_argument("--name", help="result file stem (default: derived from options)")
     parser.add_argument("--keep", action="store_true", help="keep data dirs and server logs")
