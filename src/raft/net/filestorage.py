@@ -204,6 +204,12 @@ class FileStorage(Storage):
         self.load_log_calls = 0
         self.load_log_entries = 0
         self.load_log_seconds = 0.0
+        # Log fsyncs, and the entries they made durable, for stats: in
+        # "deferred" mode one fsync can cover many writes.
+        self.log_fsyncs = 0
+        self.log_fsync_seconds = 0.0
+        self.entries_synced = 0
+        self._appended_since_sync = 0
 
         self._dir.mkdir(parents=True, exist_ok=True)
         self._lock_fd = _lock(self._dir / LOCK_FILE)
@@ -271,6 +277,7 @@ class FileStorage(Storage):
             self._log.append(entry)
             self._ends.append(self._ends[-1] + len(record))
             self._pending += record
+        self._appended_since_sync += len(entries)
         self._sync_if_per_write()
 
     def truncate_from(self, index: int) -> None:
@@ -322,21 +329,64 @@ class FileStorage(Storage):
 
         If this raises, the instance is unusable: reopen the directory.
         """
+        job = self.begin_sync()
+        if job is not None:
+            job()
+
+    def begin_sync(self) -> Callable[[], None] | None:
+        """Take what `sync()` would write, and return a job that writes it
+        and fsyncs -- or None if nothing has changed since the last sync.
+
+        This is `sync()` split in two, so the slow half can run on another
+        thread while the caller's thread carries on. This half, on the
+        caller's thread, snapshots everything the job needs -- the encoded
+        term and vote, the log bytes, where they go, any truncation -- and
+        updates the bookkeeping as though the job had already succeeded.
+        The job touches only the files and that snapshot, never the
+        in-memory log, so reads (and even writes) can go on while it runs.
+
+        Jobs must run one at a time, in the order they were begun: each
+        writes from where the previous one ended. Run the job before
+        `close()`. If the job raises, the instance is unusable, exactly as
+        if `sync()` had failed; if it is never run, nothing it covers is
+        durable.
+        """
         self._check_usable()
-        try:
-            if self._state_dirty:
-                self._write_state()
-                self._state_dirty = False
-            if self._keep < self._disk_len or self._pending:
-                if self._keep < self._disk_len:
-                    os.ftruncate(self._fd, self._keep)
-                _write_all(self._fd, self._pending, self._keep)
-                os.fsync(self._fd)
-                self._disk_len = self._keep = self._ends[-1]
-                self._pending.clear()
-        except BaseException:
-            self._broken = True
-            raise
+        state = None
+        if self._state_dirty:
+            state = json.dumps({"term": self._term, "voted_for": self._voted_for}).encode()
+            self._state_dirty = False
+        truncate_to = self._keep if self._keep < self._disk_len else None
+        data = None
+        if truncate_to is not None or self._pending:
+            data = bytes(self._pending)
+            offset = self._keep
+            appended = self._appended_since_sync
+            self._appended_since_sync = 0
+            self._disk_len = self._keep = self._ends[-1]
+            self._pending.clear()
+        if state is None and data is None:
+            return None
+        fd = self._fd
+
+        def job() -> None:
+            try:
+                if state is not None:
+                    self._write_state(state)
+                if data is not None:
+                    if truncate_to is not None:
+                        os.ftruncate(fd, truncate_to)
+                    _write_all(fd, data, offset)
+                    start = time.perf_counter()
+                    os.fsync(fd)
+                    self.log_fsync_seconds += time.perf_counter() - start
+                    self.log_fsyncs += 1
+                    self.entries_synced += appended
+            except BaseException:
+                self._broken = True
+                raise
+
+        return job
 
     def close(self) -> None:
         """`sync()`, then release the log file and the lock. Idempotent."""
@@ -363,9 +413,8 @@ class FileStorage(Storage):
 
     # -- Internals --
 
-    def _write_state(self) -> None:
+    def _write_state(self, data: bytes) -> None:
         tmp = self._dir / (STATE_FILE + ".tmp")
-        data = json.dumps({"term": self._term, "voted_for": self._voted_for}).encode()
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         try:
             _write_all(fd, data, 0)

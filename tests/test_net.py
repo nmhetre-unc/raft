@@ -268,11 +268,11 @@ async def test_storage_failure_stops_the_server(cluster: LiveCluster) -> None:
     assert node.server is not None and node.serving is not None
     storage = node.server.storage
 
-    def failing_sync() -> None:
+    def failing_job() -> None:  # runs on the driver's sync thread
         storage._broken = True  # as a real failed fsync leaves it
         raise StorageError("simulated fsync failure")
 
-    storage.sync = failing_sync  # type: ignore[method-assign]
+    storage.begin_sync = lambda: failing_job  # type: ignore[method-assign]
 
     with pytest.raises(StorageError, match="simulated"):
         await node.serving
@@ -424,9 +424,8 @@ def test_sigusr1_writes_stats(tmp_path: Path) -> None:
         (port,) = free_ports(1)
         cluster = ClusterConfig(nodes={"solo": f"127.0.0.1:{port}"})
         stop = asyncio.Event()
-        task = asyncio.create_task(
-            run(ServerConfig("solo", cluster, tmp_path / "solo"), stop, stats_on_sigusr1=True)
-        )
+        config = ServerConfig("solo", cluster, tmp_path / "solo", trace_batches=100)
+        task = asyncio.create_task(run(config, stop, stats_on_sigusr1=True))
         path = tmp_path / "solo" / "stats.json"
         deadline = time.monotonic() + 10
         while not path.exists():
@@ -438,6 +437,13 @@ def test_sigusr1_writes_stats(tmp_path: Path) -> None:
         stats = json.loads(path.read_text())
         assert stats["node_id"] == "solo"
         assert stats["cpu_user_s"] >= 0 and stats["commit_index"] >= 0
+        driver = stats["driver"]
+        assert driver["batches"] > 0 and driver["submits"] == 0
+        assert sum(driver["submits_per_batch"].values()) == driver["batches"]
+        # batches.json: the last <= 100 batches, (start, sync_start, sync_end, events, submits)
+        batches = json.loads((tmp_path / "solo" / "batches.json").read_text())
+        assert 0 < len(batches) <= 100
+        assert all(b[0] <= b[1] <= b[2] and b[3] >= 1 and b[4] == 0 for b in batches)
         assert stats["transport"] == {
             "sent": {},
             "append_entries_with_entries": 0,
@@ -485,10 +491,14 @@ def write_config(tmp_path: Path, nodes: dict[str, str]) -> Path:
     return path
 
 
-def test_main_serves_until_sigterm_and_releases_the_lock(tmp_path: Path) -> None:
+@pytest.mark.parametrize("listen", [False, True])
+def test_main_serves_until_sigterm_and_releases_the_lock(tmp_path: Path, listen: bool) -> None:
+    """With --listen, the node binds there, not to its config address --
+    here a name that doesn't resolve, as a container's peer-facing name
+    might not on the host."""
     (port,) = free_ports(1)
     address = f"127.0.0.1:{port}"
-    config = write_config(tmp_path, {"solo": address})
+    config = write_config(tmp_path, {"solo": f"solo.invalid:{port}" if listen else address})
     data_dir = tmp_path / "solo"
     loaded = ClusterConfig.load(config)
     assert loaded.election_timeout_ms == (150, 300) and loaded.request_timeout_ms == 1000
@@ -512,7 +522,8 @@ def test_main_serves_until_sigterm_and_releases_the_lock(tmp_path: Path) -> None
 
     thread = threading.Thread(target=terminate_once_leader)
     thread.start()
-    code = main(["--id", "solo", "--config", str(config), "--data-dir", str(data_dir)])
+    extra = ["--listen", address] if listen else []
+    code = main(["--id", "solo", "--config", str(config), "--data-dir", str(data_dir), *extra])
     thread.join()
 
     assert code == 0

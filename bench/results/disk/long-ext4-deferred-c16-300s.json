@@ -1,0 +1,338 @@
+{
+  "name": "long-ext4-deferred-c16-300s",
+  "environment": {
+    "cpu_count": 12,
+    "os": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.16 (main, Oct 26 2026, 14:08:45) [Clang 23.1.3 ]",
+    "git": "1eddb29-dirty",
+    "storage": {
+      "data_dir": "/home/neilm/.cache/raft-bench/raft-bench-nh6se3d_",
+      "fs_type": "ext4",
+      "device": "/dev/sdd",
+      "mount_point": "/"
+    }
+  },
+  "options": {
+    "nodes": 5,
+    "clients": 16,
+    "duration": 300.0,
+    "fsync": "deferred",
+    "kill_at": null,
+    "restart_at": null,
+    "put_ratio": 0.5,
+    "keys": 100,
+    "seed": 0,
+    "op_timeout": 30.0,
+    "out_dir": "bench/results/disk",
+    "name": "long-ext4-deferred-c16-300s",
+    "keep": false,
+    "tmpfs": false,
+    "profile": false,
+    "stats_every": 30.0,
+    "profile_native": false,
+    "external": null,
+    "chaos": null,
+    "chaos_at": 10.0
+  },
+  "t0_unix": 1794540450.4342144,
+  "summary": {
+    "window": 300.0,
+    "ops": 89415,
+    "ok": 89415,
+    "failed": 0,
+    "puts_ok": 44985,
+    "gets_ok": 44430,
+    "ops_per_sec": 298.05,
+    "latency_ms": {
+      "p50": 53.3717659998274,
+      "p99": 81.04473200000939,
+      "p99.9": 109.5930540000154
+    },
+    "longest_gap_s": 0.07613562599999568,
+    "longest_gap_at_s": 264.3150378500002,
+    "first_write_after_fault_s": {}
+  },
+  "resources": {
+    "timeline": [
+      {
+        "t_end_s": 30.0,
+        "log_length": 9655,
+        "committed_per_s": 321.3366527863336,
+        "leader_cpu_percent": 69.59795413899957,
+        "load_log_percent_of_wall": 0.0,
+        "load_log_calls_per_entry": 0.0,
+        "entries_copied_per_entry": 0.0
+      },
+      {
+        "t_end_s": 60.02,
+        "log_length": 18388,
+        "committed_per_s": 291.07978964531054,
+        "leader_cpu_percent": 70.53753602096181,
+        "load_log_percent_of_wall": 0.0,
+        "load_log_calls_per_entry": 0.0,
+        "entries_copied_per_entry": 0.0
+      },
+      {
+        "t_end_s": 90.03,
+        "log_length": 27875,
+        "committed_per_s": 315.9733387378497,
+        "leader_cpu_percent": 70.17187086174326,
+        "load_log_percent_of_wall": 0.0,
+        "load_log_calls_per_entry": 0.0,
+        "entries_copied_per_entry": 0.0
+      },
+      {
+        "t_end_s": 120.04,
+        "log_length": 37084,
+        "committed_per_s": 306.89886725822316,
+        "leader_cpu_percent": 69.0439145449553,
+        "load_log_percent_of_wall": 0.0,
+        "load_log_calls_per_entry": 0.0,
+        "entries_copied_per_entry": 0.0
+      },
+      {
+        "t_end_s": 150.05,
+        "log_length": 45648,
+        "committed_per_s": 285.4595990493916,
+        "leader_cpu_percent": 70.57352991556107,
+        "load_log_percent_of_wall": 0.0,
+        "load_log_calls_per_entry": 0.0,
+        "entries_copied_per_entry": 0.0
+      },
+      {
+        "t_end_s": 180.06,
+        "log_length": 53865,
+        "committed_per_s": 273.8038364125023,
+        "leader_cpu_percent": 70.79984818405536,
+        "load_log_percent_of_wall": 0.0,
+        "load_log_calls_per_entry": 0.0,
+        "entries_copied_per_entry": 0.0
+      },
+      {
+        "t_end_s": 210.07,
+        "log_length": 62634,
+        "committed_per_s": 292.22041396507035,
+        "leader_cpu_percent": 70.44748034236048,
+        "load_log_percent_of_wall": 0.0,
+        "load_log_calls_per_entry": 0.0,
+        "entries_copied_per_entry": 0.0
+      },
+      {
+        "t_end_s": 240.09,
+        "log_length": 71963,
+        "committed_per_s": 310.71628058758165,
+        "leader_cpu_percent": 68.5668137946861,
+        "load_log_percent_of_wall": 0.0,
+        "load_log_calls_per_entry": 0.0,
+        "entries_copied_per_entry": 0.0
+      },
+      {
+        "t_end_s": 270.1,
+        "log_length": 81332,
+        "committed_per_s": 312.2471006425993,
+        "leader_cpu_percent": 69.24015314644343,
+        "load_log_percent_of_wall": 0.0,
+        "load_log_calls_per_entry": 0.0,
+        "entries_copied_per_entry": 0.0
+      }
+    ],
+    "leader_log_fsyncs": 88672,
+    "leader_log_fsyncs_per_s": 295.4715101496626,
+    "leader_entries_per_fsync": 1.0083791952363768,
+    "leader_fsync_ms_mean": 1.99372448531642,
+    "leader_fsync_percent_of_wall": 58.90887844988015,
+    "leader": "n4",
+    "wall_s": 300.10338375800006,
+    "cpu_percent": {
+      "n0": 23.601866501150983,
+      "n1": 23.541887170779574,
+      "n2": 23.571876835965274,
+      "n3": 23.535222800738307,
+      "n4": 69.91923828796429
+    },
+    "leader_thread_cpu_percent": {
+      "main (event loop)": 43.6,
+      "event_engine": 21.2,
+      "python": 5.1,
+      "grpc_global_tim": 0.0,
+      "lifeguard": 0.0
+    },
+    "committed_entries": 89415,
+    "append_entries_per_entry": 0.9955600290778952,
+    "append_entries_with_entries_per_entry": 0.7606330034110608,
+    "entries_sent_per_entry": 4.00282950287983,
+    "bytes_encoded_per_entry": 141.44110048649554,
+    "leader_stats_start": {
+      "node_id": "n4",
+      "role": "leader",
+      "commit_index": 1,
+      "monotonic": 1328.681620122,
+      "cpu_user_s": 0.1,
+      "cpu_system_s": 0.02,
+      "transport": {
+        "sent": {
+          "PreVote": 4,
+          "RequestVote": 4,
+          "PreVoteReply": 1,
+          "AppendEntries": 4
+        },
+        "append_entries_with_entries": 4,
+        "entries_sent": 4,
+        "bytes_encoded": 168,
+        "dropped": 0,
+        "failed": 0
+      },
+      "storage": {
+        "log_length": 1,
+        "load_log_calls": 0,
+        "load_log_entries": 0,
+        "load_log_seconds": 0.0,
+        "log_fsyncs": 1,
+        "log_fsync_seconds": 0.0035785919999398175,
+        "entries_synced": 1
+      }
+    },
+    "leader_stats_end": {
+      "node_id": "n4",
+      "role": "leader",
+      "commit_index": 89416,
+      "monotonic": 1628.78500388,
+      "cpu_user_s": 132.63,
+      "cpu_system_s": 77.32,
+      "transport": {
+        "sent": {
+          "PreVote": 4,
+          "RequestVote": 4,
+          "PreVoteReply": 1,
+          "AppendEntries": 89022
+        },
+        "append_entries_with_entries": 68016,
+        "entries_sent": 357917,
+        "bytes_encoded": 12647124,
+        "dropped": 0,
+        "failed": 0
+      },
+      "storage": {
+        "log_length": 89416,
+        "load_log_calls": 0,
+        "load_log_entries": 0,
+        "load_log_seconds": 0.0,
+        "log_fsyncs": 88673,
+        "log_fsync_seconds": 176.79111615397755,
+        "entries_synced": 89416
+      }
+    }
+  },
+  "verification": {
+    "converged": true,
+    "final_view": {
+      "n0": {
+        "role": "follower",
+        "term": 1,
+        "commit": 89416,
+        "applied": 89416,
+        "hint": "n4"
+      },
+      "n1": {
+        "role": "follower",
+        "term": 1,
+        "commit": 89416,
+        "applied": 89416,
+        "hint": "n4"
+      },
+      "n2": {
+        "role": "follower",
+        "term": 1,
+        "commit": 89416,
+        "applied": 89416,
+        "hint": "n4"
+      },
+      "n3": {
+        "role": "follower",
+        "term": 1,
+        "commit": 89416,
+        "applied": 89416,
+        "hint": "n4"
+      },
+      "n4": {
+        "role": "leader",
+        "term": 1,
+        "commit": 89416,
+        "applied": 89416,
+        "hint": ""
+      },
+      "alive": [
+        "n0",
+        "n1",
+        "n2",
+        "n3",
+        "n4"
+      ]
+    },
+    "nodes_checked": [
+      "n0",
+      "n1",
+      "n2",
+      "n3",
+      "n4"
+    ],
+    "commit_index": 89416,
+    "acknowledged_puts": 44985,
+    "prefix_problems": [],
+    "ack_problems": [],
+    "linearizability": {
+      "linearizable": true,
+      "operations": 89415,
+      "checked": 89415,
+      "keys": 100,
+      "segments": 77030,
+      "seconds": 0.586,
+      "summary": "89415 operations, linearizable",
+      "unknown_outcome_puts": {
+        "failed": 0,
+        "observed": 0,
+        "unobserved": 0
+      }
+    }
+  },
+  "events": [
+    {
+      "t": 0.0014,
+      "kind": "term",
+      "node": "n0",
+      "term": 1
+    },
+    {
+      "t": 0.0015,
+      "kind": "term",
+      "node": "n1",
+      "term": 1
+    },
+    {
+      "t": 0.0015,
+      "kind": "term",
+      "node": "n2",
+      "term": 1
+    },
+    {
+      "t": 0.0015,
+      "kind": "term",
+      "node": "n3",
+      "term": 1
+    },
+    {
+      "t": 0.0015,
+      "kind": "term",
+      "node": "n4",
+      "term": 1
+    },
+    {
+      "t": 0.0015,
+      "kind": "leader",
+      "leader": "n4",
+      "term": 1,
+      "same_node": false
+    }
+  ],
+  "history": "long-ext4-deferred-c16-300s.history.jsonl"
+}

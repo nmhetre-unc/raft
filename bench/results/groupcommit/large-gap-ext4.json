@@ -1,0 +1,89 @@
+{
+  "linearizability": {
+    "linearizable": true,
+    "seconds": 0.006,
+    "summary": "1564 operations, linearizable"
+  },
+  "args": {
+    "nodes": 5,
+    "entries": 1500,
+    "value_bytes": 4096,
+    "clients": 16,
+    "timeout": 30.0,
+    "name": "large-gap-ext4",
+    "out_dir": "bench/results/groupcommit",
+    "keep": false
+  },
+  "git": "1eddb29-dirty",
+  "storage": {
+    "data_dir": "/home/neilm/.cache/raft-bench/raft-gap-29352fn8",
+    "fs_type": "ext4",
+    "device": "/dev/sdd",
+    "mount_point": "/"
+  },
+  "leader": "n2",
+  "follower": "n0",
+  "follower_commit_at_kill": 0,
+  "entries_missing": 1501,
+  "catch_up_append_entries_bytes": 6186344,
+  "grpc_max_receive_bytes": 4194304,
+  "exceeds_limit": true,
+  "write_s": 2.9,
+  "target_commit": 1501,
+  "caught_up": true,
+  "restart_to_catch_up_s": 0.365,
+  "follower_trace": [
+    [
+      0.002,
+      null,
+      null
+    ],
+    [
+      0.207,
+      0,
+      1
+    ],
+    [
+      0.259,
+      509,
+      1
+    ],
+    [
+      0.313,
+      763,
+      1
+    ],
+    [
+      0.365,
+      1501,
+      1
+    ]
+  ],
+  "final": {
+    "n0": {
+      "role": "follower",
+      "term": 1,
+      "commit": 1564
+    },
+    "n1": {
+      "role": "follower",
+      "term": 1,
+      "commit": 1564
+    },
+    "n2": {
+      "role": "leader",
+      "term": 1,
+      "commit": 1565
+    },
+    "n3": {
+      "role": "follower",
+      "term": 1,
+      "commit": 1564
+    },
+    "n4": {
+      "role": "follower",
+      "term": 1,
+      "commit": 1564
+    }
+  }
+}

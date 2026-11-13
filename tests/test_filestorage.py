@@ -411,6 +411,21 @@ def test_deferred_writes_nothing_before_sync(tmp_path: Path) -> None:
         assert storage.load_log() == [SENTINEL, *entries("a", "b")]
 
 
+@pytest.mark.parametrize(("mode", "fsyncs"), [("per_write", 3), ("deferred", 1)])
+def test_counts_log_fsyncs_and_the_entries_they_cover(
+    tmp_path: Path, mode: FsyncMode, fsyncs: int
+) -> None:
+    with open_storage(tmp_path, mode) as storage:
+        storage.append_entries(entries("a", "b"))
+        storage.append_entries(entries("c"))
+        storage.save_term_and_vote(2, None)  # state only: no log fsync
+        storage.append_entries(entries("d"))
+        storage.sync()
+        storage.sync()  # nothing pending: no fsync
+        assert (storage.log_fsyncs, storage.entries_synced) == (fsyncs, 4)
+        assert storage.log_fsync_seconds >= 0
+
+
 class SimulatedCrash(Exception):
     pass
 

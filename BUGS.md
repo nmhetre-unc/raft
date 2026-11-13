@@ -808,3 +808,122 @@ Results (same 300 s bench):
 - **Leader-kill bench:** 0 elections after restart, catch-up at the same
   per-entry rate as before, verify passed.
 - **Large-gap reproduction:** still catches up (0.26-0.31 s).
+
+## Every local benchmark before step 8 ran on tmpfs: fsync was free
+
+`bench/cluster_bench.py` put its data directories in `tempfile.mkdtemp()`,
+which here is `/tmp`, and `/tmp` is tmpfs. `os.fsync` on tmpfs returns at
+once, so no earlier local number paid for durability. That covers every
+throughput and latency figure in the entries above, including the 3x from
+per-peer flow control and the ~1,000 ops/s after bounded reads. The
+correctness results (verify, linearizability, catch-up) don't depend on it.
+
+Found when the Docker cluster, whose volumes are on ext4, ran 3.5x slower
+than the local bench; the local bench with its data moved to ext4 matched
+Docker (286 against 279-314 ops/s).
+
+**Fix.** Data directories now default to `~/.cache/raft-bench` (ext4), with
+`--tmpfs` (`/dev/shm`) for comparison, and every result records the data
+directory and its filesystem type (`environment.storage`). The leader's
+stats now count log fsyncs, their time, and the entries they made durable.
+
+Same 20 s no-fault runs, ops/s (`bench/results/disk/`):
+
+| clients | ext4 per_write | ext4 deferred | tmpfs per_write | tmpfs deferred |
+|--------:|---------------:|--------------:|----------------:|---------------:|
+| 1       | 127            | 124           | 237             | 192            |
+| 8       | 304            | 309           | 721             | 653            |
+| 16      | 329            | 334           | 616             | 751            |
+| 32      | 336            | 318           | 646             | 782            |
+
+ext4 runs repeat within ~3%; tmpfs runs, which are CPU-bound, varied by up
+to ~30% between repeats on this WSL host. A 300 s ext4 deferred run held
+274-321 entries/s throughout (298 ops/s overall, p99 81 ms).
+
+**Deferred fsync did not batch** (found here; fixed in the next entry).
+In every run, in both modes, the leader averaged 1.00-1.01 entries per
+log fsync, at 1 client or 32, and on ext4 those fsyncs took ~60% of its
+wall time. So on a real disk `deferred` was no faster than `per_write`.
+
+## Group commit never happened: the fsync blocked the event loop
+
+The driver is built for group commit -- take every queued event as one
+batch, sync once, then send -- but `deferred` mode never batched: each
+log fsync on the leader covered 1.0 client writes (previous entry).
+
+**Cause, measured.** The driver now counts, per batch, its events, its
+client submits and its sync time, and can trace every batch
+(`--trace-batches`); the bench lines the leader's sync intervals up with
+the clients' send times (both `CLOCK_MONOTONIC`). ext4, 16 clients,
+deferred, 20 s, sync still on the loop:
+
+- batches held 1.01 submits on average (4,445 batches with 1, 36 with 2,
+  none with more);
+- yet at the start of each sync, 7.8 operations on average (mostly 5-10)
+  had already been sent by clients and not yet taken in by the driver;
+- only 0.26 of them, on average, were sent *during* the sync (83% of
+  syncs had none): the queue wasn't new arrivals, it was a standing
+  backlog in front of the loop;
+- between two syncs the loop admitted 0.74 submits.
+
+`storage.sync()` ran on the event loop thread, so for the ~2 ms of each
+fsync the loop admitted nothing. Afterwards, the first submit admitted
+woke the driver, which processed it alone and blocked the loop in the
+next fsync before the gRPC server had admitted another call. About 8
+writes waited, and each fsync covered one. The leader's loop was saturated
+(~60% of wall in fsync plus ~43% CPU) at ~330 ops/s whatever the client
+count.
+
+**Fix: classic group commit.** The fsync runs on a worker thread while
+the loop carries on admitting RPCs:
+
+- `FileStorage.sync()` is split. `begin_sync()`, on the loop, snapshots
+  everything the sync must write -- the encoded term and vote, the log
+  bytes, their offset, any truncation -- and returns a job that touches
+  only the files and that snapshot. `sync()` is `begin_sync()` plus
+  running the job, so `per_write` and every other caller is unchanged.
+- The driver runs the job with `run_in_executor` and awaits it. Its
+  messages and replies still leave only after the job completes, so the
+  persist-before-send invariant is exactly as before; the existing
+  sync-before-send test passes unchanged.
+- At most one sync is in flight: the driver's loop awaits it before
+  taking the next batch. The node is never touched while a sync runs:
+  the driver's loop is the only caller of the node, and it is suspended
+  awaiting the job; inputs arriving meanwhile only enqueue. The job reads
+  nothing the loop could change anyway: `begin_sync()` copied it out.
+- Fail-stop is kept. A failed job fails the driver exactly as a failed
+  `sync()` did; events that queued up during it are discarded
+  unprocessed, and their submits are never answered. A cancelled driver
+  (shutdown) waits for a job in flight to finish before returning, so the
+  storage is never closed under a write.
+
+New tests: submits accumulating while a sync is held in the worker
+thread (not in the log, nothing sent, then one batch of all five); a
+sync failure with submits, ticks and messages queued behind it; and
+cancellation during a sync, successful or failing.
+
+**Results** (ext4, 20 s, no faults; "before" is the same code with the
+one call back on the loop, run interleaved with "after"; ops/s, p50 ms,
+entries per leader fsync; `bench/results/groupcommit/`):
+
+| mode, clients | before            | after              |
+|---------------|-------------------|--------------------|
+| deferred, 1   | 116, 8.3, 1.00    | 95, 9.9, 1.00      |
+| deferred, 8   | 260, 28.9, 1.00   | 384, 20.5, 2.01    |
+| deferred, 16  | 333, 47.7, 1.01   | 668, 23.5, 3.79    |
+| deferred, 32  | 337, 95.2, 1.01   | 979, 31.0, 5.75    |
+| per_write, 1  | 141, 6.8, 1.00    | 114, 8.1, 1.00     |
+| per_write, 8  | 283, 27.4, 1.00   | 246, 31.0, 1.00    |
+| per_write, 16 | 319, 49.8, 1.00   | 335, 47.9, 1.00    |
+| per_write, 32 | 336, 95.7, 1.00   | 344, 93.4, 1.00    |
+
+- `deferred` now scales with load: 2.0x at 16 clients and 2.9x at 32,
+  with p50 down by two thirds. The leader uses more CPU (123-134% against
+  ~70%) because it is no longer idle-blocked in fsync for 60% of its
+  wall time.
+- `per_write` is unchanged by design: it fsyncs inside each write call.
+  Its run-to-run spread at 1 and 8 clients was ~10-15% (a repeat with
+  the order swapped gave after 127 / before 119 ops/s at 1 client).
+- At 1 client `deferred` is ~10% slower (repeat: 109 against 121 ops/s,
+  p50 +1.1 ms): with nothing to batch, each operation pays a thread
+  hand-off for the leader's sync and again for the follower's.

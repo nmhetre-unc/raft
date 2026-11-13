@@ -24,6 +24,29 @@ report and writes ``<name>.json`` (environment, options, summary,
 failover and restart metrics, events, verification) and
 ``<name>.history.jsonl`` (every operation) to `--out-dir`.
 
+With `--external HOSTS.json` it starts nothing: it benchmarks a cluster
+that is already running -- e.g. ``docker compose up -d`` -- reaching node
+``<id>`` at ``HOSTS[id]`` (``docker/hosts.json``). Faults then come from
+`--chaos`, a command run at `--chaos-at` (``scripts/chaos_docker.sh
+kill-leader 10``) that prints ``down <node>`` when the fault takes effect
+and ``up <node>`` when the node is back (and optionally ``leader <node>
+<term>`` first, and ``begin down|up <node>`` just before each docker
+command, which then times the event: the upper bound);
+`--kill-at`/`--restart-at` and the resource figures need processes of our
+own and are not available. A ``down`` of the node the
+chaos command named as leader counts as a kill (failover metrics);
+otherwise as a partition, for which it also reports the leader and its
+term when the fault began and at the end, the term the isolated node
+reported when it came back, and the leader changes after it did. ``up``
+is treated like `--restart-at`: catch-up, elections and stall are measured
+from it.
+
+Data directories go on a real disk, under ``~/.cache/raft-bench``, so
+fsync costs what it costs; `--tmpfs` puts them in /dev/shm instead, for
+comparison. Every result records the filesystem type the data was on.
+(Before this option existed, every run used the system temporary
+directory, which here is tmpfs: fsync was free.)
+
 All times in the output are seconds since the load started.
 
 Failover is reported as (a) kill -> first observation of a new leader
@@ -53,11 +76,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import bisect
 import contextlib
 import dataclasses
 import json
 import os
 import platform
+import shlex
 import shutil
 import signal
 import socket
@@ -108,6 +133,41 @@ def free_ports(n: int) -> list[int]:
             s.close()
 
 
+DISK_ROOT = Path.home() / ".cache" / "raft-bench"
+TMPFS_ROOT = Path("/dev/shm")
+
+
+def filesystem_of(path: Path) -> dict[str, str]:
+    """The mount `path` is on: its type, device and mount point, from the
+    longest matching mount point in /proc/self/mounts."""
+    target = str(path.resolve())
+    best = {"fs_type": "unknown", "device": "unknown", "mount_point": "/"}
+    best_len = -1
+    for line in Path("/proc/self/mounts").read_text().splitlines():
+        device, mount_point, fs_type = line.split()[:3]
+        mount_point = mount_point.replace("\\040", " ")
+        inside = target == mount_point or target.startswith(mount_point.rstrip("/") + "/")
+        if inside and len(mount_point) > best_len:
+            best = {"fs_type": fs_type, "device": device, "mount_point": mount_point}
+            best_len = len(mount_point)
+    return best
+
+
+def docker_data_filesystem() -> dict[str, str]:
+    """Where the local Docker engine keeps volumes, for --external runs
+    against docker-compose.yml (assumes that engine runs on this host)."""
+    try:
+        root = subprocess.run(
+            ["docker", "info", "--format", "{{.DockerRootDir}}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return {"data_dir": "external", "fs_type": "unknown"}
+    return {"data_dir": f"docker volumes under {root}", **filesystem_of(Path(root))}
+
+
 def server_cpu_s(pid: int) -> float:
     """User + system CPU seconds of `pid` so far (/proc/<pid>/stat)."""
     return server_cpu_s_of(Path(f"/proc/{pid}/stat"))
@@ -134,8 +194,14 @@ def server_cpu_s_of(stat: Path) -> float:
 
 class Cluster:
     def __init__(
-        self, nodes: int, fsync: str, workdir: Path, profile: list[str] | None = None
+        self,
+        nodes: int,
+        fsync: str,
+        workdir: Path,
+        profile: list[str] | None = None,
+        trace_batches: int = 0,
     ) -> None:
+        self.trace_batches = trace_batches
         self.profile = profile
         self.fsync = fsync
         self.workdir = workdir
@@ -175,6 +241,8 @@ class Cluster:
                 str(self.workdir / node),
                 "--fsync",
                 self.fsync,
+                "--trace-batches",
+                str(self.trace_batches),
             ],
             stdin=subprocess.DEVNULL,
             stdout=log,
@@ -247,6 +315,25 @@ class Cluster:
                 proc.wait()
         for log in self._logs:
             log.close()
+
+
+class ExternalCluster(Cluster):
+    """A cluster someone else runs: `hosts` maps node id to ``host:port``.
+    Nodes reported down by the chaos command are not expected to answer."""
+
+    def __init__(self, hosts: dict[str, str]) -> None:
+        self.profile = None
+        self.nodes = dict(hosts)
+        self.procs = {}
+        self._logs = []
+        self.down: set[str] = set()
+        self._channels = {
+            i: grpc.aio.insecure_channel(a, options=POLL_CHANNEL_OPTIONS)
+            for i, a in self.nodes.items()
+        }
+
+    def alive(self) -> list[str]:
+        return [n for n in self.nodes if n not in self.down]
 
 
 def current_leader(statuses: dict[str, pb.StatusReply]) -> tuple[str | None, int]:
@@ -379,17 +466,25 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
     profile = None
     if args.profile:
         profile = ["--native"] if args.profile_native else []
-    cluster = Cluster(args.nodes, args.fsync, workdir, profile)
+    external = args.external is not None
+    cluster: Cluster
+    if external:
+        cluster = ExternalCluster(json.loads(args.external.read_text()))
+    else:
+        cluster = Cluster(args.nodes, args.fsync, workdir, profile, args.trace_batches)
     try:
-        for node in cluster.nodes:
-            cluster.start(node)
+        if not external:
+            for node in cluster.nodes:
+                cluster.start(node)
         load_leader = await wait_for_leader(cluster)
-        pids = {n: cluster.server_pid(n) for n in cluster.nodes}
-        cpu_start = {n: server_cpu_s(pid) for n, pid in pids.items()}
-        stats_start = await cluster.leader_stats(load_leader)
-        threads_start = thread_cpu_s(pids[load_leader])
+        if not external:
+            pids = {n: cluster.server_pid(n) for n in cluster.nodes}
+            cpu_start = {n: server_cpu_s(pid) for n, pid in pids.items()}
+            stats_start = await cluster.leader_stats(load_leader)
+            threads_start = thread_cpu_s(pids[load_leader])
 
         t0 = time.monotonic()
+        t0_unix = time.time()  # to line events up with outside captures
         poller = Poller(cluster, t0)
         await poller.poll_once()
         poll_task = asyncio.create_task(poller.run())
@@ -428,7 +523,9 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
                 previous = current
 
         sampler = (
-            asyncio.create_task(sample_leader()) if args.stats_every and not args.kill_at else None
+            asyncio.create_task(sample_leader())
+            if args.stats_every and not args.kill_at and not external
+            else None
         )
 
         faults: list[Fault] = []
@@ -455,7 +552,65 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
             cluster.start(fault.node)
             poller._record(kind="restart", node=fault.node)
 
+        partition: dict[str, Any] = {}
+
+        async def chaos() -> None:
+            """Run --chaos at --chaos-at; act on its down/up lines."""
+            assert isinstance(cluster, ExternalCluster)
+            await asyncio.sleep(args.chaos_at)
+            proc = await asyncio.create_subprocess_exec(
+                *shlex.split(args.chaos), stdout=asyncio.subprocess.PIPE
+            )
+            assert proc.stdout is not None
+            named_leader = None
+            begun: dict[tuple[str, str], float] = {}
+            async for raw in proc.stdout:
+                at = time.monotonic()
+                word, node, *rest = raw.decode().split()
+                if word == "begin":
+                    # "begin down|up <node>": the docker command is starting.
+                    # Its own latency (~300 ms for docker kill) is not the
+                    # cluster's, so faults are timed from here.
+                    begun[(node, rest[0])] = at
+                    continue
+                at = begun.pop((word, node), at)
+                if word == "leader":
+                    named_leader = node
+                    poller._record(kind="chaos_leader", node=node, term=int(rest[0]))
+                elif word == "down":
+                    cluster.down.add(node)
+                    kind = "kill" if node == named_leader else "partition"
+                    faults.append(Fault(kind, at, node))
+                    poller._record(kind=kind, node=node)
+                    if kind == "partition":
+                        partition.update(
+                            node=node,
+                            leader_at_down=poller.leader,
+                            leader_term_at_down=poller.leader_term,
+                        )
+                elif word == "up":
+                    restart_info["max_term_before"] = poller.max_term
+                    restart_info["at"] = at
+                    poller.catch_up_target = (node, poller.max_commit)
+                    cluster.down.discard(node)
+                    poller._record(kind="up", node=node)
+                    if partition:
+                        # The term it brings back: with PreVote off, every
+                        # election timeout while isolated raised it by one.
+                        deadline = time.monotonic() + 5
+                        while time.monotonic() < deadline:
+                            s = await cluster.status(node, timeout=0.2)
+                            if s is not None:
+                                partition["node_term_on_rejoin"] = s.current_term
+                                partition["node_term_seen_at"] = round(time.monotonic() - at, 3)
+                                break
+                            await asyncio.sleep(0.01)
+            if await proc.wait() != 0:
+                raise RuntimeError(f"--chaos exited with {proc.returncode}")
+
         fault_tasks = []
+        if args.chaos is not None:
+            fault_tasks.append(asyncio.create_task(chaos()))
         if args.kill_at is not None:
             fault_tasks.append(asyncio.create_task(kill_leader()))
         if args.restart_at is not None:
@@ -485,7 +640,7 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
             with contextlib.suppress(asyncio.CancelledError):
                 await sampler
         resources: dict[str, Any] = {"timeline": timeline}
-        if not args.kill_at:
+        if not args.kill_at and not external:
             stats_end = await cluster.leader_stats(load_leader)
             wall = stats_end["monotonic"] - stats_start["monotonic"]
             cpu = {n: server_cpu_s(pid) - cpu_start[n] for n, pid in pids.items()}
@@ -500,7 +655,35 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
                 "AppendEntries", 0
             )
             per_entry = max(committed, 1)
+            s_start, s_end = stats_start["storage"], stats_end["storage"]
+            fsyncs = s_end["log_fsyncs"] - s_start["log_fsyncs"]
+            synced = s_end["entries_synced"] - s_start["entries_synced"]
+            fsync_s = s_end["log_fsync_seconds"] - s_start["log_fsync_seconds"]
+            d_start, d_end = stats_start["driver"], stats_end["driver"]
+            batches = d_end["batches"] - d_start["batches"]
+            per_batch = {
+                int(k): v - d_start["submits_per_batch"].get(k, 0)
+                for k, v in d_end["submits_per_batch"].items()
+            }
+            with_submits = sum(v for k, v in per_batch.items() if k > 0)
             resources |= {
+                "leader_driver": {
+                    "batches": batches,
+                    "events_per_batch": (d_end["events"] - d_start["events"]) / max(batches, 1),
+                    "submits_per_batch_with_any": (d_end["submits"] - d_start["submits"])
+                    / max(with_submits, 1),
+                    "submits_per_batch_histogram": dict(sorted(per_batch.items())),
+                    "submits_during_sync": d_end["submits_during_sync"]
+                    - d_start["submits_during_sync"],
+                    "sync_percent_of_wall": 100
+                    * (d_end["sync_seconds"] - d_start["sync_seconds"])
+                    / wall,
+                },
+                "leader_log_fsyncs": fsyncs,
+                "leader_log_fsyncs_per_s": fsyncs / wall,
+                "leader_entries_per_fsync": synced / max(fsyncs, 1),
+                "leader_fsync_ms_mean": 1000 * fsync_s / max(fsyncs, 1),
+                "leader_fsync_percent_of_wall": 100 * fsync_s / wall,
                 "leader": load_leader,
                 "wall_s": wall,
                 "cpu_percent": {n: 100 * c / wall for n, c in cpu.items()},
@@ -518,6 +701,10 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
                 "leader_stats_start": stats_start,
                 "leader_stats_end": stats_end,
             }
+        if args.trace_batches and not args.kill_at and not external:
+            trace = json.loads((workdir / load_leader / "batches.json").read_text())
+            shutil.copy(workdir / load_leader / "batches.json", workdir / "batches.json")
+            resources["sync_arrivals"] = sync_arrivals(trace, ops, t0, load_end)
         await asyncio.gather(*fault_tasks)
 
         converged, final_view = await wait_for_convergence(cluster)
@@ -556,13 +743,14 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
         }
         summary = summarize(ops, start=t0, end=load_end, faults=faults)
         result: dict[str, Any] = {
+            "t0_unix": t0_unix,
             "summary": dataclasses.asdict(summary),
             "resources": resources,
             "verification": verification,
             "events": poller.events,
         }
-        if faults:
-            (kill,) = faults
+        kill = next((f for f in faults if f.label == "kill"), None)
+        if kill is not None:
             new_leader = next(
                 (
                     e
@@ -580,6 +768,16 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
                 ),
                 "b_kill_to_first_write_s": first_write_after(ops, kill.at, not_from=kill.node),
             }
+        if partition:
+            up = restart_info["at"] - t0
+            partition |= {
+                "leader_at_end": poller.leader,
+                "leader_term_at_end": poller.leader_term,
+                "leader_changes_after_rejoin": sum(
+                    1 for e in poller.events if e["kind"] == "leader" and e["t"] >= up
+                ),
+            }
+            result["partition"] = partition
         if restart_info:
             restart_at = restart_info["at"]
             put_ends = [op.end for op in ops if op.ok and op.kind == "put"]
@@ -603,6 +801,51 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
         return result
     finally:
         await cluster.shutdown()
+
+
+def sync_arrivals(
+    trace: list[list[float]], ops: list[OpResult], t0: float, end: float
+) -> dict[str, Any]:
+    """Line the leader's batches up against the clients' send times (both
+    CLOCK_MONOTONIC, shared by every process on the host): for each sync
+    that wrote client entries, how many operations clients *sent* while it
+    ran, and how many submits the next batch then held."""
+    sends = sorted(op.start for op in ops)
+    rows = [r for r in trace if t0 <= r[0] <= end]  # (start, sync_start, sync_end, events, submits)
+    per_sync: list[int] = []
+    next_batch: list[int] = []
+    for row, following in zip(rows, rows[1:], strict=False):
+        _, sync_start, sync_end, _, submits = row
+        if submits == 0:
+            continue
+        per_sync.append(bisect.bisect_left(sends, sync_end) - bisect.bisect_left(sends, sync_start))
+        next_batch.append(int(following[4]))
+    # Sent but not yet taken in by the driver, when each batch with a sync
+    # of client entries starts its sync: what one sync *could* have covered.
+    admitted = 0
+    backlog: list[int] = []
+    for row in rows:
+        admitted += int(row[4])
+        if row[4] > 0:
+            backlog.append(bisect.bisect_left(sends, row[1]) - admitted)
+    n = max(len(per_sync), 1)
+    sync_ms = [1000 * (r[2] - r[1]) for r in rows if r[4] > 0]
+    gaps = [1000 * (b[0] - a[2]) for a, b in zip(rows, rows[1:], strict=False)]
+    return {
+        "syncs_with_submits": len(per_sync),
+        "sync_ms_mean": sum(sync_ms) / max(len(sync_ms), 1),
+        "sends_during_sync_mean": sum(per_sync) / n,
+        "sends_during_sync_histogram": {k: per_sync.count(k) for k in sorted(set(per_sync))},
+        "syncs_with_a_send_during_them_percent": 100 * sum(x > 0 for x in per_sync) / n,
+        "next_batch_submits_mean": sum(next_batch) / n,
+        "next_batch_submits_when_sends_during_sync": (
+            sum(b for a, b in zip(per_sync, next_batch, strict=True) if a > 0)
+            / max(sum(a > 0 for a in per_sync), 1)
+        ),
+        "gap_between_batches_ms_mean": sum(gaps) / max(len(gaps), 1),
+        "backlog_at_sync_start_mean": sum(backlog) / max(len(backlog), 1),
+        "backlog_at_sync_start_histogram": {k: backlog.count(k) for k in sorted(set(backlog))},
+    }
 
 
 def fmt(value: float | None, scale: float = 1.0, digits: int = 1) -> str:
@@ -633,6 +876,9 @@ def report(name: str, result: dict[str, Any]) -> None:
     v = result["verification"]
     ok = verified(v)
     print(f"== {name}")
+    disk = result.get("environment", {}).get("storage")
+    if disk:
+        print(f"   data on {disk['fs_type']} ({disk['data_dir']})")
     print(
         f"   {s['ops_per_sec']:.0f} ops/s ({s['ok']} ok, {s['failed']} failed)  "
         f"p50 {fmt(lat['p50'])} ms  p99 {fmt(lat['p99'])} ms  p99.9 {fmt(lat['p99.9'])} ms  "
@@ -644,6 +890,15 @@ def report(name: str, result: dict[str, Any]) -> None:
             f"   failover: killed {f['killed']}, new leader {f['new_leader']}  "
             f"(a) {fmt(f['a_kill_to_new_leader_s'], 1000, 0)} ms  "
             f"(b) {fmt(f['b_kill_to_first_write_s'], 1000, 0)} ms"
+        )
+    if "partition" in result:
+        p = result["partition"]
+        print(
+            f"   partition: {p['node']} isolated; leader {p['leader_at_down']} term "
+            f"{p['leader_term_at_down']} at down -> {p['leader_at_end']} term "
+            f"{p['leader_term_at_end']} at end; {p['node']} came back in term "
+            f"{p.get('node_term_on_rejoin', '?')}; {p['leader_changes_after_rejoin']} leader "
+            f"changes after rejoin"
         )
     if "restart" in result:
         r = result["restart"]
@@ -664,6 +919,29 @@ def report(name: str, result: dict[str, Any]) -> None:
             f"{t} {c:.0f}%" for t, c in res["leader_thread_cpu_percent"].items() if c >= 1
         )
         print(f"   leader threads: {threads}")
+        d = res["leader_driver"]
+        print(
+            f"   leader batches: {d['events_per_batch']:.2f} events each; "
+            f"{d['submits_per_batch_with_any']:.2f} submits per batch holding any; "
+            f"{d['submits_during_sync']} submits queued during a sync; "
+            f"sync {d['sync_percent_of_wall']:.0f}% of wall"
+        )
+        if "sync_arrivals" in res:
+            a = res["sync_arrivals"]
+            print(
+                f"   per sync ({a['syncs_with_submits']}, {a['sync_ms_mean']:.2f} ms mean): "
+                f"{a['sends_during_sync_mean']:.2f} client sends during it "
+                f"({a['syncs_with_a_send_during_them_percent']:.0f}% had any); next batch held "
+                f"{a['next_batch_submits_mean']:.2f} submits "
+                f"({a['next_batch_submits_when_sends_during_sync']:.2f} after a sync with sends); "
+                f"sent but not yet admitted at sync start: {a['backlog_at_sync_start_mean']:.2f}"
+            )
+        print(
+            f"   leader log fsyncs: {res['leader_log_fsyncs_per_s']:.0f}/s, "
+            f"{res['leader_entries_per_fsync']:.1f} entries each, "
+            f"{res['leader_fsync_ms_mean']:.2f} ms mean, "
+            f"{res['leader_fsync_percent_of_wall']:.0f}% of wall"
+        )
         print(
             f"   leader per committed entry: {res['append_entries_per_entry']:.2f} AppendEntries "
             f"({res['append_entries_with_entries_per_entry']:.2f} carrying entries), "
@@ -713,12 +991,33 @@ def main() -> int:
     parser.add_argument("--out-dir", type=Path, default=Path(__file__).parent / "results")
     parser.add_argument("--name", help="result file stem (default: derived from options)")
     parser.add_argument("--keep", action="store_true", help="keep data dirs and server logs")
+    parser.add_argument(
+        "--trace-batches",
+        type=int,
+        default=0,
+        metavar="N",
+        help="servers record their last N driver batches; analysed against client sends",
+    )
+    parser.add_argument(
+        "--tmpfs",
+        action="store_true",
+        help=f"data dirs in {TMPFS_ROOT} (fsync is free) instead of {DISK_ROOT}",
+    )
     parser.add_argument("--profile", action="store_true", help="run each server under py-spy")
     parser.add_argument(
         "--stats-every", type=float, default=0.0, help="leader stats bucket, seconds (0: off)"
     )
     parser.add_argument("--profile-native", action="store_true", help="py-spy --native too")
+    parser.add_argument(
+        "--external", type=Path, help="JSON {node: host:port} of a running cluster; start nothing"
+    )
+    parser.add_argument("--chaos", help="with --external: fault command (down/up lines)")
+    parser.add_argument("--chaos-at", type=float, default=10.0, help="seconds into the load")
     args = parser.parse_args()
+    if args.external is not None and (args.kill_at is not None or args.profile):
+        parser.error("--external runs no processes of its own: use --chaos, not --kill-at")
+    if args.chaos is not None and args.external is None:
+        parser.error("--chaos needs --external")
     if args.restart_at is not None and (args.kill_at is None or args.restart_at <= args.kill_at):
         parser.error("--restart-at needs a --kill-at before it")
 
@@ -726,8 +1025,18 @@ def main() -> int:
         f"{time.strftime('%Y%m%d-%H%M%S')}-c{args.clients}-{args.fsync}"
         + (f"-kill{args.kill_at:g}" if args.kill_at is not None else "")
         + (f"-restart{args.restart_at:g}" if args.restart_at is not None else "")
+        + ("-external" if args.external is not None else "")
+        + ("-tmpfs" if args.tmpfs else "")
     )
-    workdir = Path(tempfile.mkdtemp(prefix="raft-bench-"))
+    root = TMPFS_ROOT if args.tmpfs else DISK_ROOT
+    root.mkdir(parents=True, exist_ok=True)
+    workdir = Path(tempfile.mkdtemp(prefix="raft-bench-", dir=root))
+    if args.external is not None:
+        storage = docker_data_filesystem()
+    else:
+        storage = {"data_dir": str(workdir), **filesystem_of(workdir)}
+    if args.tmpfs and storage.get("fs_type") != "tmpfs":
+        parser.error(f"--tmpfs: {root} is {storage.get('fs_type')}, not tmpfs")
     try:
         result = asyncio.run(bench(args, workdir))
     except BaseException:
@@ -745,6 +1054,7 @@ def main() -> int:
             "os": platform.platform(),
             "python": sys.version,
             "git": git_revision(),
+            "storage": storage,
         },
         "options": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
         **result,
@@ -752,6 +1062,8 @@ def main() -> int:
     }
     (args.out_dir / f"{name}.json").write_text(json.dumps(output, indent=2) + "\n")
     report(name, output)
+    if (workdir / "batches.json").exists():
+        shutil.copy(workdir / "batches.json", args.out_dir / f"{name}.batches.json")
     for raw in sorted(workdir.glob("*.raw")):
         shutil.copy(raw, args.out_dir / f"{name}.{raw.name}")
 

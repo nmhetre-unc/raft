@@ -1,0 +1,258 @@
+{
+  "name": "sweep-ext4-per_write-c32",
+  "environment": {
+    "cpu_count": 12,
+    "os": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.16 (main, Oct 26 2026, 14:08:45) [Clang 23.1.3 ]",
+    "git": "1eddb29-dirty",
+    "storage": {
+      "data_dir": "/home/neilm/.cache/raft-bench/raft-bench-yj60yyeo",
+      "fs_type": "ext4",
+      "device": "/dev/sdd",
+      "mount_point": "/"
+    }
+  },
+  "options": {
+    "nodes": 5,
+    "clients": 32,
+    "duration": 20.0,
+    "fsync": "per_write",
+    "kill_at": null,
+    "restart_at": null,
+    "put_ratio": 0.5,
+    "keys": 100,
+    "seed": 0,
+    "op_timeout": 30.0,
+    "out_dir": "bench/results/disk",
+    "name": "sweep-ext4-per_write-c32",
+    "keep": false,
+    "tmpfs": false,
+    "profile": false,
+    "stats_every": 0.0,
+    "profile_native": false,
+    "external": null,
+    "chaos": null,
+    "chaos_at": 10.0
+  },
+  "t0_unix": 1794540157.0343728,
+  "summary": {
+    "window": 20.0,
+    "ops": 6723,
+    "ok": 6723,
+    "failed": 0,
+    "puts_ok": 3364,
+    "gets_ok": 3359,
+    "ops_per_sec": 336.15,
+    "latency_ms": {
+      "p50": 95.42863799993029,
+      "p99": 126.85451500010458,
+      "p99.9": 144.69908000000942
+    },
+    "longest_gap_s": 0.039291998999942734,
+    "longest_gap_at_s": 0.0,
+    "first_write_after_fault_s": {}
+  },
+  "resources": {
+    "timeline": [],
+    "leader_log_fsyncs": 6723,
+    "leader_log_fsyncs_per_s": 334.0935572014741,
+    "leader_entries_per_fsync": 1.0,
+    "leader_fsync_ms_mean": 1.8024791630233488,
+    "leader_fsync_percent_of_wall": 60.21966753560063,
+    "leader": "n3",
+    "wall_s": 20.123105804000033,
+    "cpu_percent": {
+      "n0": 22.809600290863692,
+      "n1": 22.362353226336953,
+      "n2": 22.163576753213956,
+      "n3": 68.47849499087182,
+      "n4": 22.859294409144436
+    },
+    "leader_thread_cpu_percent": {
+      "main (event loop)": 42.1,
+      "event_engine": 20.8,
+      "python": 4.9,
+      "grpc_global_tim": 0.0,
+      "lifeguard": 0.0
+    },
+    "committed_entries": 6723,
+    "append_entries_per_entry": 0.9955377063810799,
+    "append_entries_with_entries_per_entry": 0.7861073925330954,
+    "entries_sent_per_entry": 4.0,
+    "bytes_encoded_per_entry": 134.53071545441023,
+    "leader_stats_start": {
+      "node_id": "n3",
+      "role": "leader",
+      "commit_index": 1,
+      "monotonic": 1035.248262864,
+      "cpu_user_s": 0.14,
+      "cpu_system_s": 0.05,
+      "transport": {
+        "sent": {
+          "PreVote": 4,
+          "PreVoteReply": 1,
+          "RequestVote": 4,
+          "RequestVoteReply": 1,
+          "AppendEntries": 8
+        },
+        "append_entries_with_entries": 4,
+        "entries_sent": 4,
+        "bytes_encoded": 248,
+        "dropped": 0,
+        "failed": 0
+      },
+      "storage": {
+        "log_length": 1,
+        "load_log_calls": 0,
+        "load_log_entries": 0,
+        "load_log_seconds": 0.0,
+        "log_fsyncs": 1,
+        "log_fsync_seconds": 0.0023793640000349114,
+        "entries_synced": 1
+      }
+    },
+    "leader_stats_end": {
+      "node_id": "n3",
+      "role": "leader",
+      "commit_index": 6724,
+      "monotonic": 1055.371368668,
+      "cpu_user_s": 8.78,
+      "cpu_system_s": 5.18,
+      "transport": {
+        "sent": {
+          "PreVote": 4,
+          "PreVoteReply": 1,
+          "RequestVote": 4,
+          "RequestVoteReply": 1,
+          "AppendEntries": 6701
+        },
+        "append_entries_with_entries": 5289,
+        "entries_sent": 26896,
+        "bytes_encoded": 904698,
+        "dropped": 0,
+        "failed": 0
+      },
+      "storage": {
+        "log_length": 6724,
+        "load_log_calls": 0,
+        "load_log_entries": 0,
+        "load_log_seconds": 0.0,
+        "log_fsyncs": 6724,
+        "log_fsync_seconds": 12.12044677700601,
+        "entries_synced": 6724
+      }
+    }
+  },
+  "verification": {
+    "converged": true,
+    "final_view": {
+      "n0": {
+        "role": "follower",
+        "term": 1,
+        "commit": 6724,
+        "applied": 6724,
+        "hint": "n3"
+      },
+      "n1": {
+        "role": "follower",
+        "term": 1,
+        "commit": 6724,
+        "applied": 6724,
+        "hint": "n3"
+      },
+      "n2": {
+        "role": "follower",
+        "term": 1,
+        "commit": 6724,
+        "applied": 6724,
+        "hint": "n3"
+      },
+      "n3": {
+        "role": "leader",
+        "term": 1,
+        "commit": 6724,
+        "applied": 6724,
+        "hint": "n1"
+      },
+      "n4": {
+        "role": "follower",
+        "term": 1,
+        "commit": 6724,
+        "applied": 6724,
+        "hint": "n3"
+      },
+      "alive": [
+        "n0",
+        "n1",
+        "n2",
+        "n3",
+        "n4"
+      ]
+    },
+    "nodes_checked": [
+      "n0",
+      "n1",
+      "n2",
+      "n3",
+      "n4"
+    ],
+    "commit_index": 6724,
+    "acknowledged_puts": 3364,
+    "prefix_problems": [],
+    "ack_problems": [],
+    "linearizability": {
+      "linearizable": true,
+      "operations": 6723,
+      "checked": 6723,
+      "keys": 100,
+      "segments": 4952,
+      "seconds": 0.022,
+      "summary": "6723 operations, linearizable",
+      "unknown_outcome_puts": {
+        "failed": 0,
+        "observed": 0,
+        "unobserved": 0
+      }
+    }
+  },
+  "events": [
+    {
+      "t": 0.0024,
+      "kind": "term",
+      "node": "n0",
+      "term": 1
+    },
+    {
+      "t": 0.0024,
+      "kind": "term",
+      "node": "n1",
+      "term": 1
+    },
+    {
+      "t": 0.0024,
+      "kind": "term",
+      "node": "n2",
+      "term": 1
+    },
+    {
+      "t": 0.0024,
+      "kind": "term",
+      "node": "n3",
+      "term": 1
+    },
+    {
+      "t": 0.0024,
+      "kind": "term",
+      "node": "n4",
+      "term": 1
+    },
+    {
+      "t": 0.0025,
+      "kind": "leader",
+      "leader": "n3",
+      "term": 1,
+      "same_node": false
+    }
+  ],
+  "history": "sweep-ext4-per_write-c32.history.jsonl"
+}

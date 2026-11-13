@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import os
@@ -113,6 +114,12 @@ class ServerConfig:
     cluster: ClusterConfig
     data_dir: Path
     fsync: FsyncMode = "deferred"
+    # Where to listen, when not the address peers reach this node by --
+    # e.g. 0.0.0.0:7000 in a container whose peers know it as n0:7000.
+    listen: str | None = None
+    # Keep a record of the driver's last N batches; written to
+    # batches.json alongside stats.json (0: off).
+    trace_batches: int = 0
 
     @property
     def address(self) -> str:
@@ -212,7 +219,12 @@ class RaftServer:
         async with contextlib.AsyncExitStack() as stack:
             await self._start(stack)
             self._resources = stack.pop_all()
-        log.info("%s: serving on %s", self.config.node_id, self.config.address)
+        log.info(
+            "%s: serving on %s (as %s)",
+            self.config.node_id,
+            self.config.listen or self.config.address,
+            self.config.address,
+        )
 
     async def _start(self, stack: contextlib.AsyncExitStack) -> None:
         config = self.config
@@ -250,12 +262,13 @@ class RaftServer:
             max_append_entries=cluster.max_append_entries,
             max_append_bytes=cluster.max_append_bytes,
             entry_size=_wire_entry_size,
+            trace_batches=config.trace_batches,
         )
         # SO_REUSEPORT off: a second process on this address must fail to
         # bind, not silently share the port.
         self.grpc_server = grpc.aio.server(options=[("grpc.so_reuseport", 0)])
         add_RaftServicer_to_server(_Servicer(self.driver, self.storage), self.grpc_server)
-        self.grpc_server.add_insecure_port(config.address)
+        self.grpc_server.add_insecure_port(config.listen or config.address)
         await self.grpc_server.start()
         # No grace: a pending Submit is cancelled, never given a made-up answer.
         stack.push_async_callback(self.grpc_server.stop, None)
@@ -307,17 +320,29 @@ class RaftServer:
             "cpu_user_s": times.user,
             "cpu_system_s": times.system,
             "transport": self.transport.stats(),
+            "driver": self.driver.stats.as_dict(),
             "storage": {
                 "log_length": self.storage.last_log_index(),
                 "load_log_calls": self.storage.load_log_calls,
                 "load_log_entries": self.storage.load_log_entries,
                 "load_log_seconds": self.storage.load_log_seconds,
+                "log_fsyncs": self.storage.log_fsyncs,
+                "log_fsync_seconds": self.storage.log_fsync_seconds,
+                "entries_synced": self.storage.entries_synced,
             },
         }
-        path = self.config.data_dir / "stats.json"
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(stats))
-        tmp.replace(path)
+        files: dict[str, object] = {"stats.json": stats}
+        if self.driver.batch_trace.maxlen:
+            # Written first: a reader waiting for stats.json then finds both.
+            files = {
+                "batches.json": [dataclasses.astuple(b) for b in self.driver.batch_trace],
+                **files,
+            }
+        for name, content in files.items():
+            path = self.config.data_dir / name
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(content))
+            tmp.replace(path)
 
     async def stop(self) -> None:
         """Stop the tasks and the gRPC server, then close the transport and
@@ -355,6 +380,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--data-dir", required=True, type=Path)
     parser.add_argument("--fsync", choices=["per_write", "deferred"], default="deferred")
+    parser.add_argument(
+        "--listen", help="host:port to listen on (default: this node's address in the config)"
+    )
+    parser.add_argument(
+        "--trace-batches",
+        type=int,
+        default=0,
+        metavar="N",
+        help="record the driver's last N batches; SIGUSR1 writes them to batches.json",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -363,7 +398,9 @@ def main(argv: list[str] | None = None) -> int:
     cluster = ClusterConfig.load(args.config)
     if args.id not in cluster.nodes:
         parser.error(f"--id {args.id!r} is not in {args.config}")
-    config = ServerConfig(args.id, cluster, args.data_dir, args.fsync)
+    config = ServerConfig(
+        args.id, cluster, args.data_dir, args.fsync, args.listen, args.trace_batches
+    )
     try:
         asyncio.run(_run_until_signalled(config))
     except Exception:

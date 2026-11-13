@@ -36,7 +36,14 @@ import grpc
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cluster_bench import POLL_CHANNEL_OPTIONS, Cluster, git_revision, wait_for_leader  # noqa: E402
+from cluster_bench import (  # noqa: E402
+    DISK_ROOT,
+    POLL_CHANNEL_OPTIONS,
+    Cluster,
+    filesystem_of,
+    git_revision,
+    wait_for_leader,
+)
 
 from raft.messages import AppendEntries  # noqa: E402
 from raft.net import raft_pb2 as pb  # noqa: E402
@@ -170,6 +177,7 @@ async def run(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
             "_history": history,
             "args": vars(args),
             "git": git_revision(),
+            "storage": {"data_dir": str(workdir), **filesystem_of(workdir)},
             "leader": leader,
             "follower": follower,
             "follower_commit_at_kill": follower_last,
@@ -203,7 +211,8 @@ def main() -> int:
     parser.add_argument("--keep", action="store_true", help="keep the data directory")
     args = parser.parse_args()
 
-    workdir = Path(tempfile.mkdtemp(prefix="raft-gap-"))
+    DISK_ROOT.mkdir(parents=True, exist_ok=True)
+    workdir = Path(tempfile.mkdtemp(prefix="raft-gap-", dir=DISK_ROOT))  # a real disk
     result = asyncio.run(run(args, workdir))
     history = result.pop("_history")
     args.out_dir.mkdir(parents=True, exist_ok=True)

@@ -15,6 +15,7 @@ every test, not just the one named for it.
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from random import Random
@@ -43,7 +44,8 @@ STEP = 10
 
 class TrackedStorage(FileStorage):
     """Deferred-mode `FileStorage` that knows whether it holds unsynced
-    writes, counts syncs, and can be armed to fail its next sync."""
+    writes, counts syncs, can be armed to fail its next sync, and can hold
+    its next sync job in the worker thread until released."""
 
     def __init__(self, directory: Path) -> None:
         super().__init__(
@@ -55,6 +57,15 @@ class TrackedStorage(FileStorage):
         self.dirty = False
         self.syncs = 0
         self.fail_next_sync = False
+        # hold_next_sync(): the next job sets `held` when it starts, then
+        # waits for `release` before writing anything.
+        self.held = threading.Event()
+        self.release: threading.Event | None = None
+
+    def hold_next_sync(self) -> threading.Event:
+        self.held.clear()
+        self.release = threading.Event()
+        return self.release
 
     def save_term_and_vote(self, term: int, voted_for: str | None) -> None:
         super().save_term_and_vote(term, voted_for)
@@ -68,13 +79,24 @@ class TrackedStorage(FileStorage):
         super().truncate_from(index)
         self.dirty = True
 
-    def sync(self) -> None:
-        if self.fail_next_sync:
-            self._broken = True  # as FileStorage does after a real failed sync
-            raise StorageError("simulated fsync failure")
-        super().sync()
-        self.dirty = False
-        self.syncs += 1
+    def begin_sync(self) -> Callable[[], None]:
+        job = super().begin_sync()
+        release, self.release = self.release, None
+        fail, self.fail_next_sync = self.fail_next_sync, False
+
+        def run() -> None:  # on the driver's worker thread
+            if release is not None:
+                self.held.set()
+                assert release.wait(timeout=10), "held sync never released"
+            if fail:
+                self._broken = True  # as FileStorage does after a real failed sync
+                raise StorageError("simulated fsync failure")
+            if job is not None:
+                job()
+            self.dirty = False
+            self.syncs += 1
+
+        return run
 
 
 class Link:
@@ -368,6 +390,127 @@ async def test_every_send_happens_after_sync(net: Net) -> None:
     net.heal()
     await net.until(lambda: net.drivers[leader].status().last_applied >= 9)
     assert await net.submit(leader, "c", 9, Get("k")) == Ok("8")
+
+
+async def held(storage: TrackedStorage) -> None:
+    """Wait (without blocking the loop) until `storage`'s held sync job has
+    started in the worker thread."""
+    for _ in range(5000):
+        if storage.held.is_set():
+            return
+        await asyncio.sleep(0.001)
+    raise AssertionError("sync job never started")
+
+
+async def let_submits_enqueue() -> None:
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+
+@with_net()
+async def test_submits_accumulate_while_a_sync_is_in_flight(net: Net) -> None:
+    """Group commit: while one batch's fsync runs on the worker thread, the
+    loop keeps admitting submits; the node isn't touched and nothing from
+    that batch leaves until the fsync is done; then one batch, and one
+    sync, takes everything that queued up."""
+    leader = await net.elect()
+    driver, storage = net.drivers[leader], net.storages[leader]
+    stats = driver.stats
+    release = storage.hold_next_sync()
+    syncs, sent = storage.syncs, net.sent_by(leader)
+    log_length = storage.last_log_index()
+    batches, during = stats.batches, stats.submits_during_sync
+
+    first = net.start_submit(leader, "a", 1, Put("a", "1"))
+    await held(storage)  # the first batch is in its sync
+    rest = [net.start_submit(leader, f"c{i}", 1, Put(f"k{i}", "v")) for i in range(5)]
+    await let_submits_enqueue()
+
+    assert stats.submits_during_sync == during + 5
+    assert storage.last_log_index() == log_length + 1  # only the first is in the log
+    assert net.sent_by(leader) == sent  # its AppendEntries waits for its sync
+    assert not first.done()
+
+    release.set()
+    await net.until(lambda: all(t.done() for t in [first, *rest]))
+    assert [t.result() for t in [first, *rest]] == [Ok(None)] * 6
+    # The five submits that queued during the first sync were one batch.
+    assert stats.submits_per_batch[5] == 1
+    assert stats.batches > batches + 1
+    assert storage.syncs > syncs + 1
+
+
+@with_net()
+async def test_sync_failure_with_events_queued_behind_it(net: Net) -> None:
+    """A sync fails while submits, deliveries and ticks wait in the inbox:
+    none of them is processed, nothing is sent, no submit is answered, and
+    wait_idle() still returns."""
+    leader = await net.elect()
+    driver, storage = net.drivers[leader], net.storages[leader]
+    release = storage.hold_next_sync()
+    storage.fail_next_sync = True
+    sent = net.sent_by(leader)
+    log_length = storage.last_log_index()
+
+    first = net.start_submit(leader, "a", 1, Put("a", "1"))
+    await held(storage)
+    queued = [net.start_submit(leader, f"c{i}", 1, Put(f"k{i}", "v")) for i in range(3)]
+    await let_submits_enqueue()
+    driver.tick()
+    follower = next(i for i in net.ids if i != leader)
+    net.drivers[follower].tick()  # a message to the leader may queue too
+    release.set()
+
+    with pytest.raises(StorageError, match="simulated"):
+        await net.tasks[leader]
+    await asyncio.wait_for(driver.wait_idle(), timeout=5)  # the queue was discarded
+    assert storage.last_log_index() == log_length + 1  # the queued submits never reached it
+    assert net.sent_by(leader) == sent
+    assert not any(t.done() for t in [first, *queued])
+    with pytest.raises(DriverStopped):
+        await driver.submit(ClientRequest("c", 9, Get("k")))
+    for task in [first, *queued]:
+        task.cancel()
+
+
+@with_net()
+async def test_cancel_waits_for_the_sync_in_flight(net: Net) -> None:
+    """Shutdown cancels run() mid-sync: it returns only after the write
+    finished, so the storage is never closed under it."""
+    leader = await net.elect()
+    storage = net.storages[leader]
+    release = storage.hold_next_sync()
+    syncs = storage.syncs
+    pending = net.start_submit(leader, "a", 1, Put("a", "1"))
+    await held(storage)
+
+    net.tasks[leader].cancel()
+    await asyncio.sleep(0.02)
+    assert not net.tasks[leader].done()  # still waiting for the job
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await net.tasks[leader]
+    assert storage.syncs == syncs + 1  # the job ran to the end
+    pending.cancel()
+
+
+@with_net()
+async def test_cancel_during_a_failing_sync(net: Net) -> None:
+    leader = await net.elect()
+    storage = net.storages[leader]
+    release = storage.hold_next_sync()
+    storage.fail_next_sync = True
+    pending = net.start_submit(leader, "a", 1, Put("a", "1"))
+    await held(storage)
+    net.tasks[leader].cancel()
+    await asyncio.sleep(0)
+    net.tasks[leader].cancel()  # a second cancel while it waits changes nothing
+    await asyncio.sleep(0.01)
+    assert not net.tasks[leader].done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await net.tasks[leader]
+    pending.cancel()
 
 
 # -- 7. Fail-stop --
