@@ -1,0 +1,102 @@
+# A 5-node cluster: docker compose up -d --build
+#
+# Each node has its own volume at /data and is published on the host at
+# 127.0.0.1:710<i> (docker/hosts.json, for clients and the bench). Peers
+# reach each other as n<i>:7000 on the "raft" network, at fixed IPs, so a
+# node disconnected by scripts/chaos_docker.sh partition comes back at the
+# same address. restart: "no" so a node killed by chaos_docker.sh stays
+# down until the script starts it again.
+#
+# PreVote is on (docker/cluster.json). For the PreVote-off control:
+#   RAFT_CONFIG=cluster-noprevote.json docker compose up -d
+
+x-node: &node
+  build: .
+  image: raft-node
+  restart: "no"
+  stop_grace_period: 5s
+
+services:
+  n0:
+    <<: *node
+    container_name: raft-n0
+    hostname: n0
+    command: ["--id", "n0"]
+    ports:
+      - "127.0.0.1:7100:7000"
+    volumes:
+      - n0-data:/data
+      - ./docker/${RAFT_CONFIG:-cluster.json}:/etc/raft/cluster.json:ro
+    networks:
+      raft:
+        ipv4_address: 172.28.0.10
+
+  n1:
+    <<: *node
+    container_name: raft-n1
+    hostname: n1
+    command: ["--id", "n1"]
+    ports:
+      - "127.0.0.1:7101:7000"
+    volumes:
+      - n1-data:/data
+      - ./docker/${RAFT_CONFIG:-cluster.json}:/etc/raft/cluster.json:ro
+    networks:
+      raft:
+        ipv4_address: 172.28.0.11
+
+  n2:
+    <<: *node
+    container_name: raft-n2
+    hostname: n2
+    command: ["--id", "n2"]
+    ports:
+      - "127.0.0.1:7102:7000"
+    volumes:
+      - n2-data:/data
+      - ./docker/${RAFT_CONFIG:-cluster.json}:/etc/raft/cluster.json:ro
+    networks:
+      raft:
+        ipv4_address: 172.28.0.12
+
+  n3:
+    <<: *node
+    container_name: raft-n3
+    hostname: n3
+    command: ["--id", "n3"]
+    ports:
+      - "127.0.0.1:7103:7000"
+    volumes:
+      - n3-data:/data
+      - ./docker/${RAFT_CONFIG:-cluster.json}:/etc/raft/cluster.json:ro
+    networks:
+      raft:
+        ipv4_address: 172.28.0.13
+
+  n4:
+    <<: *node
+    container_name: raft-n4
+    hostname: n4
+    command: ["--id", "n4"]
+    ports:
+      - "127.0.0.1:7104:7000"
+    volumes:
+      - n4-data:/data
+      - ./docker/${RAFT_CONFIG:-cluster.json}:/etc/raft/cluster.json:ro
+    networks:
+      raft:
+        ipv4_address: 172.28.0.14
+
+networks:
+  raft:
+    name: raft
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  n0-data:
+  n1-data:
+  n2-data:
+  n3-data:
+  n4-data:

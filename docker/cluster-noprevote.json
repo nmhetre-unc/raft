@@ -1,0 +1,13 @@
+{
+  "nodes": {
+    "n0": "n0:7000",
+    "n1": "n1:7000",
+    "n2": "n2:7000",
+    "n3": "n3:7000",
+    "n4": "n4:7000"
+  },
+  "election_timeout_ms": [150, 300],
+  "heartbeat_ms": 50,
+  "request_timeout_ms": 2000,
+  "pre_vote": false
+}
