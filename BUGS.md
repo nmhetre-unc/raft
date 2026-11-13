@@ -1,9 +1,19 @@
 # Bugs
 
-Safety violations found by the fuzzer. Each entry records the seed, the
-minimal reproducing trace, the property that broke, and the root cause.
+Every bug found, in the implementation and in the harness itself, in the
+order they were found.
 
-Reproduce any of these with `pytest tests/test_fuzz_sweep.py --seed <N>`.
+The entries up to "Milestone 5 complete" are from the simulator: safety
+violations found by the fuzzer, each with its seed, the minimal reproducing
+trace, the property that broke and the root cause. Reproduce any of them
+with `pytest tests/test_fuzz_sweep.py --seed <N>`.
+
+The entries from "A restarted node could never catch up" on were found by
+running the same `RaftNode` as real processes (`raft.net`: gRPC, durable
+`FileStorage`) under load and faults -- bugs the simulator could not see.
+Each records how it was found, the symptom, the root cause, why the
+simulator missed it, the fix, and before/after numbers with the result
+files they came from (`bench/results/`).
 
 ## Restart steals leadership from a healthy leader
 
@@ -811,23 +821,30 @@ Results (same 300 s bench):
 
 ## Every local benchmark before step 8 ran on tmpfs: fsync was free
 
-`bench/cluster_bench.py` put its data directories in `tempfile.mkdtemp()`,
-which here is `/tmp`, and `/tmp` is tmpfs. `os.fsync` on tmpfs returns at
-once, so no earlier local number paid for durability. That covers every
-throughput and latency figure in the entries above, including the 3x from
-per-peer flow control and the ~1,000 ops/s after bounded reads. The
-correctness results (verify, linearizability, catch-up) don't depend on it.
+Found by: the first Docker cluster runs, whose volumes are on ext4. A
+benchmark-methodology bug, not a Raft bug.
 
-Found when the Docker cluster, whose volumes are on ext4, ran 3.5x slower
-than the local bench; the local bench with its data moved to ext4 matched
-Docker (286 against 279-314 ops/s).
+**Symptom.** The Docker cluster ran 3.5x slower than the local process
+bench. With its data moved to ext4, the local bench matched Docker (286
+against 279-314 ops/s).
+
+**Root cause.** `bench/cluster_bench.py` put its data directories in
+`tempfile.mkdtemp()`, which here is `/tmp`, and `/tmp` is tmpfs. `os.fsync`
+on tmpfs returns at once, so no earlier local number paid for durability.
+That covers every throughput and latency figure in the entries above,
+including the 3x from per-peer flow control and the ~1,000 ops/s after
+bounded reads. The correctness results (verify, linearizability, catch-up)
+don't depend on it.
+
+**Why the simulator missed it.** The simulator has no disk; `MemoryStorage`
+syncs for free by design. This was in the benchmark harness.
 
 **Fix.** Data directories now default to `~/.cache/raft-bench` (ext4), with
 `--tmpfs` (`/dev/shm`) for comparison, and every result records the data
 directory and its filesystem type (`environment.storage`). The leader's
 stats now count log fsyncs, their time, and the entries they made durable.
 
-Same 20 s no-fault runs, ops/s (`bench/results/disk/`):
+**Results.** Same 20 s no-fault runs, ops/s (`bench/results/disk/`):
 
 | clients | ext4 per_write | ext4 deferred | tmpfs per_write | tmpfs deferred |
 |--------:|---------------:|--------------:|----------------:|---------------:|
@@ -847,11 +864,16 @@ wall time. So on a real disk `deferred` was no faster than `per_write`.
 
 ## Group commit never happened: the fsync blocked the event loop
 
-The driver is built for group commit -- take every queued event as one
-batch, sync once, then send -- but `deferred` mode never batched: each
-log fsync on the leader covered 1.0 client writes (previous entry).
+Found by: the fsync counters added in the previous entry; then the driver's
+per-batch counters and `--trace-batches`.
 
-**Cause, measured.** The driver now counts, per batch, its events, its
+**Symptom.** The driver is built for group commit -- take every queued
+event as one batch, sync once, then send -- but `deferred` mode never
+batched: each log fsync on the leader covered 1.00-1.01 client writes at 1
+client or 32, and on ext4 throughput was flat at ~330 ops/s whatever the
+client count.
+
+**Root cause, measured.** The driver now counts, per batch, its events, its
 client submits and its sync time, and can trace every batch
 (`--trace-batches`); the bench lines the leader's sync intervals up with
 the clients' send times (both `CLOCK_MONOTONIC`). ext4, 16 clients,
@@ -873,6 +895,11 @@ next fsync before the gRPC server had admitted another call. About 8
 writes waited, and each fsync covered one. The leader's loop was saturated
 (~60% of wall in fsync plus ~43% CPU) at ~330 ops/s whatever the client
 count.
+
+**Why the simulator missed it.** The simulator has no disk and no event
+loop: `MemoryStorage.sync()` costs nothing, and a node handles a step's
+messages with no notion of concurrent arrivals. Batching is a property of
+the networked driver only.
 
 **Fix: classic group commit.** The fsync runs on a worker thread while
 the loop carries on admitting RPCs:
@@ -897,7 +924,7 @@ the loop carries on admitting RPCs:
   (shutdown) waits for a job in flight to finish before returning, so the
   storage is never closed under a write.
 
-New tests: submits accumulating while a sync is held in the worker
+Regression tests (`tests/test_driver.py`): submits accumulating while a sync is held in the worker
 thread (not in the log, nothing sent, then one batch of all five); a
 sync failure with submits, ticks and messages queued behind it; and
 cancellation during a sync, successful or failing.
@@ -928,85 +955,12 @@ entries per leader fsync; `bench/results/groupcommit/`):
   p50 +1.1 ms): with nothing to batch, each operation pays a thread
   hand-off for the leader's sync and again for the follower's.
 
-## A follower's commit index went backwards: Figure 2's rule 5 taken literally
-
-**Symptom.** On the Docker cluster, after a 10 s partition, the rejoined
-follower's reported commit index flipped between 713 and 1225 for ~7 s
-while it caught up (the bench's catch-up trace polls it every 50 ms). A
-node's commit index must never decrease.
-
-**Root cause.** `RaftNode._handle_append_entries` implemented AppendEntries
-rule 5 word for word: "if leaderCommit > commitIndex, set commitIndex =
-min(leaderCommit, index of last new entry)". When a message's last
-covered index (`prev_log_index + len(entries)`) is *below* the follower's
-commit index while its `leader_commit` is above it, that assignment lowers
-the commit index. The leader produces such messages routinely since
-per-peer flow control: to a peer with entries in flight, its heartbeat is
-empty and anchored at `next_index - 1` -- the last index that peer has
-*acknowledged* -- but carries the leader's *current* commit index. A
-follower catching up chunk by chunk already holds the chunk in flight and
-has committed through it (the chunk carried the commit index too); the
-heartbeat then drops it back one chunk. On Docker the chunks were 512
-entries (713 -> 1225), and the leader's view of the follower stayed stale
-for seconds because its TCP connection to it was in retransmission backoff
-(next entry), so heartbeats kept arriving anchored at 713.
-
-Reproduced directly on a `RaftNode`: entries 1-10 with leader_commit 10,
-then a heartbeat with prev_log_index 5 and leader_commit 12: commit_index
-10 -> 5.
-
-**Why safety held.** Nothing is ever uncommitted by this: entries up to
-the old commit index stay committed everywhere (a majority holds them,
-and every later leader has them), `last_applied` never moves back so no
-entry is un-applied or re-applied, and clients are answered from applied
-state. What broke: the follower *reported* a stale, non-monotonic commit
-index (Status, and the benchmark's catch-up measurement), and it stopped
-applying until its commit index passed `last_applied` again. Had it won
-an election meanwhile it would have started from a lower commit index,
-which is safe -- a new leader recomputes it from match indexes.
-
-**Why the fuzzer missed it.** No invariant looked at commit_index over
-time, and the precondition is nearly unreachable in the fuzz phase:
-
-- it needs a heartbeat to land *inside* a chunk's flight -- after the
-  follower processed the chunk, before the leader processed the reply.
-  The fuzz phase runs every link at zero delay, so a reply returns
-  without simulated time passing; only an ADVANCE_CLOCK landing in exactly
-  that gap opens the window;
-- the other source of stale-anchored messages, STALE_REDELIVER and
-  duplicates, always carries an *old* `leader_commit`, which the
-  `leader_commit > commit_index` guard rejects.
-
-Counted across both 1000-seed sweeps (2,000 runs, 66,214 AppendEntries
-handled): 3,330 had a stale anchor and 17,721 a fresh leader_commit, but
-none had both. With the new invariant in place and the fix reverted,
-both sweeps still pass.
-
-**Fix.** Only ever raise it:
-`commit_index = max(commit_index, min(leader_commit, last_new_index))`.
-
-- New invariant `check_commit_index_monotonic`, run by the fuzzer after
-  every step: within one incarnation (a restart legitimately starts again
-  from 0; incarnations are told apart by node object identity), a node's
-  commit_index never decreases. Both sweeps check it now.
-- `tests/test_commit_index.py`: the `RaftNode` reproduction; a
-  deterministic simulator test -- a follower 20 entries behind catching up
-  in 5-entry chunks, with a 33 ms delay on its replies only and a 10 ms
-  tick, so each reply sends the next chunk mid-interval and the next
-  heartbeat finds it in flight -- which fails without the fix ("node 0
-  commit_index decreased from 10 to 5") and passes with it; and the
-  checker's own restart/crash handling.
-- No mutation-detection count moved.
-
-Earlier catch-up figures from the process bench were not affected: none of
-their catch-up traces (leader-kill and large-gap, before and after the
-fix) shows a decrease -- on localhost a chunk's reply always beats the
-next heartbeat. After the fix, same benches, ext4, deferred, 16 clients:
-leader-kill catch-up 597 / 718 / 517 ms (before: 774 / 580 / 591 ms),
-large-gap 0.257 s (before: 0.365 s), within run-to-run spread; all
-verified and linearizable.
-
 ## A partitioned follower rejoined seconds late: the leader's TCP connection was in retransmission backoff
+
+Found by: Docker partition runs (`scripts/chaos_docker.sh partition`),
+diagnosed with `ss -tin` inside the containers. Regression tests:
+`tests/test_net.py` (keepalive options; the server accepting keepalive
+pings).
 
 **Symptom.** On the Docker cluster, a follower cut off for 10 s (`docker
 network disconnect`, PreVote on) took about 5 s after its network came
@@ -1049,6 +1003,12 @@ partition at 10.87 s:
 Raft was not at fault: the leader kept sending heartbeats and chunks into
 a socket that would not deliver them until the kernel's next retransmit.
 
+**Why the simulator missed it.** The simulator has no transport: a healed
+partition delivers the next message at once. Silent packet loss on a live
+TCP connection, and the kernel's retransmission backoff, exist only below
+gRPC. The process bench missed it too: it kills processes (the socket
+closes, with an RST), it never black-holes a link.
+
 **Fix: gRPC keepalive, behind `ClusterConfig.keepalive_ms`** (cluster
 JSON `"keepalive_ms"`, default 1000; 0 turns it off).
 - Client channel options: `grpc.keepalive_time_ms` = `keepalive_timeout_ms`
@@ -1069,8 +1029,10 @@ every 0.5 s) instead of waiting on a backed-off socket. The first
 attempt after the network returned succeeded at once (`ESTAB`, rto 208,
 backoff 0).
 
-**Measured** on Docker Desktop: 5 nodes, PreVote on, 16 clients, deferred
-fsync, a 10 s partition of a follower, 3 runs per setting, no sampler.
+**Results** on Docker Desktop: 5 nodes, PreVote on, 16 clients, deferred
+fsync, a 10 s partition of a follower, 3 runs per setting, no sampler
+(`bench/results/keepalive/ka-{on,off}-{1,2,3}.json`; the two diagnostic
+runs and their `ss` captures are `diag2-*` there).
 Catch-up is timed on the victim's own container clock, from its network
 interface reappearing to its commit index reaching the highest index any
 node had reported:
@@ -1105,4 +1067,90 @@ everything arrive at once, late.
   checked by stubbing the allowance out.
 - Tests that keepalive off adds no ping options and that a negative
   value is rejected.
-- The fuzzer cannot see this: the simulator has no transport.
+
+The 9 Docker fault runs in `bench/results/docker/` (leader kill, partition
+with and without PreVote, 3 each) were rerun with keepalive on: all
+verified and linearizable; partition catch-up 262-401 ms with PreVote,
+374-647 ms without.
+
+## A follower's commit index went backwards: Figure 2's rule 5 taken literally
+
+Found by: the bench's catch-up trace on the Docker cluster, while
+investigating the partition stall (previous entry). Regression tests:
+`tests/test_commit_index.py`; invariant `check_commit_index_monotonic`.
+
+**Symptom.** On the Docker cluster, after a 10 s partition, the rejoined
+follower's reported commit index flipped between 713 and 1225 for ~7 s
+while it caught up (the bench's catch-up trace polls it every 50 ms). A
+node's commit index must never decrease.
+
+**Root cause.** `RaftNode._handle_append_entries` implemented AppendEntries
+rule 5 word for word: "if leaderCommit > commitIndex, set commitIndex =
+min(leaderCommit, index of last new entry)". When a message's last
+covered index (`prev_log_index + len(entries)`) is *below* the follower's
+commit index while its `leader_commit` is above it, that assignment lowers
+the commit index. The leader produces such messages routinely since
+per-peer flow control: to a peer with entries in flight, its heartbeat is
+empty and anchored at `next_index - 1` -- the last index that peer has
+*acknowledged* -- but carries the leader's *current* commit index. A
+follower catching up chunk by chunk already holds the chunk in flight and
+has committed through it (the chunk carried the commit index too); the
+heartbeat then drops it back one chunk. On Docker the chunks were 512
+entries (713 -> 1225), and the leader's view of the follower stayed stale
+for seconds because its TCP connection to it was in retransmission backoff
+(previous entry), so heartbeats kept arriving anchored at 713.
+
+Reproduced directly on a `RaftNode`: entries 1-10 with leader_commit 10,
+then a heartbeat with prev_log_index 5 and leader_commit 12: commit_index
+10 -> 5.
+
+**Why safety held.** Nothing is ever uncommitted by this: entries up to
+the old commit index stay committed everywhere (a majority holds them,
+and every later leader has them), `last_applied` never moves back so no
+entry is un-applied or re-applied, and clients are answered from applied
+state. What broke: the follower *reported* a stale, non-monotonic commit
+index (Status, and the benchmark's catch-up measurement), and it stopped
+applying until its commit index passed `last_applied` again. Had it won
+an election meanwhile it would have started from a lower commit index,
+which is safe -- a new leader recomputes it from match indexes.
+
+**Why the simulator missed it.** No invariant looked at commit_index over
+time, and the precondition is nearly unreachable in the fuzz phase:
+
+- it needs a heartbeat to land *inside* a chunk's flight -- after the
+  follower processed the chunk, before the leader processed the reply.
+  The fuzz phase runs every link at zero delay, so a reply returns
+  without simulated time passing; only an ADVANCE_CLOCK landing in exactly
+  that gap opens the window;
+- the other source of stale-anchored messages, STALE_REDELIVER and
+  duplicates, always carries an *old* `leader_commit`, which the
+  `leader_commit > commit_index` guard rejects.
+
+Counted across both 1000-seed sweeps (2,000 runs, 66,214 AppendEntries
+handled): 3,330 had a stale anchor and 17,721 a fresh leader_commit, but
+none had both. With the new invariant in place and the fix reverted,
+both sweeps still pass.
+
+**Fix.** Only ever raise it:
+`commit_index = max(commit_index, min(leader_commit, last_new_index))`.
+
+- New invariant `check_commit_index_monotonic`, run by the fuzzer after
+  every step: within one incarnation (a restart legitimately starts again
+  from 0; incarnations are told apart by node object identity), a node's
+  commit_index never decreases. Both sweeps check it now.
+- `tests/test_commit_index.py`: the `RaftNode` reproduction; a
+  deterministic simulator test -- a follower 20 entries behind catching up
+  in 5-entry chunks, with a 33 ms delay on its replies only and a 10 ms
+  tick, so each reply sends the next chunk mid-interval and the next
+  heartbeat finds it in flight -- which fails without the fix ("node 0
+  commit_index decreased from 10 to 5") and passes with it; and the
+  checker's own restart/crash handling.
+- No mutation-detection count moved.
+
+**Results.** Earlier catch-up figures from the process bench were not affected: none of
+their catch-up traces (leader-kill and large-gap, before and after the
+fix) shows a decrease -- on localhost a chunk's reply always beats the
+next heartbeat. After the fix, same benches, ext4, deferred, 16 clients:
+leader-kill catch-up 597 / 718 / 517 ms (before: 774 / 580 / 591 ms),
+large-gap 0.257 s (before: 0.365 s), within run-to-run spread; all
+verified and linearizable (`bench/results/commitfix/`).
