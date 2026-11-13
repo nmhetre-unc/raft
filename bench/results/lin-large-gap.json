@@ -1,0 +1,73 @@
+{
+  "linearizability": {
+    "linearizable": true,
+    "seconds": 0.005,
+    "summary": "1564 operations, linearizable"
+  },
+  "args": {
+    "nodes": 5,
+    "entries": 1500,
+    "value_bytes": 4096,
+    "clients": 16,
+    "timeout": 30.0,
+    "name": "lin-large-gap",
+    "out_dir": "bench/results",
+    "keep": false
+  },
+  "git": "258c2c5-dirty",
+  "leader": "n2",
+  "follower": "n0",
+  "follower_commit_at_kill": 1,
+  "entries_missing": 1500,
+  "catch_up_append_entries_bytes": 6186343,
+  "grpc_max_receive_bytes": 4194304,
+  "exceeds_limit": true,
+  "write_s": 1.47,
+  "target_commit": 1501,
+  "caught_up": true,
+  "restart_to_catch_up_s": 0.311,
+  "follower_trace": [
+    [
+      0.001,
+      null,
+      null
+    ],
+    [
+      0.258,
+      1017,
+      1
+    ],
+    [
+      0.311,
+      1501,
+      1
+    ]
+  ],
+  "final": {
+    "n0": {
+      "role": "follower",
+      "term": 1,
+      "commit": 1564
+    },
+    "n1": {
+      "role": "follower",
+      "term": 1,
+      "commit": 1564
+    },
+    "n2": {
+      "role": "leader",
+      "term": 1,
+      "commit": 1565
+    },
+    "n3": {
+      "role": "follower",
+      "term": 1,
+      "commit": 1564
+    },
+    "n4": {
+      "role": "follower",
+      "term": 1,
+      "commit": 1564
+    }
+  }
+}

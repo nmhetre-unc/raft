@@ -1,0 +1,246 @@
+{
+  "name": "mutation-local-reads",
+  "environment": {
+    "cpu_count": 12,
+    "os": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.16 (main, Oct 26 2026, 14:08:45) [Clang 23.1.3 ]",
+    "git": "258c2c5-dirty"
+  },
+  "options": {
+    "nodes": 5,
+    "clients": 16,
+    "duration": 30.0,
+    "fsync": "deferred",
+    "kill_at": 10.0,
+    "restart_at": 20.0,
+    "put_ratio": 0.5,
+    "keys": 100,
+    "seed": 0,
+    "out_dir": "/home/neilm/raft/bench/results",
+    "name": "mutation-local-reads",
+    "keep": false,
+    "profile": false,
+    "stats_every": 0.0,
+    "profile_native": false
+  },
+  "summary": {
+    "window": 30.0,
+    "ops": 41618,
+    "ok": 41618,
+    "failed": 0,
+    "puts_ok": 21010,
+    "gets_ok": 20608,
+    "ops_per_sec": 1387.2666666666667,
+    "latency_ms": {
+      "p50": 8.784783000010066,
+      "p99": 58.03893799929938,
+      "p99.9": 157.09768300075666
+    },
+    "longest_gap_s": 0.11925371999859635,
+    "longest_gap_at_s": 10.074014223000631,
+    "first_write_after_fault_s": {
+      "kill": 0.1817435849989124
+    }
+  },
+  "resources": {
+    "timeline": []
+  },
+  "verification": {
+    "converged": true,
+    "final_view": {
+      "n0": {
+        "role": "follower",
+        "term": 2,
+        "commit": 21016,
+        "applied": 21016,
+        "hint": "n3"
+      },
+      "n1": {
+        "role": "follower",
+        "term": 2,
+        "commit": 21016,
+        "applied": 21016,
+        "hint": "n3"
+      },
+      "n2": {
+        "role": "follower",
+        "term": 2,
+        "commit": 21016,
+        "applied": 21016,
+        "hint": "n3"
+      },
+      "n3": {
+        "role": "leader",
+        "term": 2,
+        "commit": 21016,
+        "applied": 21016,
+        "hint": "n2"
+      },
+      "n4": {
+        "role": "follower",
+        "term": 2,
+        "commit": 21016,
+        "applied": 21016,
+        "hint": "n3"
+      },
+      "alive": [
+        "n0",
+        "n1",
+        "n2",
+        "n3",
+        "n4"
+      ]
+    },
+    "nodes_checked": [
+      "n0",
+      "n1",
+      "n2",
+      "n3",
+      "n4"
+    ],
+    "commit_index": 21016,
+    "acknowledged_puts": 21010,
+    "prefix_problems": [],
+    "ack_problems": [],
+    "linearizability": {
+      "linearizable": false,
+      "operations": 41618,
+      "checked": 41,
+      "keys": 100,
+      "segments": 37,
+      "seconds": 0.053,
+      "summary": "41618 operations, NOT linearizable\nkey 'key0': no order of these operations is consistent with a register\n     c10 put := 'c10:213'      [0.0, 11.5] ms  ok via n2\n     c02 put := 'c02:228'      [91.3, 104.8] ms  ok via n2\n     c04 get <- 'c10:213'      [105.5, 107.2] ms  ok via n1"
+    }
+  },
+  "events": [
+    {
+      "t": 0.0036,
+      "kind": "term",
+      "node": "n0",
+      "term": 1
+    },
+    {
+      "t": 0.0036,
+      "kind": "term",
+      "node": "n1",
+      "term": 1
+    },
+    {
+      "t": 0.0036,
+      "kind": "term",
+      "node": "n2",
+      "term": 1
+    },
+    {
+      "t": 0.0036,
+      "kind": "term",
+      "node": "n3",
+      "term": 1
+    },
+    {
+      "t": 0.0036,
+      "kind": "term",
+      "node": "n4",
+      "term": 1
+    },
+    {
+      "t": 0.0036,
+      "kind": "leader",
+      "leader": "n2",
+      "term": 1,
+      "same_node": false
+    },
+    {
+      "t": 10.0141,
+      "kind": "kill",
+      "node": "n2"
+    },
+    {
+      "t": 10.2157,
+      "kind": "term",
+      "node": "n0",
+      "term": 2
+    },
+    {
+      "t": 10.2157,
+      "kind": "term",
+      "node": "n1",
+      "term": 2
+    },
+    {
+      "t": 10.2157,
+      "kind": "term",
+      "node": "n3",
+      "term": 2
+    },
+    {
+      "t": 10.2157,
+      "kind": "term",
+      "node": "n4",
+      "term": 2
+    },
+    {
+      "t": 10.2157,
+      "kind": "leader",
+      "leader": "n3",
+      "term": 2,
+      "same_node": false
+    },
+    {
+      "t": 20.0081,
+      "kind": "restart",
+      "node": "n2"
+    },
+    {
+      "t": 20.3659,
+      "kind": "term",
+      "node": "n2",
+      "term": 2
+    },
+    {
+      "t": 20.5619,
+      "kind": "caught_up",
+      "node": "n2",
+      "commit_index": 14363
+    }
+  ],
+  "failover": {
+    "killed": "n2",
+    "kill_at": 10.011524358000315,
+    "new_leader": "n3",
+    "a_kill_to_new_leader_s": 0.20417564199968474,
+    "b_kill_to_first_write_s": 0.1817435849989124
+  },
+  "restart": {
+    "restart_at": 20.007155025999964,
+    "catch_up_target_commit": 14363,
+    "caught_up": true,
+    "catch_up_trace": [
+      [
+        20.366,
+        8881
+      ],
+      [
+        20.409,
+        9905
+      ],
+      [
+        20.464,
+        11953
+      ],
+      [
+        20.512,
+        13489
+      ],
+      [
+        20.562,
+        14641
+      ]
+    ],
+    "e_restart_to_catch_up_s": 0.5547179599998344,
+    "c_elections_after_restart": 0,
+    "d_longest_write_stall_s": 0.014999758001067676,
+    "d_stall_starts_at": 24.3082227649993
+  },
+  "history": "mutation-local-reads.history.jsonl"
+}

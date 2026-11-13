@@ -15,7 +15,10 @@ must send to close the gap -- every entry the follower is missing, as an
 gRPC's default 4 MiB receive limit (neither our server nor our transport
 overrides it).
 
-Writes ``<name>.json`` to `--out-dir`. Not part of the test suite.
+Every put and, after catch-up, one read of every key are recorded and the
+history is checked for linearizability; a violation makes the exit status
+1. Writes ``<name>.json`` and ``<name>.history.jsonl`` to `--out-dir`.
+Not part of the test suite.
 """
 
 from __future__ import annotations
@@ -39,6 +42,8 @@ from raft.messages import AppendEntries  # noqa: E402
 from raft.net import raft_pb2 as pb  # noqa: E402
 from raft.net.client import RaftClient  # noqa: E402
 from raft.net.codec import decode_log_entry, encode_message  # noqa: E402
+from raft.net.linearizability import check as check_linearizability  # noqa: E402
+from raft.net.loadgen import OpKind, OpResult, write_history  # noqa: E402
 from raft.net.raft_pb2_grpc import RaftStub  # noqa: E402
 
 GRPC_DEFAULT_MAX_RECEIVE = 4 * 1024 * 1024
@@ -55,8 +60,32 @@ async def fetch_log(addr: str) -> pb.StatusReply:
         return reply
 
 
-async def write(members: dict[str, str], entries: int, value_bytes: int, clients: int) -> float:
-    value = "x" * value_bytes
+async def timed(
+    history: list[OpResult], client: RaftClient, kind: OpKind, key: str, value: str | None
+) -> None:
+    """Run one put or get and record it, loadgen-style, for the checker."""
+    start = time.monotonic()
+    error = None
+    try:
+        if kind == "put":
+            assert value is not None
+            await client.put(key, value)
+        else:
+            value = await client.get(key)
+    except Exception as exc:  # recorded, not raised
+        error = f"{type(exc).__name__}: {exc}"
+        value = value if kind == "put" else None
+    history.append(
+        OpResult(
+            client.client_id, kind, key, value, start, time.monotonic(), error is None,
+            client.leader, error,
+        )
+    )  # fmt: skip
+
+
+async def write(
+    members: dict[str, str], entries: int, value_bytes: int, clients: int, history: list[OpResult]
+) -> float:
     remaining = iter(range(entries))
     start = time.monotonic()
 
@@ -64,12 +93,24 @@ async def write(members: dict[str, str], entries: int, value_bytes: int, clients
         client = RaftClient(members, client_id=f"w{n}")
         try:
             for i in remaining:
-                await client.put(f"k{i % 64}", value)
+                tag = f"w{n}:{i}:"  # every value unique, as the checker requires
+                value = tag + "x" * max(0, value_bytes - len(tag))
+                await timed(history, client, "put", f"k{i % 64}", value)
         finally:
             await client.close()
 
     await asyncio.gather(*(worker(n) for n in range(clients)))
     return time.monotonic() - start
+
+
+async def read_back(members: dict[str, str], history: list[OpResult]) -> None:
+    """One read of every key, so the history has reads to check."""
+    client = RaftClient(members, client_id="reader")
+    try:
+        for k in range(64):
+            await timed(history, client, "get", f"k{k}", None)
+    finally:
+        await client.close()
 
 
 async def run(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
@@ -85,7 +126,8 @@ async def run(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
         cluster.kill(follower)
 
         live = {n: a for n, a in cluster.nodes.items() if n != follower}
-        write_s = await write(live, args.entries, args.value_bytes, args.clients)
+        history: list[OpResult] = []
+        write_s = await write(live, args.entries, args.value_bytes, args.clients, history)
 
         reply = await fetch_log(cluster.nodes[leader])
         assert reply.role == "leader", f"{leader} lost leadership during the writes"
@@ -116,8 +158,16 @@ async def run(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
                 caught_up_s = t
                 break
             await asyncio.sleep(POLL_INTERVAL)
+        await read_back(cluster.nodes, history)
+        linear = check_linearizability(history)
         final = await cluster.statuses()
         return {
+            "linearizability": {
+                "linearizable": linear.ok,
+                "seconds": round(linear.seconds, 3),
+                "summary": linear.summary(),
+            },
+            "_history": history,
             "args": vars(args),
             "git": git_revision(),
             "leader": leader,
@@ -155,7 +205,9 @@ def main() -> int:
 
     workdir = Path(tempfile.mkdtemp(prefix="raft-gap-"))
     result = asyncio.run(run(args, workdir))
+    history = result.pop("_history")
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    write_history(history, args.out_dir / f"{args.name}.history.jsonl")
     (args.out_dir / f"{args.name}.json").write_text(json.dumps(result, indent=2, default=str))
     print(
         json.dumps(
@@ -174,7 +226,10 @@ def main() -> int:
         shutil.rmtree(workdir, ignore_errors=True)
     else:
         print("data in", workdir)
-    return 0
+    lin = result["linearizability"]
+    first, *rest = lin["summary"].splitlines()
+    print("\n".join([f"{first}  (checked in {lin['seconds']:.2f} s)", *rest]))
+    return 0 if lin["linearizable"] else 1
 
 
 if __name__ == "__main__":

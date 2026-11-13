@@ -17,7 +17,9 @@ clients for `--duration` seconds. Meanwhile:
 - at `--restart-at` it is restarted on the same data directory.
 
 Afterwards it waits for all live nodes to report the same commit index,
-fetches every log, and runs both `raft.net.verify` checks. It prints a
+fetches every log, runs both `raft.net.verify` checks, and checks the
+history for linearizability (`raft.net.linearizability`); any failure
+makes the exit status 1. It prints a
 report and writes ``<name>.json`` (environment, options, summary,
 failover and restart metrics, events, verification) and
 ``<name>.history.jsonl`` (every operation) to `--out-dir`.
@@ -71,6 +73,7 @@ import grpc
 from raft.net import raft_pb2 as pb
 from raft.net.client import RaftClient
 from raft.net.codec import decode_log_entry
+from raft.net.linearizability import check as check_linearizability
 from raft.net.loadgen import (
     Fault,
     OpResult,
@@ -535,6 +538,16 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
             "ack_problems": acknowledged_puts_committed(longest.committed(), acked),
         }
 
+        linear = check_linearizability(ops)
+        verification["linearizability"] = {
+            "linearizable": linear.ok,
+            "operations": linear.operations,
+            "checked": linear.checked,
+            "keys": linear.keys,
+            "segments": linear.segments,
+            "seconds": round(linear.seconds, 3),
+            "summary": linear.summary(),
+        }
         summary = summarize(ops, start=t0, end=load_end, faults=faults)
         result: dict[str, Any] = {
             "summary": dataclasses.asdict(summary),
@@ -590,11 +603,20 @@ def fmt(value: float | None, scale: float = 1.0, digits: int = 1) -> str:
     return "-" if value is None else f"{value * scale:.{digits}f}"
 
 
+def verified(v: dict[str, Any]) -> bool:
+    return (
+        v["converged"]
+        and not v["prefix_problems"]
+        and not v["ack_problems"]
+        and v["linearizability"]["linearizable"]
+    )
+
+
 def report(name: str, result: dict[str, Any]) -> None:
     s = result["summary"]
     lat = s["latency_ms"]
     v = result["verification"]
-    ok = not v["prefix_problems"] and not v["ack_problems"] and v["converged"]
+    ok = verified(v)
     print(f"== {name}")
     print(
         f"   {s['ops_per_sec']:.0f} ops/s ({s['ok']} ok, {s['failed']} failed)  "
@@ -645,6 +667,11 @@ def report(name: str, result: dict[str, Any]) -> None:
         f"{len(v['prefix_problems'])} prefix problems, {len(v['ack_problems'])} missing of "
         f"{v['acknowledged_puts']} acknowledged puts)"
     )
+    lin = v["linearizability"]
+    first, *rest = lin["summary"].splitlines()
+    print(f"   {first}  (checked in {lin['seconds']:.2f} s)")
+    for line in rest:
+        print(f"   {line}")
 
 
 def main() -> int:
@@ -708,7 +735,7 @@ def main() -> int:
     else:
         shutil.rmtree(workdir)
     v = output["verification"]
-    return 0 if v["converged"] and not v["prefix_problems"] and not v["ack_problems"] else 1
+    return 0 if verified(v) else 1
 
 
 if __name__ == "__main__":
