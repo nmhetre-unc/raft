@@ -207,3 +207,53 @@ def test_save_term_and_vote_rejects_non_str_voted_for() -> None:
     storage = MemoryStorage()
     with pytest.raises(TypeError, match="voted_for"):
         storage.save_term_and_vote(1, 42)  # type: ignore[arg-type]
+
+
+# -- Bounded reads: entry_at, term_at, entries_from --
+
+
+def _three() -> MemoryStorage:
+    storage = MemoryStorage()
+    storage.append_entries([LogEntry(1, "a"), LogEntry(1, "b"), LogEntry(2, "c")])
+    return storage
+
+
+def test_entry_at_and_term_at_read_one_entry_including_the_sentinel() -> None:
+    storage = _three()
+    assert storage.entry_at(0) == SENTINEL
+    assert storage.entry_at(3) == LogEntry(2, "c")
+    assert [storage.term_at(i) for i in range(4)] == [0, 1, 1, 2]
+
+
+@pytest.mark.parametrize("index", [-1, -4, 4])
+def test_entry_at_rejects_out_of_range_indexes_including_negative(index: int) -> None:
+    storage = _three()
+    with pytest.raises(IndexError):
+        storage.entry_at(index)
+    with pytest.raises(IndexError):
+        storage.term_at(index)
+
+
+def test_entries_from_is_a_bounded_slice() -> None:
+    storage = _three()
+    log = storage.load_log()
+    for start in range(5):
+        for count in range(5):
+            assert storage.entries_from(start, count) == log[start : start + count]
+    assert storage.entries_from(4, 10) == []  # one past the end
+
+
+@pytest.mark.parametrize(
+    ("start", "count", "error"), [(-1, 1, IndexError), (5, 1, IndexError), (1, -1, ValueError)]
+)
+def test_entries_from_rejects_bad_arguments(start: int, count: int, error: type) -> None:
+    with pytest.raises(error):
+        _three().entries_from(start, count)
+
+
+def test_entries_from_returns_a_copy_not_a_live_view() -> None:
+    storage = _three()
+    chunk = storage.entries_from(1, 2)
+    chunk.clear()
+    storage.truncate_from(1)
+    assert storage.entries_from(0, 10) == [SENTINEL]

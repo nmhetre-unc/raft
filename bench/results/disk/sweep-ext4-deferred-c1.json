@@ -1,0 +1,254 @@
+{
+  "name": "sweep-ext4-deferred-c1",
+  "environment": {
+    "cpu_count": 12,
+    "os": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.16 (main, Oct 26 2026, 14:08:45) [Clang 23.1.3 ]",
+    "git": "1eddb29-dirty",
+    "storage": {
+      "data_dir": "/home/neilm/.cache/raft-bench/raft-bench-heu4s0oc",
+      "fs_type": "ext4",
+      "device": "/dev/sdd",
+      "mount_point": "/"
+    }
+  },
+  "options": {
+    "nodes": 5,
+    "clients": 1,
+    "duration": 20.0,
+    "fsync": "deferred",
+    "kill_at": null,
+    "restart_at": null,
+    "put_ratio": 0.5,
+    "keys": 100,
+    "seed": 0,
+    "op_timeout": 30.0,
+    "out_dir": "bench/results/disk",
+    "name": "sweep-ext4-deferred-c1",
+    "keep": false,
+    "tmpfs": false,
+    "profile": false,
+    "stats_every": 0.0,
+    "profile_native": false,
+    "external": null,
+    "chaos": null,
+    "chaos_at": 10.0
+  },
+  "t0_unix": 1794540178.3338876,
+  "summary": {
+    "window": 20.0,
+    "ops": 2487,
+    "ok": 2487,
+    "failed": 0,
+    "puts_ok": 1242,
+    "gets_ok": 1245,
+    "ops_per_sec": 124.35,
+    "latency_ms": {
+      "p50": 7.698822000065775,
+      "p99": 13.083754000035697,
+      "p99.9": 18.038853000007293
+    },
+    "longest_gap_s": 0.029225992999954542,
+    "longest_gap_at_s": 0.0,
+    "first_write_after_fault_s": {}
+  },
+  "resources": {
+    "timeline": [],
+    "leader_log_fsyncs": 2487,
+    "leader_log_fsyncs_per_s": 124.26248529911605,
+    "leader_entries_per_fsync": 1.0,
+    "leader_fsync_ms_mean": 1.5416179445089198,
+    "leader_fsync_percent_of_wall": 19.156527716639314,
+    "leader": "n3",
+    "wall_s": 20.01408545800018,
+    "cpu_percent": {
+      "n0": 29.978886682537045,
+      "n1": 30.078816304812168,
+      "n2": 29.679097815711675,
+      "n3": 72.69880020515234,
+      "n4": 30.228710738224855
+    },
+    "leader_thread_cpu_percent": {
+      "main (event loop)": 41.3,
+      "event_engine": 23.1,
+      "python": 7.5,
+      "grpc_global_tim": 0.0,
+      "lifeguard": 0.0
+    },
+    "committed_entries": 2487,
+    "append_entries_per_entry": 4.001608363490149,
+    "append_entries_with_entries_per_entry": 4.0,
+    "entries_sent_per_entry": 4.0,
+    "bytes_encoded_per_entry": 198.1101728990752,
+    "leader_stats_start": {
+      "node_id": "n3",
+      "role": "leader",
+      "commit_index": 1,
+      "monotonic": 1056.55184823,
+      "cpu_user_s": 0.17,
+      "cpu_system_s": 0.06,
+      "transport": {
+        "sent": {
+          "PreVote": 4,
+          "RequestVote": 4,
+          "AppendEntries": 4
+        },
+        "append_entries_with_entries": 4,
+        "entries_sent": 4,
+        "bytes_encoded": 160,
+        "dropped": 0,
+        "failed": 0
+      },
+      "storage": {
+        "log_length": 1,
+        "load_log_calls": 0,
+        "load_log_entries": 0,
+        "load_log_seconds": 0.0,
+        "log_fsyncs": 1,
+        "log_fsync_seconds": 0.002118399999972098,
+        "entries_synced": 1
+      }
+    },
+    "leader_stats_end": {
+      "node_id": "n3",
+      "role": "leader",
+      "commit_index": 2488,
+      "monotonic": 1076.565933688,
+      "cpu_user_s": 9.03,
+      "cpu_system_s": 5.74,
+      "transport": {
+        "sent": {
+          "PreVote": 4,
+          "RequestVote": 4,
+          "AppendEntries": 9956
+        },
+        "append_entries_with_entries": 9952,
+        "entries_sent": 9952,
+        "bytes_encoded": 492860,
+        "dropped": 0,
+        "failed": 0
+      },
+      "storage": {
+        "log_length": 2488,
+        "load_log_calls": 0,
+        "load_log_entries": 0,
+        "load_log_seconds": 0.0,
+        "log_fsyncs": 2488,
+        "log_fsync_seconds": 3.8361222279936555,
+        "entries_synced": 2488
+      }
+    }
+  },
+  "verification": {
+    "converged": true,
+    "final_view": {
+      "n0": {
+        "role": "follower",
+        "term": 1,
+        "commit": 2488,
+        "applied": 2488,
+        "hint": "n3"
+      },
+      "n1": {
+        "role": "follower",
+        "term": 1,
+        "commit": 2488,
+        "applied": 2488,
+        "hint": "n3"
+      },
+      "n2": {
+        "role": "follower",
+        "term": 1,
+        "commit": 2488,
+        "applied": 2488,
+        "hint": "n3"
+      },
+      "n3": {
+        "role": "leader",
+        "term": 1,
+        "commit": 2488,
+        "applied": 2488,
+        "hint": ""
+      },
+      "n4": {
+        "role": "follower",
+        "term": 1,
+        "commit": 2488,
+        "applied": 2488,
+        "hint": "n3"
+      },
+      "alive": [
+        "n0",
+        "n1",
+        "n2",
+        "n3",
+        "n4"
+      ]
+    },
+    "nodes_checked": [
+      "n0",
+      "n1",
+      "n2",
+      "n3",
+      "n4"
+    ],
+    "commit_index": 2488,
+    "acknowledged_puts": 1242,
+    "prefix_problems": [],
+    "ack_problems": [],
+    "linearizability": {
+      "linearizable": true,
+      "operations": 2487,
+      "checked": 2487,
+      "keys": 100,
+      "segments": 2487,
+      "seconds": 0.004,
+      "summary": "2487 operations, linearizable",
+      "unknown_outcome_puts": {
+        "failed": 0,
+        "observed": 0,
+        "unobserved": 0
+      }
+    }
+  },
+  "events": [
+    {
+      "t": 0.0018,
+      "kind": "term",
+      "node": "n0",
+      "term": 1
+    },
+    {
+      "t": 0.0019,
+      "kind": "term",
+      "node": "n1",
+      "term": 1
+    },
+    {
+      "t": 0.0019,
+      "kind": "term",
+      "node": "n2",
+      "term": 1
+    },
+    {
+      "t": 0.0019,
+      "kind": "term",
+      "node": "n3",
+      "term": 1
+    },
+    {
+      "t": 0.0019,
+      "kind": "term",
+      "node": "n4",
+      "term": 1
+    },
+    {
+      "t": 0.0019,
+      "kind": "leader",
+      "leader": "n3",
+      "term": 1,
+      "same_node": false
+    }
+  ],
+  "history": "sweep-ext4-deferred-c1.history.jsonl"
+}

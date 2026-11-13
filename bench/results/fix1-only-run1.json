@@ -1,0 +1,1156 @@
+{
+  "name": "fix1-only-run1",
+  "environment": {
+    "cpu_count": 12,
+    "os": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.16 (main, Oct 26 2026, 14:08:45) [Clang 23.1.3 ]",
+    "git": "0fa374b-dirty"
+  },
+  "options": {
+    "nodes": 5,
+    "clients": 16,
+    "duration": 30.0,
+    "fsync": "deferred",
+    "kill_at": 10.0,
+    "restart_at": 20.0,
+    "put_ratio": 0.5,
+    "keys": 100,
+    "seed": 0,
+    "out_dir": "/home/neilm/raft/bench/results",
+    "name": "fix1-only-run1",
+    "keep": false
+  },
+  "summary": {
+    "window": 30.0,
+    "ops": 6576,
+    "ok": 6576,
+    "failed": 0,
+    "puts_ok": 3294,
+    "gets_ok": 3282,
+    "ops_per_sec": 219.2,
+    "latency_ms": {
+      "p50": 52.262204999351525,
+      "p99": 278.61986799962324,
+      "p99.9": 324.29563400000916
+    },
+    "longest_gap_s": 0.25122464899959596,
+    "longest_gap_at_s": 10.007206838000457,
+    "first_write_after_fault_s": {
+      "kill": 0.2583792529994753
+    }
+  },
+  "verification": {
+    "converged": true,
+    "final_view": {
+      "n0": {
+        "role": "follower",
+        "term": 24,
+        "commit": 6604,
+        "applied": 6604,
+        "hint": "n4"
+      },
+      "n1": {
+        "role": "follower",
+        "term": 24,
+        "commit": 6604,
+        "applied": 6604,
+        "hint": "n4"
+      },
+      "n2": {
+        "role": "follower",
+        "term": 24,
+        "commit": 6604,
+        "applied": 6604,
+        "hint": "n4"
+      },
+      "n3": {
+        "role": "follower",
+        "term": 24,
+        "commit": 6604,
+        "applied": 6604,
+        "hint": "n4"
+      },
+      "n4": {
+        "role": "leader",
+        "term": 24,
+        "commit": 6604,
+        "applied": 6604,
+        "hint": "n0"
+      },
+      "alive": [
+        "n0",
+        "n1",
+        "n2",
+        "n3",
+        "n4"
+      ]
+    },
+    "nodes_checked": [
+      "n0",
+      "n1",
+      "n2",
+      "n3",
+      "n4"
+    ],
+    "commit_index": 6604,
+    "acknowledged_puts": 3294,
+    "prefix_problems": [],
+    "ack_problems": []
+  },
+  "events": [
+    {
+      "t": 0.0033,
+      "kind": "term",
+      "node": "n0",
+      "term": 1
+    },
+    {
+      "t": 0.0033,
+      "kind": "term",
+      "node": "n1",
+      "term": 1
+    },
+    {
+      "t": 0.0033,
+      "kind": "term",
+      "node": "n2",
+      "term": 1
+    },
+    {
+      "t": 0.0033,
+      "kind": "term",
+      "node": "n3",
+      "term": 1
+    },
+    {
+      "t": 0.0033,
+      "kind": "term",
+      "node": "n4",
+      "term": 1
+    },
+    {
+      "t": 0.0034,
+      "kind": "leader",
+      "leader": "n0",
+      "term": 1,
+      "same_node": false
+    },
+    {
+      "t": 10.0128,
+      "kind": "kill",
+      "node": "n0"
+    },
+    {
+      "t": 10.2309,
+      "kind": "term",
+      "node": "n1",
+      "term": 2
+    },
+    {
+      "t": 10.231,
+      "kind": "term",
+      "node": "n2",
+      "term": 2
+    },
+    {
+      "t": 10.231,
+      "kind": "term",
+      "node": "n3",
+      "term": 2
+    },
+    {
+      "t": 10.231,
+      "kind": "term",
+      "node": "n4",
+      "term": 2
+    },
+    {
+      "t": 10.231,
+      "kind": "leader",
+      "leader": "n4",
+      "term": 2,
+      "same_node": false
+    },
+    {
+      "t": 20.0101,
+      "kind": "restart",
+      "node": "n0"
+    },
+    {
+      "t": 20.4323,
+      "kind": "term",
+      "node": "n0",
+      "term": 2
+    },
+    {
+      "t": 20.7342,
+      "kind": "term",
+      "node": "n0",
+      "term": 3
+    },
+    {
+      "t": 20.7342,
+      "kind": "term",
+      "node": "n1",
+      "term": 3
+    },
+    {
+      "t": 20.7342,
+      "kind": "term",
+      "node": "n2",
+      "term": 3
+    },
+    {
+      "t": 20.7342,
+      "kind": "term",
+      "node": "n3",
+      "term": 3
+    },
+    {
+      "t": 20.7342,
+      "kind": "term",
+      "node": "n4",
+      "term": 4
+    },
+    {
+      "t": 20.787,
+      "kind": "term",
+      "node": "n1",
+      "term": 4
+    },
+    {
+      "t": 20.787,
+      "kind": "term",
+      "node": "n2",
+      "term": 4
+    },
+    {
+      "t": 20.787,
+      "kind": "term",
+      "node": "n3",
+      "term": 4
+    },
+    {
+      "t": 20.7871,
+      "kind": "leader",
+      "leader": "n4",
+      "term": 4,
+      "same_node": true
+    },
+    {
+      "t": 20.9358,
+      "kind": "term",
+      "node": "n0",
+      "term": 4
+    },
+    {
+      "t": 21.1379,
+      "kind": "term",
+      "node": "n0",
+      "term": 5
+    },
+    {
+      "t": 21.1379,
+      "kind": "term",
+      "node": "n1",
+      "term": 6
+    },
+    {
+      "t": 21.1379,
+      "kind": "term",
+      "node": "n2",
+      "term": 5
+    },
+    {
+      "t": 21.1379,
+      "kind": "term",
+      "node": "n3",
+      "term": 6
+    },
+    {
+      "t": 21.138,
+      "kind": "term",
+      "node": "n4",
+      "term": 6
+    },
+    {
+      "t": 21.1895,
+      "kind": "term",
+      "node": "n2",
+      "term": 6
+    },
+    {
+      "t": 21.1895,
+      "kind": "leader",
+      "leader": "n4",
+      "term": 6,
+      "same_node": true
+    },
+    {
+      "t": 21.3935,
+      "kind": "term",
+      "node": "n0",
+      "term": 6
+    },
+    {
+      "t": 21.6965,
+      "kind": "term",
+      "node": "n0",
+      "term": 7
+    },
+    {
+      "t": 21.6965,
+      "kind": "term",
+      "node": "n1",
+      "term": 8
+    },
+    {
+      "t": 21.6965,
+      "kind": "term",
+      "node": "n2",
+      "term": 7
+    },
+    {
+      "t": 21.6965,
+      "kind": "term",
+      "node": "n3",
+      "term": 8
+    },
+    {
+      "t": 21.6966,
+      "kind": "term",
+      "node": "n4",
+      "term": 8
+    },
+    {
+      "t": 21.7476,
+      "kind": "term",
+      "node": "n2",
+      "term": 8
+    },
+    {
+      "t": 21.7476,
+      "kind": "leader",
+      "leader": "n4",
+      "term": 8,
+      "same_node": true
+    },
+    {
+      "t": 21.8984,
+      "kind": "term",
+      "node": "n0",
+      "term": 8
+    },
+    {
+      "t": 22.1524,
+      "kind": "term",
+      "node": "n0",
+      "term": 9
+    },
+    {
+      "t": 22.1524,
+      "kind": "term",
+      "node": "n1",
+      "term": 10
+    },
+    {
+      "t": 22.1524,
+      "kind": "term",
+      "node": "n2",
+      "term": 10
+    },
+    {
+      "t": 22.1524,
+      "kind": "term",
+      "node": "n3",
+      "term": 10
+    },
+    {
+      "t": 22.1524,
+      "kind": "term",
+      "node": "n4",
+      "term": 10
+    },
+    {
+      "t": 22.1524,
+      "kind": "leader",
+      "leader": "n4",
+      "term": 10,
+      "same_node": true
+    },
+    {
+      "t": 22.3533,
+      "kind": "term",
+      "node": "n0",
+      "term": 10
+    },
+    {
+      "t": 22.6078,
+      "kind": "term",
+      "node": "n0",
+      "term": 11
+    },
+    {
+      "t": 22.6078,
+      "kind": "term",
+      "node": "n1",
+      "term": 12
+    },
+    {
+      "t": 22.6078,
+      "kind": "term",
+      "node": "n2",
+      "term": 12
+    },
+    {
+      "t": 22.6078,
+      "kind": "term",
+      "node": "n3",
+      "term": 12
+    },
+    {
+      "t": 22.6078,
+      "kind": "term",
+      "node": "n4",
+      "term": 12
+    },
+    {
+      "t": 22.6078,
+      "kind": "leader",
+      "leader": "n4",
+      "term": 12,
+      "same_node": true
+    },
+    {
+      "t": 22.8613,
+      "kind": "term",
+      "node": "n0",
+      "term": 12
+    },
+    {
+      "t": 23.0623,
+      "kind": "term",
+      "node": "n0",
+      "term": 13
+    },
+    {
+      "t": 23.0624,
+      "kind": "term",
+      "node": "n1",
+      "term": 14
+    },
+    {
+      "t": 23.0624,
+      "kind": "term",
+      "node": "n2",
+      "term": 14
+    },
+    {
+      "t": 23.0624,
+      "kind": "term",
+      "node": "n3",
+      "term": 13
+    },
+    {
+      "t": 23.0624,
+      "kind": "term",
+      "node": "n4",
+      "term": 14
+    },
+    {
+      "t": 23.115,
+      "kind": "term",
+      "node": "n3",
+      "term": 14
+    },
+    {
+      "t": 23.115,
+      "kind": "leader",
+      "leader": "n4",
+      "term": 14,
+      "same_node": true
+    },
+    {
+      "t": 23.3174,
+      "kind": "term",
+      "node": "n0",
+      "term": 14
+    },
+    {
+      "t": 23.4664,
+      "kind": "term",
+      "node": "n0",
+      "term": 15
+    },
+    {
+      "t": 23.4664,
+      "kind": "term",
+      "node": "n1",
+      "term": 16
+    },
+    {
+      "t": 23.4664,
+      "kind": "term",
+      "node": "n2",
+      "term": 15
+    },
+    {
+      "t": 23.4664,
+      "kind": "term",
+      "node": "n3",
+      "term": 16
+    },
+    {
+      "t": 23.4664,
+      "kind": "term",
+      "node": "n4",
+      "term": 16
+    },
+    {
+      "t": 23.5186,
+      "kind": "term",
+      "node": "n2",
+      "term": 16
+    },
+    {
+      "t": 23.5186,
+      "kind": "leader",
+      "leader": "n4",
+      "term": 16,
+      "same_node": true
+    },
+    {
+      "t": 23.6708,
+      "kind": "term",
+      "node": "n0",
+      "term": 16
+    },
+    {
+      "t": 23.8257,
+      "kind": "term",
+      "node": "n0",
+      "term": 17
+    },
+    {
+      "t": 23.8741,
+      "kind": "term",
+      "node": "n1",
+      "term": 18
+    },
+    {
+      "t": 23.8741,
+      "kind": "term",
+      "node": "n2",
+      "term": 18
+    },
+    {
+      "t": 23.8741,
+      "kind": "term",
+      "node": "n3",
+      "term": 18
+    },
+    {
+      "t": 23.8741,
+      "kind": "term",
+      "node": "n4",
+      "term": 18
+    },
+    {
+      "t": 23.8741,
+      "kind": "leader",
+      "leader": "n4",
+      "term": 18,
+      "same_node": true
+    },
+    {
+      "t": 24.0268,
+      "kind": "term",
+      "node": "n0",
+      "term": 18
+    },
+    {
+      "t": 24.281,
+      "kind": "term",
+      "node": "n0",
+      "term": 19
+    },
+    {
+      "t": 24.281,
+      "kind": "term",
+      "node": "n1",
+      "term": 20
+    },
+    {
+      "t": 24.281,
+      "kind": "term",
+      "node": "n2",
+      "term": 20
+    },
+    {
+      "t": 24.281,
+      "kind": "term",
+      "node": "n3",
+      "term": 20
+    },
+    {
+      "t": 24.281,
+      "kind": "term",
+      "node": "n4",
+      "term": 20
+    },
+    {
+      "t": 24.3369,
+      "kind": "leader",
+      "leader": "n4",
+      "term": 20,
+      "same_node": true
+    },
+    {
+      "t": 24.4824,
+      "kind": "term",
+      "node": "n0",
+      "term": 20
+    },
+    {
+      "t": 24.7352,
+      "kind": "term",
+      "node": "n0",
+      "term": 21
+    },
+    {
+      "t": 24.7352,
+      "kind": "term",
+      "node": "n1",
+      "term": 21
+    },
+    {
+      "t": 24.7352,
+      "kind": "term",
+      "node": "n2",
+      "term": 21
+    },
+    {
+      "t": 24.7352,
+      "kind": "term",
+      "node": "n3",
+      "term": 21
+    },
+    {
+      "t": 24.7352,
+      "kind": "term",
+      "node": "n4",
+      "term": 22
+    },
+    {
+      "t": 24.7941,
+      "kind": "term",
+      "node": "n1",
+      "term": 22
+    },
+    {
+      "t": 24.7941,
+      "kind": "term",
+      "node": "n2",
+      "term": 22
+    },
+    {
+      "t": 24.7941,
+      "kind": "term",
+      "node": "n3",
+      "term": 22
+    },
+    {
+      "t": 24.7942,
+      "kind": "leader",
+      "leader": "n4",
+      "term": 22,
+      "same_node": true
+    },
+    {
+      "t": 25.043,
+      "kind": "term",
+      "node": "n0",
+      "term": 22
+    },
+    {
+      "t": 25.2936,
+      "kind": "term",
+      "node": "n0",
+      "term": 23
+    },
+    {
+      "t": 25.2936,
+      "kind": "term",
+      "node": "n1",
+      "term": 24
+    },
+    {
+      "t": 25.2936,
+      "kind": "term",
+      "node": "n2",
+      "term": 24
+    },
+    {
+      "t": 25.2936,
+      "kind": "term",
+      "node": "n3",
+      "term": 24
+    },
+    {
+      "t": 25.2936,
+      "kind": "term",
+      "node": "n4",
+      "term": 24
+    },
+    {
+      "t": 25.2937,
+      "kind": "leader",
+      "leader": "n4",
+      "term": 24,
+      "same_node": true
+    },
+    {
+      "t": 25.3975,
+      "kind": "term",
+      "node": "n0",
+      "term": 24
+    },
+    {
+      "t": 25.4881,
+      "kind": "caught_up",
+      "node": "n0",
+      "commit_index": 4745
+    }
+  ],
+  "failover": {
+    "killed": "n0",
+    "kill_at": 10.009059105000233,
+    "new_leader": "n4",
+    "a_kill_to_new_leader_s": 0.22194089499976677,
+    "b_kill_to_first_write_s": 0.2583792529994753
+  },
+  "restart": {
+    "restart_at": 20.009411564000402,
+    "catch_up_target_commit": 4745,
+    "caught_up": true,
+    "catch_up_trace": [
+      [
+        20.285,
+        0
+      ],
+      [
+        20.334,
+        0
+      ],
+      [
+        20.39,
+        0
+      ],
+      [
+        20.432,
+        0
+      ],
+      [
+        20.48,
+        0
+      ],
+      [
+        20.537,
+        0
+      ],
+      [
+        20.586,
+        0
+      ],
+      [
+        20.635,
+        0
+      ],
+      [
+        20.69,
+        0
+      ],
+      [
+        20.734,
+        0
+      ],
+      [
+        20.787,
+        0
+      ],
+      [
+        20.837,
+        0
+      ],
+      [
+        20.887,
+        0
+      ],
+      [
+        20.936,
+        0
+      ],
+      [
+        20.988,
+        0
+      ],
+      [
+        21.04,
+        0
+      ],
+      [
+        21.09,
+        0
+      ],
+      [
+        21.138,
+        0
+      ],
+      [
+        21.189,
+        0
+      ],
+      [
+        21.241,
+        0
+      ],
+      [
+        21.292,
+        0
+      ],
+      [
+        21.342,
+        0
+      ],
+      [
+        21.394,
+        0
+      ],
+      [
+        21.443,
+        0
+      ],
+      [
+        21.492,
+        0
+      ],
+      [
+        21.545,
+        0
+      ],
+      [
+        21.597,
+        0
+      ],
+      [
+        21.647,
+        0
+      ],
+      [
+        21.697,
+        0
+      ],
+      [
+        21.748,
+        0
+      ],
+      [
+        21.798,
+        0
+      ],
+      [
+        21.848,
+        0
+      ],
+      [
+        21.898,
+        0
+      ],
+      [
+        21.948,
+        0
+      ],
+      [
+        21.999,
+        0
+      ],
+      [
+        22.049,
+        0
+      ],
+      [
+        22.101,
+        0
+      ],
+      [
+        22.152,
+        0
+      ],
+      [
+        22.202,
+        0
+      ],
+      [
+        22.252,
+        0
+      ],
+      [
+        22.303,
+        0
+      ],
+      [
+        22.353,
+        0
+      ],
+      [
+        22.404,
+        0
+      ],
+      [
+        22.455,
+        0
+      ],
+      [
+        22.507,
+        0
+      ],
+      [
+        22.558,
+        0
+      ],
+      [
+        22.608,
+        0
+      ],
+      [
+        22.658,
+        0
+      ],
+      [
+        22.708,
+        0
+      ],
+      [
+        22.76,
+        0
+      ],
+      [
+        22.81,
+        0
+      ],
+      [
+        22.861,
+        0
+      ],
+      [
+        22.912,
+        0
+      ],
+      [
+        22.963,
+        0
+      ],
+      [
+        23.014,
+        0
+      ],
+      [
+        23.062,
+        0
+      ],
+      [
+        23.115,
+        0
+      ],
+      [
+        23.165,
+        0
+      ],
+      [
+        23.214,
+        0
+      ],
+      [
+        23.265,
+        0
+      ],
+      [
+        23.317,
+        0
+      ],
+      [
+        23.367,
+        0
+      ],
+      [
+        23.418,
+        0
+      ],
+      [
+        23.466,
+        0
+      ],
+      [
+        23.519,
+        0
+      ],
+      [
+        23.569,
+        0
+      ],
+      [
+        23.62,
+        0
+      ],
+      [
+        23.671,
+        0
+      ],
+      [
+        23.722,
+        0
+      ],
+      [
+        23.776,
+        0
+      ],
+      [
+        23.826,
+        0
+      ],
+      [
+        23.874,
+        0
+      ],
+      [
+        23.927,
+        0
+      ],
+      [
+        23.978,
+        0
+      ],
+      [
+        24.027,
+        0
+      ],
+      [
+        24.077,
+        0
+      ],
+      [
+        24.128,
+        0
+      ],
+      [
+        24.179,
+        0
+      ],
+      [
+        24.229,
+        0
+      ],
+      [
+        24.281,
+        0
+      ],
+      [
+        24.337,
+        0
+      ],
+      [
+        24.386,
+        0
+      ],
+      [
+        24.432,
+        0
+      ],
+      [
+        24.482,
+        0
+      ],
+      [
+        24.533,
+        0
+      ],
+      [
+        24.585,
+        0
+      ],
+      [
+        24.636,
+        0
+      ],
+      [
+        24.687,
+        0
+      ],
+      [
+        24.735,
+        0
+      ],
+      [
+        24.794,
+        0
+      ],
+      [
+        24.844,
+        0
+      ],
+      [
+        24.897,
+        0
+      ],
+      [
+        24.941,
+        0
+      ],
+      [
+        24.993,
+        0
+      ],
+      [
+        25.043,
+        0
+      ],
+      [
+        25.095,
+        0
+      ],
+      [
+        25.143,
+        0
+      ],
+      [
+        25.197,
+        0
+      ],
+      [
+        25.247,
+        0
+      ],
+      [
+        25.294,
+        0
+      ],
+      [
+        25.345,
+        0
+      ],
+      [
+        25.397,
+        0
+      ],
+      [
+        25.488,
+        6102
+      ]
+    ],
+    "e_restart_to_catch_up_s": 5.478699276000043,
+    "c_elections_after_restart": 22,
+    "d_longest_write_stall_s": 0.1659261479999259,
+    "d_stall_starts_at": 28.852608758000315
+  },
+  "history": "fix1-only-run1.history.jsonl"
+}

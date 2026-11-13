@@ -23,6 +23,12 @@ entry any caller appends lands at index 1. The sentinel can never be
 truncated away: `truncate_from(0)` raises rather than emptying the log
 back past its anchor.
 
+Reads: `load_log()` copies the whole log, so its cost grows with the log
+-- fine for tests and diagnostics, wrong for anything that runs per
+message. `entry_at`, `term_at` and `entries_from` read one entry, one
+term, or a bounded run of entries in time independent of the log's
+length; every per-message path in `raft.node` uses those.
+
 `MemoryStorage` never inspects a log entry's command. Entries are
 `LogEntry(term, command)` pairs; Storage legitimately reads `term` (Raft's
 consistency check is built on it), but `command` is an opaque payload it
@@ -49,8 +55,24 @@ SENTINEL: LogEntry = LogEntry(term=0, command=None)
 """The fixed entry occupying log index 0: term 0, no command."""
 
 
+def check_index(log_length: int, index: int) -> None:
+    """Raise IndexError unless 0 <= index < log_length. A negative index
+    must not silently count from the end, as a Python list would."""
+    if not 0 <= index < log_length:
+        raise IndexError(f"log index {index} out of range 0..{log_length - 1}")
+
+
+def bounded_slice(log: list[LogEntry], start: int, max_count: int) -> list[LogEntry]:
+    """`entries_from` for a list-backed log (sentinel at position 0)."""
+    if max_count < 0:
+        raise ValueError("max_count must be non-negative")
+    check_index(len(log) + 1, start)  # start may be one past the end
+    return log[start : start + max_count]
+
+
 class StorageError(Exception):
-    """Raised by a write call that `MemoryStorage.fail_after` has armed."""
+    """A durable-state failure: a write armed by `MemoryStorage.fail_after`,
+    or on-disk state `raft.net.filestorage.FileStorage` can't trust."""
 
 
 class Storage(Protocol):
@@ -93,6 +115,22 @@ class Storage(Protocol):
 
     def load_log(self) -> list[LogEntry]:
         """Return the full persisted log, including the index-0 sentinel."""
+        ...
+
+    def entry_at(self, index: int) -> LogEntry:
+        """Return the entry at `index` (0 is the sentinel) without copying
+        the log. Raises IndexError unless 0 <= index <= last_log_index()."""
+        ...
+
+    def term_at(self, index: int) -> int:
+        """`entry_at(index).term`, with the same bounds."""
+        ...
+
+    def entries_from(self, start: int, max_count: int) -> list[LogEntry]:
+        """Return at most `max_count` entries from `start` on, in order --
+        fewer at the end of the log, none when `start` is one past it --
+        copying only those. Raises IndexError unless 0 <= start <=
+        last_log_index() + 1, and ValueError if max_count is negative."""
         ...
 
     def last_log_index(self) -> int:
@@ -166,6 +204,16 @@ class MemoryStorage(Storage):
 
     def load_log(self) -> list[LogEntry]:
         return list(self._log)
+
+    def entry_at(self, index: int) -> LogEntry:
+        check_index(len(self._log), index)
+        return self._log[index]
+
+    def term_at(self, index: int) -> int:
+        return self.entry_at(index).term
+
+    def entries_from(self, start: int, max_count: int) -> list[LogEntry]:
+        return bounded_slice(self._log, start, max_count)
 
     def last_log_index(self) -> int:
         return len(self._log) - 1

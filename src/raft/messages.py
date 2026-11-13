@@ -74,11 +74,54 @@ class AppendEntriesReply:
     replaced: a leader that instead tracked "what I most recently sent"
     per peer could misattribute an old reply against a newer, larger
     send and believe more was replicated than actually was).
+
+    `conflict_index` and `conflict_term` are set on a consistency-check
+    failure, so the leader can skip back a whole term per round trip
+    instead of one entry (the Raft paper's section 5.3 optimization; see
+    `RaftNode._handle_append_entries_reply`):
+
+    - the follower's log is too short to have `prev_log_index`:
+      `conflict_term = 0`, `conflict_index` = its last index + 1;
+    - it has a different term there: `conflict_term` is that term and
+      `conflict_index` the first index at which it holds that term.
+
+    Both 0 on success, on a stale-term rejection, and on any reply built
+    without them (the leader then falls back to backing off by one).
     """
 
     term: int
     success: bool
     match_index: int = 0
+    conflict_index: int = 0
+    conflict_term: int = 0
 
 
-Message = RequestVote | RequestVoteReply | AppendEntries | AppendEntriesReply
+@dataclass(frozen=True)
+class PreVote:
+    """Asks whether a real election would succeed, before starting one
+    (Ongaro's thesis, section 9.6).
+
+    `term` is the term the sender *would* campaign in -- its current term
+    plus one -- not one it holds. A receiver never adopts it, never
+    records a vote for it, and never resets a timer because of it: a
+    pre-vote changes no state anywhere.
+    """
+
+    term: int
+    candidate_id: str
+    last_log_index: int
+    last_log_term: int
+
+
+@dataclass(frozen=True)
+class PreVoteReply:
+    """A response to `PreVote`. `term` is the voter's real current term,
+    so a pre-candidate that's behind learns the newer term from it."""
+
+    term: int
+    vote_granted: bool
+
+
+Message = (
+    RequestVote | RequestVoteReply | AppendEntries | AppendEntriesReply | PreVote | PreVoteReply
+)

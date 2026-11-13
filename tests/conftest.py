@@ -34,8 +34,8 @@ def pytest_addoption(parser: _pytest.config.Parser) -> None:
 # Sweep test node IDs (from tests/test_fuzz_sweep.py) to report aggregate
 # wall-clock time for, keyed by the human-readable label to print.
 _SWEEP_LABELS = {
-    "test_fuzz_sweep_fixed_seeds": "50-seed sweep",
-    "test_fuzz_sweep_large": "1000-seed sweep",
+    "test_fuzz_sweep_fixed_seeds": "50-seed sweep, both election modes",
+    "test_fuzz_sweep_large": "1000-seed sweep, both election modes",
 }
 
 

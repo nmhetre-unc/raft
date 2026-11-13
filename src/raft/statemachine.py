@@ -198,6 +198,17 @@ class KVStateMachine:
         session = self._sessions.get(client_id)
         return session.serial_number if session is not None else None
 
+    def session(self, client_id: str) -> tuple[int, object] | None:
+        """`(serial_number, result)` of the last request applied for
+        `client_id`, or `None` if it has no recorded session yet.
+
+        This is how a driver answers a client: the result recorded here
+        is exactly what `apply_client_request` returned when it applied
+        the request, whichever node applied it.
+        """
+        session = self._sessions.get(client_id)
+        return (session.serial_number, session.result) if session is not None else None
+
     def read(self, key: str) -> object:
         """A direct, local, unreplicated read of this node's own current state.
 

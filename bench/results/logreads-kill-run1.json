@@ -1,0 +1,253 @@
+{
+  "name": "logreads-kill-run1",
+  "environment": {
+    "cpu_count": 12,
+    "os": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.16 (main, Oct 26 2026, 14:08:45) [Clang 23.1.3 ]",
+    "git": "b93da42-dirty"
+  },
+  "options": {
+    "nodes": 5,
+    "clients": 16,
+    "duration": 30.0,
+    "fsync": "deferred",
+    "kill_at": 10.0,
+    "restart_at": 20.0,
+    "put_ratio": 0.5,
+    "keys": 100,
+    "seed": 0,
+    "out_dir": "/home/neilm/raft/bench/results",
+    "name": "logreads-kill-run1",
+    "keep": false,
+    "profile": false,
+    "stats_every": 0.0,
+    "profile_native": false
+  },
+  "summary": {
+    "window": 30.0,
+    "ops": 18305,
+    "ok": 18305,
+    "failed": 0,
+    "puts_ok": 9271,
+    "gets_ok": 9034,
+    "ops_per_sec": 610.1666666666666,
+    "latency_ms": {
+      "p50": 21.52349499920092,
+      "p99": 88.33448000041244,
+      "p99.9": 156.63057200072217
+    },
+    "longest_gap_s": 0.19697875999918324,
+    "longest_gap_at_s": 10.020243249000487,
+    "first_write_after_fault_s": {
+      "kill": 0.20187864000035916
+    }
+  },
+  "resources": {
+    "timeline": []
+  },
+  "verification": {
+    "converged": true,
+    "final_view": {
+      "n0": {
+        "role": "follower",
+        "term": 2,
+        "commit": 18315,
+        "applied": 18315,
+        "hint": "n4"
+      },
+      "n1": {
+        "role": "follower",
+        "term": 2,
+        "commit": 18315,
+        "applied": 18315,
+        "hint": "n4"
+      },
+      "n2": {
+        "role": "follower",
+        "term": 2,
+        "commit": 18315,
+        "applied": 18315,
+        "hint": "n4"
+      },
+      "n3": {
+        "role": "follower",
+        "term": 2,
+        "commit": 18315,
+        "applied": 18315,
+        "hint": "n4"
+      },
+      "n4": {
+        "role": "leader",
+        "term": 2,
+        "commit": 18315,
+        "applied": 18315,
+        "hint": "n3"
+      },
+      "alive": [
+        "n0",
+        "n1",
+        "n2",
+        "n3",
+        "n4"
+      ]
+    },
+    "nodes_checked": [
+      "n0",
+      "n1",
+      "n2",
+      "n3",
+      "n4"
+    ],
+    "commit_index": 18315,
+    "acknowledged_puts": 9271,
+    "prefix_problems": [],
+    "ack_problems": []
+  },
+  "events": [
+    {
+      "t": 0.0055,
+      "kind": "term",
+      "node": "n0",
+      "term": 1
+    },
+    {
+      "t": 0.0055,
+      "kind": "term",
+      "node": "n1",
+      "term": 1
+    },
+    {
+      "t": 0.0055,
+      "kind": "term",
+      "node": "n2",
+      "term": 1
+    },
+    {
+      "t": 0.0055,
+      "kind": "term",
+      "node": "n3",
+      "term": 1
+    },
+    {
+      "t": 0.0055,
+      "kind": "term",
+      "node": "n4",
+      "term": 1
+    },
+    {
+      "t": 0.0055,
+      "kind": "leader",
+      "leader": "n3",
+      "term": 1,
+      "same_node": false
+    },
+    {
+      "t": 10.0198,
+      "kind": "kill",
+      "node": "n3"
+    },
+    {
+      "t": 10.2135,
+      "kind": "term",
+      "node": "n0",
+      "term": 2
+    },
+    {
+      "t": 10.2135,
+      "kind": "term",
+      "node": "n1",
+      "term": 2
+    },
+    {
+      "t": 10.2135,
+      "kind": "term",
+      "node": "n2",
+      "term": 2
+    },
+    {
+      "t": 10.2135,
+      "kind": "term",
+      "node": "n4",
+      "term": 2
+    },
+    {
+      "t": 10.2136,
+      "kind": "leader",
+      "leader": "n4",
+      "term": 2,
+      "same_node": false
+    },
+    {
+      "t": 20.018,
+      "kind": "restart",
+      "node": "n3"
+    },
+    {
+      "t": 20.5028,
+      "kind": "term",
+      "node": "n3",
+      "term": 2
+    },
+    {
+      "t": 20.91,
+      "kind": "caught_up",
+      "node": "n3",
+      "commit_index": 11189
+    }
+  ],
+  "failover": {
+    "killed": "n3",
+    "kill_at": 10.01534336899931,
+    "new_leader": "n4",
+    "a_kill_to_new_leader_s": 0.1982566310006888,
+    "b_kill_to_first_write_s": 0.20187864000035916
+  },
+  "restart": {
+    "restart_at": 20.016875927,
+    "catch_up_target_commit": 11189,
+    "caught_up": true,
+    "catch_up_trace": [
+      [
+        20.503,
+        4230
+      ],
+      [
+        20.564,
+        4230
+      ],
+      [
+        20.609,
+        4742
+      ],
+      [
+        20.674,
+        6790
+      ],
+      [
+        20.711,
+        7302
+      ],
+      [
+        20.76,
+        8326
+      ],
+      [
+        20.813,
+        9350
+      ],
+      [
+        20.86,
+        10886
+      ],
+      [
+        20.91,
+        11603
+      ]
+    ],
+    "e_restart_to_catch_up_s": 0.8931280050001078,
+    "c_elections_after_restart": 0,
+    "d_longest_write_stall_s": 0.03464074899966363,
+    "d_stall_starts_at": 20.04587179900045
+  },
+  "history": "logreads-kill-run1.history.jsonl"
+}

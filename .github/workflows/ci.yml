@@ -15,17 +15,17 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install package with dev dependencies
-        run: pip install -e ".[dev]"
+      - name: Install package with dev and net dependencies
+        run: pip install -e ".[dev,net]"
 
       - name: Lint with ruff
         run: ruff check
 
       - name: Type check with mypy
-        run: mypy src/
+        run: mypy src/ bench/
 
       - name: Test with pytest
-        run: pytest --cov=src/raft --cov-fail-under=80
+        run: pytest --cov=src/raft --cov-fail-under=100
 
   fuzz:
     runs-on: ubuntu-latest
@@ -42,3 +42,34 @@ jobs:
 
       - name: Run the 1000-seed fuzz sweep
         run: pytest tests/test_fuzz_sweep.py -m slow -v
+
+  # A real 3-process cluster under load on the runner's disk: the leader is
+  # SIGKILLed at 3 s and restarted at 6 s. The bench exits non-zero unless
+  # every node converges on one committed prefix, no acknowledged write is
+  # missing, and the whole client history is linearizable.
+  cluster-bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package with net dependencies
+        run: pip install -e ".[dev,net]"
+
+      - name: 10 s leader-kill bench, 3 nodes, verified and linearizability-checked
+        run: >
+          python bench/cluster_bench.py --nodes 3 --clients 8 --duration 10
+          --kill-at 3 --restart-at 6 --name ci-leader-kill --out-dir ci-results
+
+      - name: Keep the result and client history
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-bench
+          path: ci-results/
+          if-no-files-found: ignore

@@ -1,0 +1,68 @@
+{
+  "args": {
+    "nodes": 5,
+    "entries": 500,
+    "value_bytes": 4096,
+    "clients": 16,
+    "timeout": 30.0,
+    "name": "large-gap-control-before",
+    "out_dir": "bench/results",
+    "keep": false
+  },
+  "git": "a721a33",
+  "leader": "n2",
+  "follower": "n0",
+  "follower_commit_at_kill": 0,
+  "entries_missing": 501,
+  "catch_up_append_entries_bytes": 2062128,
+  "grpc_max_receive_bytes": 4194304,
+  "exceeds_limit": false,
+  "write_s": 2.64,
+  "target_commit": 501,
+  "caught_up": true,
+  "restart_to_catch_up_s": 0.204,
+  "follower_trace": [
+    [
+      0.001,
+      null,
+      null
+    ],
+    [
+      0.153,
+      0,
+      1
+    ],
+    [
+      0.204,
+      501,
+      1
+    ]
+  ],
+  "final": {
+    "n0": {
+      "role": "follower",
+      "term": 1,
+      "commit": 501
+    },
+    "n1": {
+      "role": "follower",
+      "term": 1,
+      "commit": 501
+    },
+    "n2": {
+      "role": "leader",
+      "term": 1,
+      "commit": 501
+    },
+    "n3": {
+      "role": "follower",
+      "term": 1,
+      "commit": 501
+    },
+    "n4": {
+      "role": "follower",
+      "term": 1,
+      "commit": 501
+    }
+  }
+}

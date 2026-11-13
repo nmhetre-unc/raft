@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from raft.invariants import SafetyViolation
-from raft.sim.fuzz import Fuzzer, TraceEntry
+from raft.sim.fuzz import Fuzzer, LivenessViolation, TraceEntry
 
 if TYPE_CHECKING:
     import _pytest.python
@@ -72,8 +72,8 @@ def _format_violation_report(
     return "\n".join(lines)
 
 
-def _run_and_report(seed: int) -> None:
-    fuzzer = Fuzzer(n=N_NODES, seed=seed, steps=STEPS_PER_SEED)
+def _run_and_report(seed: int, pre_vote: bool) -> None:
+    fuzzer = Fuzzer(n=N_NODES, seed=seed, steps=STEPS_PER_SEED, pre_vote=pre_vote)
 
     violation: SafetyViolation | None = None
     try:
@@ -82,7 +82,15 @@ def _run_and_report(seed: int) -> None:
         violation = caught
 
     if violation is None:
-        return  # no violation: this seed passes
+        # Safe throughout; now stop the faults and require convergence.
+        try:
+            fuzzer.check_liveness()
+        except LivenessViolation as stuck:
+            pytest.fail(
+                f"Raft liveness violation, seed {seed}, pre_vote={pre_vote}: {stuck.reason}",
+                pytrace=False,
+            )
+        return
 
     # Shrink before reporting, per policy -- nobody should have to
     # manually re-run shrink() on a failure this test already saw.
@@ -90,13 +98,22 @@ def _run_and_report(seed: int) -> None:
     # Raised outside the `except` block so the failure message stands
     # alone, without Python chaining the original SafetyViolation onto it
     # as "the above exception was the direct cause of the following one".
-    pytest.fail(_format_violation_report(seed, violation, shrunk_trace), pytrace=False)
+    report = _format_violation_report(seed, violation, shrunk_trace)
+    pytest.fail(f"pre_vote={pre_vote}\n{report}", pytrace=False)
 
 
-def test_fuzz_sweep_fixed_seeds(seed: int) -> None:
-    _run_and_report(seed)
+# Both election modes: PreVote is off in the simulator by default (so the
+# pinned mutation-detection counts measure the same protocol they always
+# have) but on in the server, so the sweeps check it under faults too.
+PRE_VOTE_MODES = pytest.mark.parametrize("pre_vote", [False, True], ids=["vote", "prevote"])
+
+
+@PRE_VOTE_MODES
+def test_fuzz_sweep_fixed_seeds(seed: int, pre_vote: bool) -> None:
+    _run_and_report(seed, pre_vote)
 
 
 @pytest.mark.slow
-def test_fuzz_sweep_large(seed: int) -> None:
-    _run_and_report(seed)
+@PRE_VOTE_MODES
+def test_fuzz_sweep_large(seed: int, pre_vote: bool) -> None:
+    _run_and_report(seed, pre_vote)

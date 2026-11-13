@@ -1,9 +1,19 @@
 # Bugs
 
-Safety violations found by the fuzzer. Each entry records the seed, the
-minimal reproducing trace, the property that broke, and the root cause.
+Every bug found, in the implementation and in the harness itself, in the
+order they were found.
 
-Reproduce any of these with `pytest tests/test_fuzz_sweep.py --seed <N>`.
+The entries up to "Milestone 5 complete" are from the simulator: safety
+violations found by the fuzzer, each with its seed, the minimal reproducing
+trace, the property that broke and the root cause. Reproduce any of them
+with `pytest tests/test_fuzz_sweep.py --seed <N>`.
+
+The entries from "A restarted node could never catch up" on were found by
+running the same `RaftNode` as real processes (`raft.net`: gRPC, durable
+`FileStorage`) under load and faults -- bugs the simulator could not see.
+Each records how it was found, the symptom, the root cause, why the
+simulator missed it, the fix, and before/after numbers with the result
+files they came from (`bench/results/`).
 
 ## Restart steals leadership from a healthy leader
 
@@ -494,3 +504,653 @@ mechanism, all are now exercised — not just wired in — by the complete
 fault model at once. Milestone 5 is complete; snapshotting and cluster
 membership changes remain out of scope, tracked as Milestone 6 (or
 later), not started here.
+## A restarted node could never catch up: one-entry log backtracking
+
+Found by: `bench/cluster_bench.py` leader-kill runs (step 6 baseline), not the
+fuzzer. Regression test: `tests/test_catchup.py`.
+
+**Symptom.** In 2 of 3 leader-kill benchmark runs (16 clients, kill the leader
+at 10 s, restart it at 20 s), the restarted node still had commit index 0
+sixty seconds after the load stopped, while the other four agreed. Re-measured
+on the pre-fix code with catch-up timing added: 0 of 3 runs caught up. Both
+safety checks passed every time; this is liveness, not safety.
+
+**Root cause.** On a rejected AppendEntries, the leader backed `next_index`
+up by exactly one entry and retried (the code said "no conflict-term
+optimization yet"). Three things compounded it:
+
+- the restarted node came back about 4,400 entries behind;
+- every retry carried the whole log tail from `next_index` on, so each of
+  those thousands of round trips encoded and decoded thousands of entries;
+- every leader elected while the node was down (and every election in the
+  restart storm) initializes `next_index` optimistically to its own log end,
+  restarting the walk from the top.
+
+**Why the simulator missed it.** Two reasons, both structural:
+
+1. Fuzzed logs are tiny: across the 1000-seed sweep the longest log at the
+   end of a run has 37 entries (median 10), so even one-entry backtracking
+   needs at most a few dozen round trips.
+2. The simulated network delivers with zero delay, so a round trip costs no
+   simulated time. Thousands of them would still look instantaneous.
+
+The fuzzer now has a liveness phase (`Fuzzer.check_liveness`, run by both
+sweeps): after the last fault, heal, restart everything, give every link
+5 ms of delay, and require that a leader commits its whole log and every
+node reports that commit index within 3,000 simulated ms. The bound was
+fixed before measuring. The pre-fix code **passes** it on all 1000 seeds
+(worst case 1,605 ms) -- the logs are simply too short to expose this. It
+stays as a guard against liveness regressions the fuzzer *can* reach. The
+deterministic test is what reproduces this bug: crash a follower, commit
+5,000 entries, crash the leader so a new one is elected while the follower
+is down, restart the follower with 5 ms links, and require catch-up within
+1,000 simulated ms and 200 messages. Pre-fix it fails: after 500 ms and 201
+messages the follower holds 0 of 5,002 entries. The leader change is
+essential: a leader that was leading when the follower crashed keeps
+`next_index` at the crash point and needs no backtracking at all.
+
+**Fix (1 of 2: fast backtracking).** `AppendEntriesReply` carries
+`conflict_index` and `conflict_term` on failure (the Raft paper's section
+5.3 optimization). The follower reports either "too short: my last index + 1"
+or "I have term T there, starting at index i". The leader probes just past
+its own last entry of T if it has one, else at i. One round trip per
+conflicting term instead of per entry. It stays safe because `next_index`
+only picks which `prev_log_index` to probe; the follower's consistency check
+still gates every append. It always makes progress because the leader's term
+at the rejected index must be newer than T, so all its term-T entries lie
+before it. A delayed failure reply can no longer push `next_index` below
+`match_index + 1`. After the fix the restarted node caught up in all 3 runs,
+in 4.9-6.2 s. The remaining seconds are the restart election storm, a
+separate bug (next entry).
+
+(Correction: this entry first reported 4.3-6.1 s, finishing 0.1-0.16 s after
+the storm. Those numbers came from a bench whose own Status poller used gRPC's
+default reconnect backoff, so it couldn't see the restarted node for seconds
+after it came up. The poller now uses short backoff, and the figures above are
+re-measured with it on the same Fix-1 code.)
+
+## Restarting a node set off an election storm against a healthy leader
+
+Found by: `bench/cluster_bench.py` leader-kill runs, column (c), once Fix 1
+let the restarted node catch up at all. Regression tests:
+`tests/test_prevote.py`, `tests/test_net.py::test_server_keeps_reconnect_backoff_under_the_election_timeout`.
+
+**Symptom.** After the killed leader was restarted, the cluster went through
+20-26 elections in the next 5-6 seconds, and the restarted node took that long
+to catch up. Every one of those elections made the healthy leader step down
+and win again. Writes kept flowing (stalls of 56-166 ms), but the restarted
+node didn't catch up until the storm ended.
+
+**Root cause.** Two things together:
+
+1. *Transport.* gRPC's default reconnect backoff starts at 1 s and grows.
+   While the old leader was dead for 10 s, every other node's channel to it
+   backed off further and further, so after it restarted the current leader
+   could not reach it for seconds.
+2. *Protocol.* A node that hears no AppendEntries for one election timeout
+   increments its term and campaigns. The restarted node did exactly that,
+   every 150-300 ms. It could never win (its log was behind), but its
+   RequestVote carried a higher term, and every node that received one,
+   leader included, adopted that term and stepped down.
+
+**Why the simulator missed it.** The simulator has no transport: a message to
+a node that has just restarted is delivered as soon as it is sent. Nothing
+models a sender that can't reach a peer that is up. The protocol half (a node
+cut off from the leader disrupts it on return) *is* reproducible in the
+simulator by partitioning one node, and now is:
+`test_partitioned_node_rejoining_does_not_disrupt_a_stable_leader` fails its
+control case (PreVote off) exactly this way. The fuzzer never flagged it
+because it is not a safety violation, and the cluster does converge
+eventually.
+
+**Fix (a): transport.** `GrpcTransport` sets reconnect backoff to 20 ms
+initial, 50 ms max, 20 ms minimum connect timeout. The server caps them at a
+third of the minimum election timeout. The leader now reaches a restarted
+peer within a heartbeat or two. On its own this ended the storm: 0 elections
+after restart in 3 of 3 runs, catch-up 229-276 ms, mostly the server process
+starting.
+
+**Fix (b): PreVote** (Ongaro's thesis, section 9.6). On by default in the
+server, off by default in `RaftNode`, so the simulator's pinned mutation counts
+keep measuring the same protocol. Both fuzz sweeps run both modes. On an
+election timeout a node first sends `PreVote` for its term + 1 without
+changing any state. A voter grants only if that term is newer than its own,
+it is not the leader, it has not accepted an AppendEntries from a current
+leader within the minimum election timeout, and the candidate's log is at
+least as up-to-date as its own. Only a majority of grants starts a real
+election. This covers the cases backoff can't, such as a genuine partition:
+in the simulator, a node cut off for 3 s rejoins with its term unchanged and
+the leader keeps its term. In the leader-kill bench, where backoff had
+already removed the storm, PreVote changed nothing measurable (0 elections,
+catch-up 246-317 ms). It adds one round trip before each real election, which
+is within noise in kill-to-leader time.
+
+## A follower far enough behind could never catch up: one AppendEntries carried the whole gap
+
+Found by: `bench/large_gap_repro.py`, written to test whether this could
+happen, after reading the code rather than from a failing run. Regression
+tests: `tests/test_chunking.py`.
+
+**Symptom.** Kill a follower, commit 1,500 puts of 4 KiB through the leader,
+restart the follower. It never caught up: it stayed at commit index 0 for the
+full 30 s timeout, while every other node was at 1,501. With 500 such puts
+(2.06 MB to send) it caught up in 0.2 s. While the follower was down, the
+1,500 writes also took 24.7 s, against 2.6 s for 500.
+
+**Root cause.** The leader built every AppendEntries with *everything* from
+the peer's `next_index` to the end of its log. For a follower 1,500 entries
+behind, that is one 6,186,343-byte `Envelope`. Neither our server nor
+`GrpcTransport` sets a message size limit, so gRPC's defaults apply: no limit
+on sending, 4 MiB (4,194,304 bytes) on receiving. The follower's server
+rejected the RPC with `RESOURCE_EXHAUSTED: Received message larger than max`,
+which was confirmed directly against a server process: 4,121,885 bytes
+accepted, 4,534,085 rejected. The transport counts a failed RPC as a lost
+packet, so the leader got no reply and sent the same message, never smaller,
+on every heartbeat and every write. The slow writes have the same cause: every
+client write built and encoded the whole multi-megabyte tail again for the
+dead peer.
+
+**Why the simulator missed it.** The simulator has no message size limit and
+no encoding: a message carrying 5,000 entries costs the same as one carrying
+none. Its logs also stay short (at most a few dozen entries in the fuzzer). The
+leader-kill bench missed it too: its values are about 20 bytes, so a 10 s
+outage left roughly 2,300 entries, about 100 KB to send.
+
+**Fix.** An AppendEntries now carries at most `max_append_entries` entries
+(default 512) and at most `max_append_bytes` (default 1 MiB), by
+`entry_size`. It always carries at least one entry when the peer is behind,
+so a single oversized entry still goes out. The server measures size with the
+real protobuf encoding; `RaftNode` on its own uses an overestimate based on
+`repr`. Both caps are configurable in the cluster config. When a success reply
+confirms everything last sent to a peer that is still behind, the leader sends
+the next chunk immediately instead of waiting for the next heartbeat. When
+newer entries are already in flight, as in normal pipelined replication under
+load, it sends nothing extra, so no entry goes out twice. In the simulator this
+rule never fires unless a chunk was capped, so the fuzz sweeps and pinned
+mutation counts are unchanged.
+
+Results:
+
+- **Large-gap reproduction:** the follower now catches up in 0.26-0.37 s
+  (3 runs), in chunks of about 254 entries, the 1 MiB cap.
+- **Leader-kill bench:** catch-up is 258-401 ms, against 246-317 ms before. A
+  gap of about 2,300 small entries now takes about 5 chunk round trips under
+  load instead of one message.
+- **Still open:** while a peer is down, every write still builds and encodes
+  a chunk of up to 1 MiB for it. The 1,500 writes took 13-14 s, against
+  24.7 s before. Capping bounds this cost, but it doesn't remove it. *(Resolved by
+  per-peer flow control, below: the same 1,500 writes now take 1.3-1.6 s.)*
+
+## Every write re-sent every unacknowledged entry to every peer
+
+Found by: profiling the leader with py-spy during the no-fault bench (16
+clients, deferred fsync), plus send counters added to `GrpcTransport`
+(`stats()`) and the bench (`resources` in the result JSON). Regression tests:
+`tests/test_flow_control.py`.
+
+**Symptom.** Throughput stayed at 230-310 ops/s from 1 to 32 clients and fell
+at 32. The leader's event-loop thread was at 99-100% CPU from 8 clients up.
+Every client operation is one log entry, and for each one the leader sent 4
+AppendEntries (one per peer) carrying 60-200 entries in total, about
+1.8-5.7 KB encoded. The minimum is 4 entries.
+
+**Root cause.** `append_command` sent each peer everything from its
+`next_index` on. `next_index` only moves when a reply arrives, so with N
+writes arriving within one round trip, each write re-sent all the earlier
+ones still unacknowledged. The number of entries sent per write grew with
+load, and so did the cost of encoding them. That cost came twice: once to
+send and once in Fix 2's `_wire_entry_size`, which encodes each entry to
+measure it. On the leader's main thread, encoding took 31% of busy time and
+per-RPC gRPC overhead 48%. `load_log()` copies took 1.4%.
+
+**Why the simulator missed it.** It isn't a safety or liveness problem:
+duplicate entries are idempotent on the follower, and the simulator charges
+nothing for encoding or sending. The fuzzer's zero-delay network also never
+has more than a write or two in flight.
+
+**Fix: per-peer flow control** in `RaftNode`. At most one AppendEntries
+carrying entries is in flight to each peer. While it is unacknowledged and
+younger than one heartbeat interval, new entries wait. When the success reply
+arrives, everything that waited goes out in one message, up to Fix 2's caps.
+Heartbeats still go out on schedule; a peer with something in flight gets an
+empty one, so it keeps hearing from its leader and learns the commit index.
+
+*Why it's safe:* it only changes *when* an AppendEntries is sent, never what
+it contains. Every message is still built from `next_index` and
+consistency-checked by the follower, and commitment still waits for
+`match_index`, which only replies move. Holding a message back looks to the
+protocol exactly like a slow network.
+
+*Lost messages and replies:* "in flight" expires one heartbeat interval after
+the send. The next heartbeat then re-sends a full chunk from `next_index`, so
+a loss costs at most about two heartbeat intervals. A dead peer gets at most
+one chunk per heartbeat instead of one per write, which also fixes Fix 2's
+open item.
+
+Results (20 s no-fault runs, unprofiled):
+
+- **Load:** at 8-32 clients, entries sent per write are 4.0, the minimum.
+  AppendEntries per write fell from 4.0 to 0.95-1.2, because writes are now
+  batched.
+- **Throughput:** at 16 clients, 891 ops/s (deferred fsync) and 871
+  (per-write), against 295 and 274. p99 fell from 89-103 ms to 29-31 ms. A
+  single client is unchanged (about 250-290 ops/s), since nothing was
+  duplicated there.
+- **Restart:** leader-kill restart catch-up is 519-637 ms, against 258-401 ms.
+  The gap is now 3-6× larger because of the higher write rate, and it closes
+  at 30-38k entries/s against 5-10k.
+- **Large-gap reproduction:** still catches up (0.26-0.32 s).
+
+The leader's main thread is still at 100%. What dominates it now is per-RPC
+gRPC overhead (about 66%, including asyncio scheduling) and `load_log()`
+copies (7.8%, growing with log length).
+
+Five mutation-detection tests had their pinned counts shift (all mutations still detected), because
+fewer resends change which seeds reach each precondition; each test records
+the old and new count. `test_every_send_happens_after_sync` now expects 2
+messages for a burst of 5 instead of 10.
+
+## Throughput fell with uptime: every message copied the whole log
+
+Found by: the 300 s no-fault bench (16 clients, deferred fsync) with the
+leader's stats sampled every 20 s (`--stats-every`). FileStorage now counts
+`load_log()` calls, entries copied and time spent, and reports them in the
+SIGUSR1 stats. Regression tests: `tests/test_log_reads.py`, the new reads in
+`tests/test_storage.py`, and the read operations in `tests/test_filestorage.py`'s
+model test.
+
+**Symptom.** Throughput fell steadily as the log grew: 842 committed
+entries/s in the first 20 s (log 17k), 354 at 52k, and 165 at 94k. The
+leader's event loop stayed at 100%. By the end, `load_log()` was 38% of wall
+time and copied about 400,000 entries per committed entry. That 38% counts
+only the copying itself, not freeing the copy or the callers' work on it. The
+short benches understated all this, because each started with an empty log:
+the 891 ops/s reported for flow control was the average of a rate already
+falling.
+
+**Root cause.** `Storage` had one way to read the log, `load_log()`, which
+returns a copy of the whole log. `RaftNode` called it on every per-message
+path:
+
+- building each AppendEntries;
+- the follower's consistency check;
+- every apply;
+- every commit-index check;
+- every reply that triggered a send.
+
+The driver called it too, to check each resolved client request's term. So
+each message cost time proportional to everything ever committed. Two loops
+were also linear in a run of one term, which can be most of the log:
+
+- the follower's walk back to the start of the conflicting term's run, in
+  `_conflict_reply`;
+- the leader's backward scan for its last entry of the conflict term, in
+  `_next_index_after_conflict`.
+
+**Why the simulator missed it.** Its logs stay short (at most a few dozen
+entries in the fuzzer, 5,000 in the catch-up test), and a copy costs no
+simulated time. Correctness never depended on it.
+
+**Fix.** `Storage` gains bounded reads that cost the same whatever the log's
+length:
+
+- `entry_at(index)` and `term_at(index)`, which raise IndexError out of
+  range, including for negative indexes, which a Python list would silently
+  count from the end;
+- `entries_from(start, max_count)`, a copy of only the requested slice.
+
+Both `MemoryStorage` and `FileStorage` implement them. Every per-message path
+in `RaftNode`, and the driver's waiter check, now uses them. Both conflict
+searches are binary searches; that is valid because terms never decrease
+along a Raft log, which the old scan already relied on. `load_log()` stays
+for callers that need a full copy: tests, the fuzzer's checks, and Status
+with `include_log`. Nothing in the node's behaviour changed: every existing
+test, including the pinned mutation-detection counts, passed unchanged.
+
+Results (same 300 s bench):
+
+- **Throughput:** flat at 1,000-1,130 entries/s from a 22k-entry log to a
+  286k-entry one, with `load_log()` at 0 calls on the hot path. Overall
+  1,024 ops/s, against 325; p99 25 ms, against 130 ms.
+- **Not explained yet:** a dip to 869-895 entries/s at 200-240 s, which then
+  recovered to 1,082 by 280 s and so is not tied to log length. Also one
+  229 ms write gap at t=294 s (p99.9 is 47 ms).
+- **Leader-kill bench:** 0 elections after restart, catch-up at the same
+  per-entry rate as before, verify passed.
+- **Large-gap reproduction:** still catches up (0.26-0.31 s).
+
+## Every local benchmark before step 8 ran on tmpfs: fsync was free
+
+Found by: the first Docker cluster runs, whose volumes are on ext4. A
+benchmark-methodology bug, not a Raft bug.
+
+**Symptom.** The Docker cluster ran 3.5x slower than the local process
+bench. With its data moved to ext4, the local bench matched Docker (286
+against 279-314 ops/s).
+
+**Root cause.** `bench/cluster_bench.py` put its data directories in
+`tempfile.mkdtemp()`, which here is `/tmp`, and `/tmp` is tmpfs. `os.fsync`
+on tmpfs returns at once, so no earlier local number paid for durability.
+That covers every throughput and latency figure in the entries above,
+including the 3x from per-peer flow control and the ~1,000 ops/s after
+bounded reads. The correctness results (verify, linearizability, catch-up)
+don't depend on it.
+
+**Why the simulator missed it.** The simulator has no disk; `MemoryStorage`
+syncs for free by design. This was in the benchmark harness.
+
+**Fix.** Data directories now default to `~/.cache/raft-bench` (ext4), with
+`--tmpfs` (`/dev/shm`) for comparison, and every result records the data
+directory and its filesystem type (`environment.storage`). The leader's
+stats now count log fsyncs, their time, and the entries they made durable.
+
+**Results.** Same 20 s no-fault runs, ops/s (`bench/results/disk/`):
+
+| clients | ext4 per_write | ext4 deferred | tmpfs per_write | tmpfs deferred |
+|--------:|---------------:|--------------:|----------------:|---------------:|
+| 1       | 127            | 124           | 237             | 192            |
+| 8       | 304            | 309           | 721             | 653            |
+| 16      | 329            | 334           | 616             | 751            |
+| 32      | 336            | 318           | 646             | 782            |
+
+ext4 runs repeat within ~3%; tmpfs runs, which are CPU-bound, varied by up
+to ~30% between repeats on this WSL host. A 300 s ext4 deferred run held
+274-321 entries/s throughout (298 ops/s overall, p99 81 ms).
+
+**Deferred fsync did not batch** (found here; fixed in the next entry).
+In every run, in both modes, the leader averaged 1.00-1.01 entries per
+log fsync, at 1 client or 32, and on ext4 those fsyncs took ~60% of its
+wall time. So on a real disk `deferred` was no faster than `per_write`.
+
+## Group commit never happened: the fsync blocked the event loop
+
+Found by: the fsync counters added in the previous entry; then the driver's
+per-batch counters and `--trace-batches`.
+
+**Symptom.** The driver is built for group commit -- take every queued
+event as one batch, sync once, then send -- but `deferred` mode never
+batched: each log fsync on the leader covered 1.00-1.01 client writes at 1
+client or 32, and on ext4 throughput was flat at ~330 ops/s whatever the
+client count.
+
+**Root cause, measured.** The driver now counts, per batch, its events, its
+client submits and its sync time, and can trace every batch
+(`--trace-batches`); the bench lines the leader's sync intervals up with
+the clients' send times (both `CLOCK_MONOTONIC`). ext4, 16 clients,
+deferred, 20 s, sync still on the loop:
+
+- batches held 1.01 submits on average (4,445 batches with 1, 36 with 2,
+  none with more);
+- yet at the start of each sync, 7.8 operations on average (mostly 5-10)
+  had already been sent by clients and not yet taken in by the driver;
+- only 0.26 of them, on average, were sent *during* the sync (83% of
+  syncs had none): the queue wasn't new arrivals, it was a standing
+  backlog in front of the loop;
+- between two syncs the loop admitted 0.74 submits.
+
+`storage.sync()` ran on the event loop thread, so for the ~2 ms of each
+fsync the loop admitted nothing. Afterwards, the first submit admitted
+woke the driver, which processed it alone and blocked the loop in the
+next fsync before the gRPC server had admitted another call. About 8
+writes waited, and each fsync covered one. The leader's loop was saturated
+(~60% of wall in fsync plus ~43% CPU) at ~330 ops/s whatever the client
+count.
+
+**Why the simulator missed it.** The simulator has no disk and no event
+loop: `MemoryStorage.sync()` costs nothing, and a node handles a step's
+messages with no notion of concurrent arrivals. Batching is a property of
+the networked driver only.
+
+**Fix: classic group commit.** The fsync runs on a worker thread while
+the loop carries on admitting RPCs:
+
+- `FileStorage.sync()` is split. `begin_sync()`, on the loop, snapshots
+  everything the sync must write -- the encoded term and vote, the log
+  bytes, their offset, any truncation -- and returns a job that touches
+  only the files and that snapshot. `sync()` is `begin_sync()` plus
+  running the job, so `per_write` and every other caller is unchanged.
+- The driver runs the job with `run_in_executor` and awaits it. Its
+  messages and replies still leave only after the job completes, so the
+  persist-before-send invariant is exactly as before; the existing
+  sync-before-send test passes unchanged.
+- At most one sync is in flight: the driver's loop awaits it before
+  taking the next batch. The node is never touched while a sync runs:
+  the driver's loop is the only caller of the node, and it is suspended
+  awaiting the job; inputs arriving meanwhile only enqueue. The job reads
+  nothing the loop could change anyway: `begin_sync()` copied it out.
+- Fail-stop is kept. A failed job fails the driver exactly as a failed
+  `sync()` did; events that queued up during it are discarded
+  unprocessed, and their submits are never answered. A cancelled driver
+  (shutdown) waits for a job in flight to finish before returning, so the
+  storage is never closed under a write.
+
+Regression tests (`tests/test_driver.py`): submits accumulating while a sync is held in the worker
+thread (not in the log, nothing sent, then one batch of all five); a
+sync failure with submits, ticks and messages queued behind it; and
+cancellation during a sync, successful or failing.
+
+**Results** (ext4, 20 s, no faults; "before" is the same code with the
+one call back on the loop, run interleaved with "after"; ops/s, p50 ms,
+entries per leader fsync; `bench/results/groupcommit/`):
+
+| mode, clients | before            | after              |
+|---------------|-------------------|--------------------|
+| deferred, 1   | 116, 8.3, 1.00    | 95, 9.9, 1.00      |
+| deferred, 8   | 260, 28.9, 1.00   | 384, 20.5, 2.01    |
+| deferred, 16  | 333, 47.7, 1.01   | 668, 23.5, 3.79    |
+| deferred, 32  | 337, 95.2, 1.01   | 979, 31.0, 5.75    |
+| per_write, 1  | 141, 6.8, 1.00    | 114, 8.1, 1.00     |
+| per_write, 8  | 283, 27.4, 1.00   | 246, 31.0, 1.00    |
+| per_write, 16 | 319, 49.8, 1.00   | 335, 47.9, 1.00    |
+| per_write, 32 | 336, 95.7, 1.00   | 344, 93.4, 1.00    |
+
+- `deferred` now scales with load: 2.0x at 16 clients and 2.9x at 32,
+  with p50 down by two thirds. The leader uses more CPU (123-134% against
+  ~70%) because it is no longer idle-blocked in fsync for 60% of its
+  wall time.
+- `per_write` is unchanged by design: it fsyncs inside each write call.
+  Its run-to-run spread at 1 and 8 clients was ~10-15% (a repeat with
+  the order swapped gave after 127 / before 119 ops/s at 1 client).
+- At 1 client `deferred` is ~10% slower (repeat: 109 against 121 ops/s,
+  p50 +1.1 ms): with nothing to batch, each operation pays a thread
+  hand-off for the leader's sync and again for the follower's.
+
+## A partitioned follower rejoined seconds late: the leader's TCP connection was in retransmission backoff
+
+Found by: Docker partition runs (`scripts/chaos_docker.sh partition`),
+diagnosed with `ss -tin` inside the containers. Regression tests:
+`tests/test_net.py` (keepalive options; the server accepting keepalive
+pings).
+
+**Symptom.** On the Docker cluster, a follower cut off for 10 s (`docker
+network disconnect`, PreVote on) took about 5 s after its network came
+back to catch up. A follower restarted after a crash catches up in well
+under a second.
+
+**Cause, confirmed with `ss -tin` inside the containers** (one separate
+diagnostic run per setting, sampling every container's sockets every
+0.25 s; not part of the measured runs below, because the sampling cut
+throughput to about a third). A `docker network disconnect` drops packets
+silently: no RST, no ICMP. So the leader's gRPC connection to the victim
+stayed `ESTAB` the whole time, with HTTP/2 frames piling up behind one
+unacknowledged segment. Times are seconds since load start, with the
+partition at 10.87 s:
+
+| time | leader → victim socket |
+|---|---|
+| 10.60 | rto 204, first retransmit |
+| 11.04 / 11.45 / 12.26 | rto 408 / 816 / 1632 |
+| 13.84 | rto 3264, backoff 4 |
+| 17.35 | rto 6528, backoff 5, send_q ~9 KB and growing |
+| ~21.0 | network back; nothing happens |
+| 24.12 | retransmit timer fires, rto 204, backoff 0: recovered |
+
+- The victim's side of the same connection was also backing off its
+  unacknowledged replies (rto 6912, backoff 5), and recovered at the same
+  moment.
+- TCP's exponential backoff is deterministic from the moment of the
+  partition. With a 10 s partition the next retransmit always falls about
+  13 s after the partition started, so about 3 s after the network
+  returns. That is why the three measured runs without keepalive agree so
+  closely.
+- On the node's own clock, the first commit progress after rejoin came
+  3.1-3.4 s after its interface reappeared. A second stall of about 1.1 s
+  followed, then the backlog streamed in about 0.3 s. That second stall
+  is not decomposed. A plausible cause is draining the stale queued
+  frames with the congestion window reset to one segment after the RTO,
+  but the capture does not show it directly.
+
+Raft was not at fault: the leader kept sending heartbeats and chunks into
+a socket that would not deliver them until the kernel's next retransmit.
+
+**Why the simulator missed it.** The simulator has no transport: a healed
+partition delivers the next message at once. Silent packet loss on a live
+TCP connection, and the kernel's retransmission backoff, exist only below
+gRPC. The process bench missed it too: it kills processes (the socket
+closes, with an RST), it never black-holes a link.
+
+**Fix: gRPC keepalive, behind `ClusterConfig.keepalive_ms`** (cluster
+JSON `"keepalive_ms"`, default 1000; 0 turns it off).
+- Client channel options: `grpc.keepalive_time_ms` = `keepalive_timeout_ms`
+  = keepalive_ms, `grpc.keepalive_permit_without_calls` 1, and
+  `grpc.http2.max_pings_without_data` 0.
+- The server must accept those pings: `keepalive_permit_without_calls` 1,
+  `http2.min_recv_ping_interval_without_data_ms` keepalive_ms/2, and
+  `http2.max_ping_strikes` 0. A default server answers a ping without
+  data more often than every 5 minutes with GOAWAY "too_many_pings"
+  after two strikes.
+- gRPC clamps the client interval to at least 1 s, so 1000 is the
+  floor.
+
+With keepalive on, the diagnostic run shows the leader declaring the
+connection dead about 1.4 s into the partition (a ping unanswered
+for the 1 s keepalive timeout). It then retries the connection (`SYN-SENT`, a new attempt about
+every 0.5 s) instead of waiting on a backed-off socket. The first
+attempt after the network returned succeeded at once (`ESTAB`, rto 208,
+backoff 0).
+
+**Results** on Docker Desktop: 5 nodes, PreVote on, 16 clients, deferred
+fsync, a 10 s partition of a follower, 3 runs per setting, no sampler
+(`bench/results/keepalive/ka-{on,off}-{1,2,3}.json`; the two diagnostic
+runs and their `ss` captures are `diag2-*` there).
+Catch-up is timed on the victim's own container clock, from its network
+interface reappearing to its commit index reaching the highest index any
+node had reported:
+
+| keepalive | catch-up (ms) | elections | verify | linearizable |
+|---|---|---|---|---|
+| off (`docker/cluster-nokeepalive.json`) | 5004 / 5092 / 4926 | 0 | PASS | yes |
+| on (`docker/cluster.json`) | 425 / 319 / 427 | 0 | PASS | yes |
+
+In every run the victim came back in term 1 and the leader kept its
+term.
+
+**Measuring it honestly on Docker Desktop.** The first figures (about
+3.3 s even with keepalive) were not Raft's. After `docker network
+connect`, Docker Desktop holds back both published-port forwarding and
+`docker exec` output streams for about 3.3-3.8 s. A host-side poll, and
+even a poll inside the container whose output is read on the host, sees
+everything arrive at once, late.
+- `scripts/chaos_docker.sh` now stamps each sample inside the container
+  with its CLOCK_MONOTONIC, whether it has a non-loopback interface, and
+  PID 1's start time on that same clock (`/proc/1/stat` field 22).
+- `cluster_bench.py` computes catch-up from those stamps
+  (`restart.in_network`): from the 0→1 network transition (partition) or
+  the server's start (restart).
+- The host-side figure is still reported, but on Docker Desktop it
+  includes that forwarding delay.
+
+**Tests.**
+- `test_server_accepts_keepalive_pings_without_goaway`: a channel with
+  1 s keepalive idles 6.5 s against the server and stays READY. Without
+  the server-side allowance it receives GOAWAY and goes IDLE, which was
+  checked by stubbing the allowance out.
+- Tests that keepalive off adds no ping options and that a negative
+  value is rejected.
+
+The 9 Docker fault runs in `bench/results/docker/` (leader kill, partition
+with and without PreVote, 3 each) were rerun with keepalive on: all
+verified and linearizable; partition catch-up 262-401 ms with PreVote,
+374-647 ms without.
+
+## A follower's commit index went backwards: Figure 2's rule 5 taken literally
+
+Found by: the bench's catch-up trace on the Docker cluster, while
+investigating the partition stall (previous entry). Regression tests:
+`tests/test_commit_index.py`; invariant `check_commit_index_monotonic`.
+
+**Symptom.** On the Docker cluster, after a 10 s partition, the rejoined
+follower's reported commit index flipped between 713 and 1225 for ~7 s
+while it caught up (the bench's catch-up trace polls it every 50 ms). A
+node's commit index must never decrease.
+
+**Root cause.** `RaftNode._handle_append_entries` implemented AppendEntries
+rule 5 word for word: "if leaderCommit > commitIndex, set commitIndex =
+min(leaderCommit, index of last new entry)". When a message's last
+covered index (`prev_log_index + len(entries)`) is *below* the follower's
+commit index while its `leader_commit` is above it, that assignment lowers
+the commit index. The leader produces such messages routinely since
+per-peer flow control: to a peer with entries in flight, its heartbeat is
+empty and anchored at `next_index - 1` -- the last index that peer has
+*acknowledged* -- but carries the leader's *current* commit index. A
+follower catching up chunk by chunk already holds the chunk in flight and
+has committed through it (the chunk carried the commit index too); the
+heartbeat then drops it back one chunk. On Docker the chunks were 512
+entries (713 -> 1225), and the leader's view of the follower stayed stale
+for seconds because its TCP connection to it was in retransmission backoff
+(previous entry), so heartbeats kept arriving anchored at 713.
+
+Reproduced directly on a `RaftNode`: entries 1-10 with leader_commit 10,
+then a heartbeat with prev_log_index 5 and leader_commit 12: commit_index
+10 -> 5.
+
+**Why safety held.** Nothing is ever uncommitted by this: entries up to
+the old commit index stay committed everywhere (a majority holds them,
+and every later leader has them), `last_applied` never moves back so no
+entry is un-applied or re-applied, and clients are answered from applied
+state. What broke: the follower *reported* a stale, non-monotonic commit
+index (Status, and the benchmark's catch-up measurement), and it stopped
+applying until its commit index passed `last_applied` again. Had it won
+an election meanwhile it would have started from a lower commit index,
+which is safe -- a new leader recomputes it from match indexes.
+
+**Why the simulator missed it.** No invariant looked at commit_index over
+time, and the precondition is nearly unreachable in the fuzz phase:
+
+- it needs a heartbeat to land *inside* a chunk's flight -- after the
+  follower processed the chunk, before the leader processed the reply.
+  The fuzz phase runs every link at zero delay, so a reply returns
+  without simulated time passing; only an ADVANCE_CLOCK landing in exactly
+  that gap opens the window;
+- the other source of stale-anchored messages, STALE_REDELIVER and
+  duplicates, always carries an *old* `leader_commit`, which the
+  `leader_commit > commit_index` guard rejects.
+
+Counted across both 1000-seed sweeps (2,000 runs, 66,214 AppendEntries
+handled): 3,330 had a stale anchor and 17,721 a fresh leader_commit, but
+none had both. With the new invariant in place and the fix reverted,
+both sweeps still pass.
+
+**Fix.** Only ever raise it:
+`commit_index = max(commit_index, min(leader_commit, last_new_index))`.
+
+- New invariant `check_commit_index_monotonic`, run by the fuzzer after
+  every step: within one incarnation (a restart legitimately starts again
+  from 0; incarnations are told apart by node object identity), a node's
+  commit_index never decreases. Both sweeps check it now.
+- `tests/test_commit_index.py`: the `RaftNode` reproduction; a
+  deterministic simulator test -- a follower 20 entries behind catching up
+  in 5-entry chunks, with a 33 ms delay on its replies only and a 10 ms
+  tick, so each reply sends the next chunk mid-interval and the next
+  heartbeat finds it in flight -- which fails without the fix ("node 0
+  commit_index decreased from 10 to 5") and passes with it; and the
+  checker's own restart/crash handling.
+- No mutation-detection count moved.
+
+**Results.** Earlier catch-up figures from the process bench were not affected: none of
+their catch-up traces (leader-kill and large-gap, before and after the
+fix) shows a decrease -- on localhost a chunk's reply always beats the
+next heartbeat. After the fix, same benches, ext4, deferred, 16 clients:
+leader-kill catch-up 597 / 718 / 517 ms (before: 774 / 580 / 591 ms),
+large-gap 0.257 s (before: 0.365 s), within run-to-run spread; all
+verified and linearizable (`bench/results/commitfix/`).

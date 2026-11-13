@@ -122,6 +122,7 @@ from raft.invariants import (
     AppliedEntryHistory,
     CommittedEntry,
     SafetyViolation,
+    check_commit_index_monotonic,
     check_election_safety,
     check_leader_append_only,
     check_leader_completeness,
@@ -130,7 +131,7 @@ from raft.invariants import (
     check_state_machine_safety,
 )
 from raft.messages import AppendEntries
-from raft.node import NotLeader, RaftClusterNode, raft_node_factory
+from raft.node import NotLeader, RaftClusterNode, Role, raft_node_factory
 from raft.sim.cluster import Cluster
 from raft.sim.network import DEFAULT_HISTORY_DEPTH, DeliveryRecord
 from raft.statemachine import ClientRequest, Delete, Put
@@ -164,6 +165,28 @@ DEFAULT_WEIGHTS: dict[Action, float] = {
     # a run, before there's anything to redeliver.
     Action.STALE_REDELIVER: 7.0,
 }
+
+# The liveness phase (Fuzzer.check_liveness). The simulated network
+# delivers with zero delay by default, which makes a round trip free in
+# simulated time -- so a protocol needing thousands of them to converge
+# would still look instant. Giving every link a delay during this phase
+# makes simulated time a real cost. The bounds were fixed before the
+# current code was measured against them: an election takes a few
+# 150-300 ms timeouts at worst, and catching a node up should take a
+# handful of 10 ms round trips, not one per log entry.
+LIVENESS_LINK_DELAY_MS = 5
+LIVENESS_BOUND_MS = 3000
+LIVENESS_MAX_EVENTS = 20_000
+
+
+class LivenessViolation(AssertionError):
+    """Faults stopped, but the cluster didn't converge within the bound."""
+
+    def __init__(self, message: str, *, seed: int) -> None:
+        super().__init__(f"{message} (seed={seed})")
+        self.reason = message
+        self.seed = seed
+
 
 # How long (in fuzzer steps) a newly-formed partition refuses to heal.
 PARTITION_DURATION_RANGE = (3, 20)
@@ -229,6 +252,7 @@ class Fuzzer:
         steps: int,
         weights: dict[Action, float] | None = None,
         network_history_depth: int = DEFAULT_HISTORY_DEPTH,
+        pre_vote: bool = False,
     ) -> None:
         if n < 1:
             raise ValueError("n must be >= 1")
@@ -243,6 +267,7 @@ class Fuzzer:
         self.steps = steps
         self.weights = effective_weights
         self._network_history_depth = network_history_depth
+        self.pre_vote = pre_vote
         self.trace: list[TraceEntry] = []
 
         self._rng = random.Random(seed)
@@ -261,6 +286,85 @@ class Fuzzer:
             entry = self._perform(action, step_index)
             self.trace.append(entry)
             self._check_invariants(step_index)
+
+    def check_liveness(
+        self,
+        bound_ms: int = LIVENESS_BOUND_MS,
+        link_delay_ms: int = LIVENESS_LINK_DELAY_MS,
+        max_events: int = LIVENESS_MAX_EVENTS,
+    ) -> int:
+        """After `run()`: stop all faults and require convergence.
+
+        Heals any partition, restarts every crashed node, and gives every
+        link `link_delay_ms` of delay. Then, acting as a client that keeps
+        writing, it appends one request to the leader whenever the leader
+        has nothing of its own term yet -- without that, a leader elected
+        without a no-op could never commit, which is a client-traffic
+        question, not the convergence this checks. Converged means: a
+        leader exists, its whole log is committed, and every node reports
+        that same commit index.
+
+        Returns the simulated milliseconds convergence took. Raises
+        `LivenessViolation` past `bound_ms` simulated milliseconds or
+        `max_events` processed events, whichever comes first.
+        """
+        cluster = self.cluster
+        cluster.heal()
+        self._partition_active = False
+        ids = cluster.node_ids()
+        for node_id in ids:
+            if cluster.get_node(node_id) is None:
+                cluster.restart(node_id)
+        for a in ids:
+            for b in ids:
+                if a != b:
+                    cluster.network.set_delay(a, b, link_delay_ms)
+
+        start = cluster.clock.now()
+        serial = 0
+        for _ in range(max_events):
+            now = cluster.clock.now()
+            leader_id = self._highest_term_leader()
+            if leader_id is not None:
+                leader = cluster.get_node(leader_id)
+                assert leader is not None
+                log = leader.raft_node.storage.load_log()
+                if log[-1].term != leader.raft_node.current_term:
+                    serial += 1
+                    request = ClientRequest("liveness-client", serial, Put("liveness", str(serial)))
+                    produced = leader.append_command(request, now)
+                    assert not isinstance(produced, NotLeader)
+                    cluster.route(leader_id, produced, now)
+                elif self._commit_indexes() == {leader.raft_node.commit_index} == {len(log) - 1}:
+                    return now - start
+            if now - start > bound_ms:
+                break
+            cluster.step()
+        raise LivenessViolation(
+            f"no convergence {cluster.clock.now() - start} ms after faults stopped "
+            f"(bound {bound_ms} ms, {max_events} events): commit_index per node "
+            f"{self._commit_index_by_node()}, leader {self._highest_term_leader()}",
+            seed=self.seed,
+        )
+
+    def _highest_term_leader(self) -> int | None:
+        leaders = [
+            (node.raft_node.current_term, node_id)
+            for node_id in self.cluster.node_ids()
+            if (node := self.cluster.get_node(node_id)) is not None
+            and node.raft_node.role is Role.LEADER
+        ]
+        return max(leaders)[1] if leaders else None
+
+    def _commit_index_by_node(self) -> dict[int, int]:
+        return {
+            node_id: node.raft_node.commit_index
+            for node_id in self.cluster.node_ids()
+            if (node := self.cluster.get_node(node_id)) is not None
+        }
+
+    def _commit_indexes(self) -> set[int]:
+        return set(self._commit_index_by_node().values())
 
     def replay(self, trace: list[TraceEntry]) -> None:
         """Execute exactly this recorded sequence against a fresh cluster.
@@ -356,7 +460,7 @@ class Fuzzer:
         self.cluster = Cluster(
             n=self.n,
             seed=self.seed,
-            node_factory=raft_node_factory(self.n, self.seed),
+            node_factory=raft_node_factory(self.n, self.seed, pre_vote=self.pre_vote),
             network_history_depth=self._network_history_depth,
         )
         self.trace = []
@@ -366,6 +470,7 @@ class Fuzzer:
         self._no_spurious_truncation_history: dict[str, list[LogEntry]] = {}
         self._leader_completeness_history: dict[int, CommittedEntry] = {}
         self._state_machine_safety_history = AppliedEntryHistory()
+        self._commit_index_history: dict[int, tuple[RaftClusterNode, int]] = {}
         # CLIENT_REQUEST's own bookkeeping -- see _next_client_request.
         # Live-draw-decision aids only: replay never reconstructs or
         # consults these, since a forced entry already carries the full,
@@ -775,6 +880,7 @@ class Fuzzer:
             check_log_matching(self.cluster)
             check_leader_completeness(self.cluster, self._leader_completeness_history)
             check_state_machine_safety(self.cluster, self._state_machine_safety_history)
+            check_commit_index_monotonic(self.cluster, self._commit_index_history)
         except SafetyViolation as violation:
             violation.step = step_index
             violation.trace = tuple(self.trace)

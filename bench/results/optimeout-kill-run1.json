@@ -1,0 +1,268 @@
+{
+  "name": "optimeout-kill-run1",
+  "environment": {
+    "cpu_count": 12,
+    "os": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.16 (main, Oct 26 2026, 14:08:45) [Clang 23.1.3 ]",
+    "git": "3726735-dirty"
+  },
+  "options": {
+    "nodes": 5,
+    "clients": 16,
+    "duration": 30.0,
+    "fsync": "deferred",
+    "kill_at": 10.0,
+    "restart_at": 20.0,
+    "put_ratio": 0.5,
+    "keys": 100,
+    "seed": 0,
+    "op_timeout": 0.2,
+    "out_dir": "/home/neilm/raft/bench/results",
+    "name": "optimeout-kill-run1",
+    "keep": false,
+    "profile": false,
+    "stats_every": 0.0,
+    "profile_native": false
+  },
+  "summary": {
+    "window": 30.0,
+    "ops": 30750,
+    "ok": 30744,
+    "failed": 6,
+    "puts_ok": 15508,
+    "gets_ok": 15236,
+    "ops_per_sec": 1024.8,
+    "latency_ms": {
+      "p50": 14.778562001083628,
+      "p99": 30.15052599948831,
+      "p99.9": 39.82592700049281
+    },
+    "longest_gap_s": 0.19905379299962078,
+    "longest_gap_at_s": 10.010167555001317,
+    "first_write_after_fault_s": {
+      "kill": 0.19869439499962027
+    }
+  },
+  "resources": {
+    "timeline": []
+  },
+  "verification": {
+    "converged": true,
+    "final_view": {
+      "n0": {
+        "role": "follower",
+        "term": 2,
+        "commit": 30750,
+        "applied": 30750,
+        "hint": "n3"
+      },
+      "n1": {
+        "role": "follower",
+        "term": 2,
+        "commit": 30750,
+        "applied": 30750,
+        "hint": "n3"
+      },
+      "n2": {
+        "role": "follower",
+        "term": 2,
+        "commit": 30750,
+        "applied": 30750,
+        "hint": "n3"
+      },
+      "n3": {
+        "role": "leader",
+        "term": 2,
+        "commit": 30750,
+        "applied": 30750,
+        "hint": "n2"
+      },
+      "n4": {
+        "role": "follower",
+        "term": 2,
+        "commit": 30750,
+        "applied": 30750,
+        "hint": "n3"
+      },
+      "alive": [
+        "n0",
+        "n1",
+        "n2",
+        "n3",
+        "n4"
+      ]
+    },
+    "nodes_checked": [
+      "n0",
+      "n1",
+      "n2",
+      "n3",
+      "n4"
+    ],
+    "commit_index": 30750,
+    "acknowledged_puts": 15508,
+    "prefix_problems": [],
+    "ack_problems": [],
+    "linearizability": {
+      "linearizable": true,
+      "operations": 30750,
+      "checked": 30746,
+      "keys": 100,
+      "segments": 26391,
+      "seconds": 0.107,
+      "summary": "30750 operations, linearizable",
+      "unknown_outcome_puts": {
+        "failed": 4,
+        "observed": 2,
+        "unobserved": 2
+      }
+    }
+  },
+  "events": [
+    {
+      "t": 0.0043,
+      "kind": "term",
+      "node": "n0",
+      "term": 1
+    },
+    {
+      "t": 0.0044,
+      "kind": "term",
+      "node": "n1",
+      "term": 1
+    },
+    {
+      "t": 0.0044,
+      "kind": "term",
+      "node": "n2",
+      "term": 1
+    },
+    {
+      "t": 0.0044,
+      "kind": "term",
+      "node": "n3",
+      "term": 1
+    },
+    {
+      "t": 0.0044,
+      "kind": "term",
+      "node": "n4",
+      "term": 1
+    },
+    {
+      "t": 0.0044,
+      "kind": "leader",
+      "leader": "n2",
+      "term": 1,
+      "same_node": false
+    },
+    {
+      "t": 10.0149,
+      "kind": "kill",
+      "node": "n2"
+    },
+    {
+      "t": 10.2389,
+      "kind": "term",
+      "node": "n0",
+      "term": 2
+    },
+    {
+      "t": 10.2389,
+      "kind": "term",
+      "node": "n1",
+      "term": 2
+    },
+    {
+      "t": 10.2389,
+      "kind": "term",
+      "node": "n3",
+      "term": 2
+    },
+    {
+      "t": 10.2389,
+      "kind": "term",
+      "node": "n4",
+      "term": 2
+    },
+    {
+      "t": 10.2389,
+      "kind": "leader",
+      "leader": "n3",
+      "term": 2,
+      "same_node": false
+    },
+    {
+      "t": 20.0164,
+      "kind": "restart",
+      "node": "n2"
+    },
+    {
+      "t": 20.3926,
+      "kind": "term",
+      "node": "n2",
+      "term": 2
+    },
+    {
+      "t": 20.7511,
+      "kind": "caught_up",
+      "node": "n2",
+      "commit_index": 20970
+    }
+  ],
+  "failover": {
+    "killed": "n2",
+    "kill_at": 10.010526953001317,
+    "new_leader": "n3",
+    "a_kill_to_new_leader_s": 0.22837304699868177,
+    "b_kill_to_first_write_s": 0.19869439499962027
+  },
+  "restart": {
+    "restart_at": 20.015654430000723,
+    "catch_up_target_commit": 20970,
+    "caught_up": true,
+    "catch_up_trace": [
+      [
+        20.338,
+        0
+      ],
+      [
+        20.393,
+        11798
+      ],
+      [
+        20.44,
+        12822
+      ],
+      [
+        20.49,
+        14358
+      ],
+      [
+        20.547,
+        15894
+      ],
+      [
+        20.593,
+        17430
+      ],
+      [
+        20.65,
+        18454
+      ],
+      [
+        20.694,
+        18966
+      ],
+      [
+        20.751,
+        21014
+      ]
+    ],
+    "e_restart_to_catch_up_s": 0.7354003629989165,
+    "c_elections_after_restart": 0,
+    "d_longest_write_stall_s": 0.035909940999772516,
+    "d_stall_starts_at": 28.3104105600014
+  },
+  "history": "optimeout-kill-run1.history.jsonl"
+}

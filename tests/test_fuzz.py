@@ -357,3 +357,32 @@ def test_replay_of_a_forced_client_request_skip_reuses_its_recorded_detail() -> 
     fuzzer.replay([forced])
 
     assert fuzzer.trace == [TraceEntry(step=0, action=Action.CLIENT_REQUEST, detail=forced.detail)]
+
+
+# -- Liveness after faults stop --
+
+
+def test_check_liveness_converges_after_a_run() -> None:
+    from raft.sim.fuzz import LIVENESS_BOUND_MS
+
+    fuzzer = Fuzzer(n=5, seed=3, steps=300)
+    fuzzer.run()
+    elapsed = fuzzer.check_liveness()
+    assert 0 <= elapsed <= LIVENESS_BOUND_MS
+    commits = {
+        node.raft_node.commit_index
+        for i in fuzzer.cluster.node_ids()
+        if (node := fuzzer.cluster.get_node(i)) is not None
+    }
+    assert len(commits) == 1 and len(fuzzer.cluster.node_ids()) == 5
+
+
+@pytest.mark.parametrize("bounds", [{"bound_ms": 0}, {"max_events": 0}])
+def test_check_liveness_reports_non_convergence(bounds: dict[str, int]) -> None:
+    from raft.sim.fuzz import LivenessViolation
+
+    fuzzer = Fuzzer(n=5, seed=3, steps=300)
+    fuzzer.run()
+    with pytest.raises(LivenessViolation, match="no convergence") as caught:
+        fuzzer.check_liveness(**bounds)
+    assert caught.value.seed == 3 and "commit_index per node" in caught.value.reason

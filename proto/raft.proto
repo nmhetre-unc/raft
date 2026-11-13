@@ -1,0 +1,171 @@
+// Wire format for running RaftNode as real processes (raft.net).
+//
+// Field names follow raft.messages / raft.statemachine exactly, so the
+// codec in src/raft/net/codec.py is a field-for-field copy with no
+// renaming to keep straight. Regenerate the Python modules with
+// scripts/gen_proto.sh after any change here; the generated files are
+// committed.
+
+syntax = "proto3";
+
+package raft;
+
+// -- Commands and log entries (raft.statemachine, raft.storage) --
+
+message Put {
+  string key = 1;
+  // str only: the codec rejects any other Python value rather than
+  // silently stringifying it, so what a client reads back is exactly
+  // what it wrote.
+  string value = 2;
+}
+
+message Get {
+  string key = 1;
+}
+
+message Delete {
+  string key = 1;
+}
+
+message Command {
+  oneof op {
+    Put put = 1;
+    Get get = 2;
+    Delete delete = 3;
+  }
+}
+
+message ClientRequest {
+  string client_id = 1;
+  int64 serial_number = 2;
+  Command command = 3;
+}
+
+message LogEntry {
+  int64 term = 1;
+  // Neither set means command=None: the index-0 sentinel or a leader's
+  // election no-op.
+  oneof payload {
+    ClientRequest client_request = 2;
+    Command command = 3;
+  }
+}
+
+// -- Raft RPCs (raft.messages) --
+
+message RequestVote {
+  int64 term = 1;
+  string candidate_id = 2;
+  int64 last_log_index = 3;
+  int64 last_log_term = 4;
+}
+
+message RequestVoteReply {
+  int64 term = 1;
+  bool vote_granted = 2;
+}
+
+// PreVote (thesis section 9.6): `term` is the term the sender would
+// campaign in, never adopted by the receiver.
+message PreVote {
+  int64 term = 1;
+  string candidate_id = 2;
+  int64 last_log_index = 3;
+  int64 last_log_term = 4;
+}
+
+message PreVoteReply {
+  int64 term = 1;
+  bool vote_granted = 2;
+}
+
+message AppendEntries {
+  int64 term = 1;
+  string leader_id = 2;
+  int64 prev_log_index = 3;
+  int64 prev_log_term = 4;
+  repeated LogEntry entries = 5;
+  int64 leader_commit = 6;
+}
+
+message AppendEntriesReply {
+  int64 term = 1;
+  bool success = 2;
+  int64 match_index = 3;
+  // On failure only: where the leader should probe next (see
+  // raft.messages.AppendEntriesReply).
+  int64 conflict_index = 4;
+  int64 conflict_term = 5;
+}
+
+// One message from one node to another. A reply travels back as its own
+// Envelope in its own Deliver call, never as Deliver's response -- the
+// same shape RaftNode.handle already has, where replies are just more
+// (dst, message) pairs.
+message Envelope {
+  string src = 1;
+  oneof message {
+    RequestVote request_vote = 2;
+    RequestVoteReply request_vote_reply = 3;
+    AppendEntries append_entries = 4;
+    AppendEntriesReply append_entries_reply = 5;
+    PreVote pre_vote = 6;
+    PreVoteReply pre_vote_reply = 7;
+  }
+}
+
+// -- Client API --
+
+message Unit {}
+
+// What KVStateMachine.apply returned: None (Put), NOT_FOUND, or a str.
+// (Not a field named `str`: the generated .pyi would shadow the builtin
+// within the class body and fail mypy.)
+message Result {
+  oneof kind {
+    Unit none = 1;
+    Unit not_found = 2;
+    string value = 3;
+  }
+}
+
+message NotLeader {
+  optional string leader_hint = 1;
+}
+
+message SubmitReply {
+  oneof outcome {
+    Result ok = 1;
+    NotLeader not_leader = 2;
+    // The request's fate is unknown; retry with the same serial_number.
+    Unit timeout = 3;
+    // The entry was overwritten by a newer leader before it committed;
+    // retry with the same serial_number.
+    Unit lost = 4;
+  }
+}
+
+message StatusRequest {
+  // The full log is for debugging and tests; it can be large.
+  bool include_log = 1;
+}
+
+message StatusReply {
+  string node_id = 1;
+  string role = 2;
+  int64 current_term = 3;
+  int64 commit_index = 4;
+  int64 last_applied = 5;
+  optional string leader_hint = 6;
+  // Only when StatusRequest.include_log is set; index 0 (the sentinel)
+  // is omitted, so log[0] here is entry 1. May include entries not yet
+  // fsynced.
+  repeated LogEntry log = 7;
+}
+
+service Raft {
+  rpc Deliver(Envelope) returns (Unit);
+  rpc Submit(ClientRequest) returns (SubmitReply);
+  rpc Status(StatusRequest) returns (StatusReply);
+}

@@ -165,11 +165,29 @@ from raft.messages import (
     AppendEntries,
     AppendEntriesReply,
     Message,
+    PreVote,
+    PreVoteReply,
     RequestVote,
     RequestVoteReply,
 )
 from raft.statemachine import ClientRequest, Delete, Get, KVStateMachine, Put
 from raft.storage import LogEntry, Storage
+
+# Caps on one AppendEntries. A follower that is far behind is caught up in
+# chunks -- each the next one sent as soon as the last is acknowledged --
+# rather than with one message carrying the whole gap: over gRPC that
+# message would eventually exceed the receiver's maximum message size and
+# be rejected every time, so the follower would never catch up (BUGS.md).
+DEFAULT_MAX_APPEND_ENTRIES = 512
+DEFAULT_MAX_APPEND_BYTES = 1 << 20
+
+
+def approximate_entry_size(entry: LogEntry) -> int:
+    """A rough, transport-agnostic size for `entry`, used against
+    `max_append_bytes` when no exact encoder-based measure is given. The
+    repr of a command is longer than any compact wire encoding of it, so
+    this errs on the side of smaller chunks."""
+    return 16 + len(repr(entry.command))
 
 
 @dataclass(frozen=True)
@@ -231,12 +249,18 @@ class RaftNode:
         heartbeat_interval: int = 50,
         rng: random.Random | None = None,
         append_noop_on_election: bool = False,
+        pre_vote: bool = False,
+        max_append_entries: int = DEFAULT_MAX_APPEND_ENTRIES,
+        max_append_bytes: int = DEFAULT_MAX_APPEND_BYTES,
+        entry_size: Callable[[LogEntry], int] = approximate_entry_size,
     ) -> None:
         lo, hi = election_timeout_range
         if lo <= 0 or hi < lo:
             raise ValueError("election_timeout_range must be a positive, non-empty range")
         if heartbeat_interval <= 0:
             raise ValueError("heartbeat_interval must be positive")
+        if max_append_entries <= 0 or max_append_bytes <= 0:
+            raise ValueError("max_append_entries and max_append_bytes must be positive")
 
         self.node_id = node_id
         self.peers = list(peers)
@@ -250,6 +274,17 @@ class RaftNode:
         # a leader with nothing at its own current term can never commit
         # anything at all, including entries inherited from earlier terms.
         self.append_noop_on_election = append_noop_on_election
+        # PreVote (Ongaro's thesis, section 9.6): on an election timeout,
+        # first ask whether a majority *would* vote, without touching the
+        # term; campaign for real only if so. See _start_pre_vote.
+        self.pre_vote = pre_vote
+        # One AppendEntries carries at most `max_append_entries` entries and,
+        # by `entry_size`, at most `max_append_bytes` -- except that it always
+        # carries at least one entry when the peer is behind, so a single
+        # oversized entry still moves (it's the transport's to accept or not).
+        self.max_append_entries = max_append_entries
+        self.max_append_bytes = max_append_bytes
+        self.entry_size = entry_size
 
         # Persistent state -- loaded now, written back by _persist_if_dirty().
         self.current_term, self.voted_for = storage.load_term_and_vote()
@@ -266,6 +301,12 @@ class RaftNode:
         # since either is a more useful guess than nothing.
         self.leader_hint: str | None = None
         self.votes_received: set[str] = set()
+        # PreVote round state, volatile. `_last_leader_contact` is when this
+        # node last accepted an AppendEntries from a current leader; a voter
+        # refuses pre-votes for one minimum election timeout after that.
+        self.pre_voting = False
+        self.pre_votes_received: set[str] = set()
+        self._last_leader_contact: int | None = None
         self.election_deadline: int = 0
         self._next_heartbeat: int = 0
         # The highest index this node believes is committed, and the
@@ -278,6 +319,15 @@ class RaftNode:
         # module docstring for why these are never derived from each other.
         self.next_index: dict[str, int] = {}
         self.match_index: dict[str, int] = {}
+        # Leader-only flow control. `_sent_through[peer]` is the last log
+        # index included in the most recent AppendEntries that carried
+        # entries to `peer`, and `_sent_at[peer]` when it was sent. While
+        # that message is unacknowledged (and younger than a heartbeat
+        # interval), it is "in flight": new entries wait, and go out
+        # together in one message when the reply arrives. See
+        # `_in_flight`.
+        self._sent_through: dict[str, int] = {}
+        self._sent_at: dict[str, int] = {}
         # The deadline's first real draw is deferred to the first tick()
         # (see there for why): at construction time this node has no idea
         # what "now" actually is, and a restart can happen arbitrarily far
@@ -300,10 +350,10 @@ class RaftNode:
         out: list[tuple[str, Message]] = []
 
         if self.role in (Role.FOLLOWER, Role.CANDIDATE) and now >= self.election_deadline:
-            out.extend(self._start_election(now))
+            out.extend(self._start_pre_vote(now) if self.pre_vote else self._start_election(now))
 
         if self.role is Role.LEADER and now >= self._next_heartbeat:
-            out.extend(self._send_append_entries(now))
+            out.extend(self._send_append_entries(now, heartbeat=True))
 
         self._persist_if_dirty()
         self._apply_committed_entries()
@@ -311,10 +361,15 @@ class RaftNode:
 
     def handle(self, msg: Message, src: str, now: int) -> list[tuple[str, Message]]:
         """Called with one incoming message, addressed to this node, from `src`."""
-        self._maybe_adopt_newer_term(msg.term)
+        if not isinstance(msg, PreVote):  # a PreVote's term is hypothetical
+            self._maybe_adopt_newer_term(msg.term)
         self._maybe_update_leader_hint(msg)
 
-        if isinstance(msg, RequestVote):
+        if isinstance(msg, PreVote):
+            out = self._handle_pre_vote(msg, src, now)
+        elif isinstance(msg, PreVoteReply):
+            out = self._handle_pre_vote_reply(msg, src, now)
+        elif isinstance(msg, RequestVote):
             out = self._handle_request_vote(msg, src, now)
         elif isinstance(msg, RequestVoteReply):
             out = self._handle_request_vote_reply(msg, src, now)
@@ -336,6 +391,7 @@ class RaftNode:
             self.current_term = term
             self.voted_for = None
             self.role = Role.FOLLOWER
+            self.pre_voting = False
             self._dirty = True
 
     def _maybe_update_leader_hint(self, msg: Message) -> None:
@@ -378,7 +434,7 @@ class RaftNode:
 
         return [(src, RequestVoteReply(term=self.current_term, vote_granted=grant))]
 
-    def _challenger_log_is_current(self, msg: RequestVote) -> bool:
+    def _challenger_log_is_current(self, msg: RequestVote | PreVote) -> bool:
         """Figure 2's up-to-date check: compare last_log_term, then last_log_index."""
         our_term = self.storage.last_log_term()
         if msg.last_log_term != our_term:
@@ -400,6 +456,77 @@ class RaftNode:
             return []
         return self._become_leader(now)
 
+    # -- PreVote (Ongaro's thesis, section 9.6) --
+
+    def _start_pre_vote(self, now: int) -> list[tuple[str, Message]]:
+        """Ask every peer whether it would vote for this node in the next
+        term, changing nothing: not the term, not `voted_for`, not the
+        role. A majority of grants starts a real election
+        (`_handle_pre_vote_reply`); anything less leaves this node exactly
+        as it was, to try again at its next election timeout.
+
+        This is what stops a node that was cut off -- and has been timing
+        out the whole time -- from rejoining with an inflated term and
+        forcing a healthy leader to step down.
+        """
+        self._reset_election_deadline(now)
+        self.pre_voting = True
+        self.pre_votes_received = {self.node_id}
+        if self._is_majority(self.pre_votes_received):  # a single-node cluster
+            self.pre_voting = False
+            return self._start_election(now)
+        request = PreVote(
+            term=self.current_term + 1,
+            candidate_id=self.node_id,
+            last_log_index=self.storage.last_log_index(),
+            last_log_term=self.storage.last_log_term(),
+        )
+        return [(peer, request) for peer in self.peers]
+
+    def _handle_pre_vote(self, msg: PreVote, src: str, now: int) -> list[tuple[str, Message]]:
+        """Grant iff a real RequestVote for `msg.term` could be granted
+        here AND this node has no reason to think a leader is alive.
+
+        - `msg.term > current_term`: otherwise the candidate's election
+          term is one this node has already reached; the reply's term
+          tells it so.
+        - the candidate's log is at least as up-to-date as this one --
+          the same Figure 2 check a real vote applies.
+        - this node is not the leader, and hasn't accepted an
+          AppendEntries from a current leader within the minimum election
+          timeout: a follower still hearing from a leader has no reason
+          to help replace it.
+
+        Granting records nothing: no `voted_for`, no timer reset, no term
+        change. A pre-vote promises nothing about the real vote.
+        """
+        grant = (
+            msg.term > self.current_term
+            and self.role is not Role.LEADER
+            and not self._heard_from_leader_recently(now)
+            and self._challenger_log_is_current(msg)
+        )
+        return [(src, PreVoteReply(term=self.current_term, vote_granted=grant))]
+
+    def _heard_from_leader_recently(self, now: int) -> bool:
+        return (
+            self._last_leader_contact is not None
+            and now - self._last_leader_contact < self.election_timeout_range[0]
+        )
+
+    def _handle_pre_vote_reply(
+        self, msg: PreVoteReply, src: str, now: int
+    ) -> list[tuple[str, Message]]:
+        # A reply carrying a newer term has already been adopted above,
+        # which ended the round; anything else outside a round is stale.
+        if not self.pre_voting or not msg.vote_granted:
+            return []
+        self.pre_votes_received.add(src)
+        if not self._is_majority(self.pre_votes_received):
+            return []
+        self.pre_voting = False
+        return self._start_election(now)
+
     # -- AppendEntries (Figure 2's receiver implementation, commit tracking included) --
 
     def _handle_append_entries(
@@ -411,9 +538,12 @@ class RaftNode:
 
         self.role = Role.FOLLOWER
         self.leader_id = msg.leader_id
+        self.pre_voting = False
+        self._last_leader_contact = now
         self._reset_election_deadline(now)
 
-        log = self.storage.load_log()
+        storage = self.storage
+        last = storage.last_log_index()
 
         # 2. Reply false if the log has no entry at prev_log_index, or has
         # one whose term differs from prev_log_term -- the consistency
@@ -421,8 +551,8 @@ class RaftNode:
         # always 0 everywhere, and any correctly-formed message naming
         # prev_log_index=0 carries prev_log_term=0 too, so this passes
         # unconditionally there without needing a special case for it.
-        if msg.prev_log_index >= len(log) or log[msg.prev_log_index].term != msg.prev_log_term:
-            return [(src, AppendEntriesReply(term=self.current_term, success=False))]
+        if msg.prev_log_index > last or storage.term_at(msg.prev_log_index) != msg.prev_log_term:
+            return [(src, self._conflict_reply(msg.prev_log_index))]
 
         # 3 & 4. Find the first sent entry (if any) this follower doesn't
         # already hold at that index and term -- Raft's Log Matching
@@ -441,14 +571,14 @@ class RaftNode:
         first_new = 0
         while first_new < len(msg.entries):
             index = msg.prev_log_index + 1 + first_new
-            if index >= len(log) or log[index].term != msg.entries[first_new].term:
+            if index > last or storage.term_at(index) != msg.entries[first_new].term:
                 break
             first_new += 1
 
         new_entries = msg.entries[first_new:]
         if new_entries:
             conflict_index = msg.prev_log_index + 1 + first_new
-            if conflict_index < len(log):
+            if conflict_index <= last:
                 self.storage.truncate_from(conflict_index)  # 3: delete the conflict onward
             self.storage.append_entries(list(new_entries))  # 4: append what's new
 
@@ -463,12 +593,45 @@ class RaftNode:
         # far (it could still be catching up from an earlier, smaller
         # message), which would mean claiming an entry is committed before
         # this follower has even seen it.
+        #
+        # And only ever *raise* commit_index. Taken literally, the rule
+        # lowers it whenever this message is anchored below it while
+        # leader_commit is above it -- which a leader produces routinely:
+        # its heartbeat to a peer with entries in flight is empty and
+        # anchored at the last index that peer *acknowledged*, so a
+        # follower catching up chunk by chunk, already holding (and
+        # committed through) the chunk in flight, would drop back one chunk
+        # every heartbeat (BUGS.md). Committed is permanent; a message that
+        # covers less than we already know is committed tells us nothing.
         last_new_index = msg.prev_log_index + len(msg.entries)
         if msg.leader_commit > self.commit_index:
-            self.commit_index = min(msg.leader_commit, last_new_index)
+            self.commit_index = max(self.commit_index, min(msg.leader_commit, last_new_index))
 
         reply = AppendEntriesReply(term=self.current_term, success=True, match_index=last_new_index)
         return [(src, reply)]
+
+    def _conflict_reply(self, prev_log_index: int) -> AppendEntriesReply:
+        """A consistency-check failure, telling the leader where to probe
+        next (see `AppendEntriesReply`): past this log's end if it's too
+        short, else the start of the run of the conflicting term.
+
+        Terms never decrease along a Raft log, so that run's start is the
+        first index whose term is >= the conflicting term: a binary
+        search, not a walk back over a run that can be the whole log."""
+        last = self.storage.last_log_index()
+        if prev_log_index > last:
+            conflict_index, conflict_term = last + 1, 0
+        else:
+            conflict_term = self.storage.term_at(prev_log_index)
+            conflict_index = prev_log_index
+            if prev_log_index > 0:  # index 0 only conflicts in a malformed message
+                conflict_index = self._first_index_with_term_at_least(conflict_term, prev_log_index)
+        return AppendEntriesReply(
+            term=self.current_term,
+            success=False,
+            conflict_index=conflict_index,
+            conflict_term=conflict_term,
+        )
 
     def _handle_append_entries_reply(
         self, msg: AppendEntriesReply, src: str, now: int
@@ -491,15 +654,83 @@ class RaftNode:
                 self.match_index[src] = msg.match_index
                 self.next_index[src] = msg.match_index + 1
                 self._advance_commit_index()
+                # This reply confirms everything in flight to the peer. If
+                # it is still behind -- the last message was a capped
+                # chunk, or entries were appended while it was in flight
+                # and held back -- send what's next now, all of it in one
+                # message (up to the caps), instead of waiting for the
+                # next heartbeat.
+                if (
+                    msg.match_index >= self._sent_through.get(src, 0)
+                    and msg.match_index < self.storage.last_log_index()
+                ):
+                    return [(src, self._build_append_entries_for(src, now))]
             return []
 
         # Failure, and (per the checks above) at our current term, not a
-        # stale-term step-down: back off by exactly one and retry
-        # immediately with the earlier prev_log_index. No conflict-term
-        # optimization yet -- a later refinement, not this milestone.
-        self.next_index[src] = max(1, self.next_index[src] - 1)
-        log = self.storage.load_log()
-        return [(src, self._build_append_entries_for(src, log))]
+        # stale-term step-down: move next_index back using the follower's
+        # conflict hint and retry immediately.
+        self.next_index[src] = self._next_index_after_conflict(src, msg)
+        return [(src, self._build_append_entries_for(src, now))]
+
+    def _first_index_with_term_at_least(self, term: int, hi: int) -> int:
+        """The smallest index in [1, hi] whose term is >= `term`, or hi + 1
+        if none is. Binary search: terms never decrease along a log."""
+        lo = 1
+        hi += 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self.storage.term_at(mid) >= term:
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
+
+    def _next_index_after_conflict(self, peer: str, msg: AppendEntriesReply) -> int:
+        """Where to probe `peer` next after it rejected an AppendEntries.
+
+        With a conflict term this leader also holds, probe just past its
+        own last entry of that term; with one it doesn't hold, skip the
+        follower's whole run of it (`conflict_index`); with a log that's
+        too short (`conflict_term == 0`), go straight to the follower's
+        end. That is one round trip per conflicting term, not one per
+        entry. A reply without a hint (`conflict_index == 0`, only ever
+        hand-built) falls back to backing off by one.
+
+        Why this stays safe: next_index only chooses which
+        `prev_log_index` the next AppendEntries names. The follower still
+        runs the full consistency check on it and accepts entries only
+        where its log matches this leader's at that index and term -- so
+        guessing too far back costs some redundant entries, guessing too
+        far forward costs another rejection, and neither can put an
+        entry anywhere it wouldn't have gone with one-step backoff.
+
+        Why it always makes progress: the rejected probe named some index
+        p where the follower holds conflict_term T and this leader holds
+        a different term T'. T' > T: if T' < T, this leader would hold
+        term-T entries only after p, and by Log Matching any such entry
+        implies it also holds T's entry at p -- a contradiction. So every
+        term-T entry this leader has lies before p, and the new
+        next_index is at most p.
+
+        Never below match_index + 1: a delayed failure reply arriving
+        after a success has already confirmed more is stale, and must
+        not send this peer back over entries it is known to hold.
+        """
+        current = self.next_index[peer]
+        last = self.storage.last_log_index()
+        if msg.conflict_index == 0:
+            proposed = current - 1
+        elif msg.conflict_term == 0:
+            proposed = msg.conflict_index
+        else:
+            # One past this leader's last entry of conflict_term, if it has
+            # any: the first index whose term is above it, found by binary
+            # search (terms never decrease along a log).
+            after = self._first_index_with_term_at_least(msg.conflict_term + 1, last)
+            has_term = after > 1 and self.storage.term_at(after - 1) == msg.conflict_term
+            proposed = after if has_term else msg.conflict_index
+        return max(1, self.match_index[peer] + 1, min(proposed, last + 1))
 
     def _advance_commit_index(self) -> None:
         """Figure 2's leader commit rule -- with Figure 2's own last-paragraph
@@ -517,7 +748,6 @@ class RaftNode:
         match_counts = [*self.match_index.values(), self.storage.last_log_index()]
         majority_needed = len(match_counts) // 2 + 1
 
-        log = self.storage.load_log()
         for candidate in range(self.storage.last_log_index(), self.commit_index, -1):
             confirmations = sum(1 for match_index in match_counts if match_index >= candidate)
             if confirmations < majority_needed:
@@ -532,7 +762,7 @@ class RaftNode:
             # an old-term entry directly, on majority alone, is exactly
             # the unsafe case Figure 8 exists to rule out: a later leader
             # that never saw it as committed can still overwrite it.
-            if log[candidate].term != self.current_term:
+            if self.storage.term_at(candidate) != self.current_term:
                 continue
 
             self.commit_index = candidate
@@ -572,9 +802,10 @@ class RaftNode:
         if self.last_applied >= self.commit_index:
             return
 
-        log = self.storage.load_log()
-        for index in range(self.last_applied + 1, self.commit_index + 1):
-            command = log[index].command
+        first = self.last_applied + 1
+        entries = self.storage.entries_from(first, self.commit_index - self.last_applied)
+        for index, entry in enumerate(entries, first):
+            command = entry.command
             if isinstance(command, ClientRequest):
                 self.state_machine.apply_client_request(command)
             elif isinstance(command, Put | Get | Delete):
@@ -613,6 +844,8 @@ class RaftNode:
         last_index = self.storage.last_log_index()
         self.next_index = dict.fromkeys(self.peers, last_index + 1)
         self.match_index = dict.fromkeys(self.peers, 0)
+        self._sent_through = dict.fromkeys(self.peers, 0)
+        self._sent_at = {}
 
         if self.append_noop_on_election:
             # A leader can only ever commit an entry from its OWN current
@@ -636,32 +869,82 @@ class RaftNode:
 
         return self._send_append_entries(now)  # sent immediately, per Figure 2
 
-    def _send_append_entries(self, now: int) -> list[tuple[str, Message]]:
-        """Send every peer an AppendEntries built from *its own* next_index.
+    def _send_append_entries(
+        self, now: int, *, heartbeat: bool = False
+    ) -> list[tuple[str, Message]]:
+        """Send each peer an AppendEntries built from *its own* next_index.
 
         Each peer gets a distinct message -- not one shared object -- since
         `prev_log_index`/`prev_log_term` anchor the log-matching check at
         wherever *that* peer is believed to be, and `entries` is whatever
-        this leader has from there onward. A peer already caught up (its
+        this leader has from there onward, up to the chunk caps (see
+        `_build_append_entries_for`). A peer already caught up (its
         next_index one past this leader's last entry) simply gets `entries
         = ()`: a heartbeat is nothing more than that case.
+
+        Flow control: a peer with entries in flight (`_in_flight`) is
+        skipped -- its new entries go out when the reply comes back -- or,
+        when this is a `heartbeat`, sent an empty AppendEntries, so it
+        keeps hearing from its leader and learns the commit index. The
+        heartbeat timer restarts only when every peer was sent something.
         """
-        log = self.storage.load_log()
-        out: list[tuple[str, Message]] = [
-            (peer, self._build_append_entries_for(peer, log)) for peer in self.peers
-        ]
-        self._next_heartbeat = now + self.heartbeat_interval
+        out: list[tuple[str, Message]] = []
+        for peer in self.peers:
+            if not self._in_flight(peer, now):
+                out.append((peer, self._build_append_entries_for(peer, now)))
+            elif heartbeat:
+                out.append((peer, self._build_append_entries_for(peer, now, empty=True)))
+        if len(out) == len(self.peers):
+            self._next_heartbeat = now + self.heartbeat_interval
         return out
 
-    def _build_append_entries_for(self, peer: str, log: list[LogEntry]) -> AppendEntries:
-        """Build the AppendEntries `peer` should get right now, from its next_index."""
-        prev_log_index = self.next_index[peer] - 1
-        entries = tuple(log[self.next_index[peer] :])
+    def _in_flight(self, peer: str, now: int) -> bool:
+        """Whether an AppendEntries carrying entries to `peer` is still
+        awaiting its reply.
+
+        Why holding entries back is safe: flow control only decides *when*
+        an AppendEntries goes out, never what it contains -- every message
+        is still built by `_build_append_entries_for` from next_index, and
+        the follower still runs the full consistency check. Delaying or
+        not sending a message is indistinguishable, to the protocol, from
+        the network delaying or dropping it, which Raft already tolerates;
+        commitment still waits for match_index, which only replies move.
+
+        Why a lost message or reply can't stall the peer: "in flight"
+        expires one heartbeat interval after the send. The next heartbeat
+        after that finds the peer not in flight and re-sends a full chunk
+        from next_index -- so a loss costs at most about two heartbeat
+        intervals, and a dead peer gets at most one chunk per heartbeat,
+        not one per client write.
+        """
+        unacknowledged = self._sent_through.get(peer, 0) > self.match_index[peer]
+        sent_at = self._sent_at.get(peer)
+        return unacknowledged and sent_at is not None and now - sent_at < self.heartbeat_interval
+
+    def _build_append_entries_for(
+        self, peer: str, now: int, *, empty: bool = False
+    ) -> AppendEntries:
+        """Build the AppendEntries `peer` should get right now: entries from
+        its next_index on, capped by count and approximate size -- or, with
+        `empty`, none (a heartbeat that leaves what's in flight alone)."""
+        start = self.next_index[peer]
+        prev_log_index = start - 1
+        chunk = [] if empty else self.storage.entries_from(start, self.max_append_entries)
+        size = 0
+        for count, entry in enumerate(chunk):
+            size += self.entry_size(entry)
+            if size > self.max_append_bytes and count > 0:
+                del chunk[count:]  # at least one entry, always
+                break
+        entries = tuple(chunk)
+        if entries:
+            self._sent_through[peer] = start + len(entries) - 1
+            self._sent_at[peer] = now
         return AppendEntries(
             term=self.current_term,
             leader_id=self.node_id,
             prev_log_index=prev_log_index,
-            prev_log_term=log[prev_log_index].term,
+            prev_log_term=self.storage.term_at(prev_log_index),
             entries=entries,
             leader_commit=self.commit_index,
         )
@@ -695,8 +978,11 @@ class RaftNode:
         return out
 
     def _has_majority(self) -> bool:
+        return self._is_majority(self.votes_received)
+
+    def _is_majority(self, voters: set[str]) -> bool:
         cluster_size = len(self.peers) + 1  # +1 for this node
-        return len(self.votes_received) * 2 > cluster_size
+        return len(voters) * 2 > cluster_size
 
     # -- Shared bookkeeping --
 
@@ -811,6 +1097,9 @@ def raft_node_factory(
     election_timeout_range: tuple[int, int] = (150, 300),
     heartbeat_interval: int = 50,
     append_noop_on_election: bool = False,
+    pre_vote: bool = False,
+    max_append_entries: int = DEFAULT_MAX_APPEND_ENTRIES,
+    max_append_bytes: int = DEFAULT_MAX_APPEND_BYTES,
 ) -> Callable[[int, Storage], RaftClusterNode]:
     """Build a `Cluster`-compatible `node_factory` that produces `RaftNode`s.
 
@@ -843,6 +1132,9 @@ def raft_node_factory(
             heartbeat_interval=heartbeat_interval,
             rng=random.Random(node_seeds[name]),
             append_noop_on_election=append_noop_on_election,
+            pre_vote=pre_vote,
+            max_append_entries=max_append_entries,
+            max_append_bytes=max_append_bytes,
         )
         return RaftClusterNode(raft_node)
 
