@@ -54,6 +54,16 @@ current, observable state alone:
   high-water mark would silently skip re-checking a slower node's own
   catch-up range against what a faster node already recorded.
 
+- Commit Index Monotonic (`check_commit_index_monotonic`): within one
+  incarnation of a node -- from a (re)start to its next crash -- its
+  commit_index never decreases. Not one of Figure 3's properties, but
+  every one of them reasons as if "committed" only grows; a node whose
+  commit_index falls reports entries as uncommitted that it already
+  reported committed (and may have applied). Needs a `history`
+  accumulator too; a restart legitimately starts again from 0 (commit
+  index is volatile state), so each incarnation gets its own baseline,
+  told apart by node object identity (`Cluster.restart` builds a new one).
+
 A crashed node has no live state to inspect -- `Cluster.get_node` already
 returns `None` for one -- so every checker here simply skips it rather
 than treating a crash as a violation or an error.
@@ -175,6 +185,33 @@ def check_leader_append_only(
                 )
 
         history[node.node_id] = current_log
+
+
+def check_commit_index_monotonic(
+    cluster: Cluster[RaftClusterNode], history: dict[int, tuple[RaftClusterNode, int]]
+) -> None:
+    """No node's commit_index ever decreases, within one incarnation.
+
+    `history` is a caller-owned accumulator (`{}` to start), mapping each
+    node id to the node object last seen and its commit_index then. A
+    different object under the same id is a restarted node, whose volatile
+    commit_index rightly starts over: it gets a fresh baseline. A crashed
+    node is skipped and forgotten.
+    """
+    for node_id in cluster.node_ids():
+        node = cluster.get_node(node_id)
+        if node is None:
+            history.pop(node_id, None)
+            continue
+        previous = history.get(node_id)
+        if previous is not None and previous[0] is node and node.commit_index < previous[1]:
+            raise SafetyViolation(
+                f"node {node_id!r} commit_index decreased from {previous[1]} to "
+                f"{node.commit_index}",
+                seed=cluster.seed,
+                step=cluster.step_count,
+            )
+        history[node_id] = (node, node.commit_index)
 
 
 def check_no_spurious_truncation(

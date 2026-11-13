@@ -73,7 +73,7 @@ from raft.net.codec import (
 from raft.net.driver import DriverStopped, Lost, NodeDriver, Ok, SubmitOutcome, Timeout
 from raft.net.filestorage import FileStorage, FsyncMode
 from raft.net.raft_pb2_grpc import RaftServicer, add_RaftServicer_to_server
-from raft.net.transport import GrpcTransport
+from raft.net.transport import GrpcTransport, keepalive_server_options
 from raft.node import DEFAULT_MAX_APPEND_BYTES, DEFAULT_MAX_APPEND_ENTRIES, NotLeader
 from raft.storage import LogEntry
 
@@ -91,6 +91,8 @@ class ClusterConfig:
     pre_vote: bool = True
     max_append_entries: int = DEFAULT_MAX_APPEND_ENTRIES
     max_append_bytes: int = DEFAULT_MAX_APPEND_BYTES
+    # gRPC keepalive between nodes, ms; 0 turns it off. See GrpcTransport.
+    keepalive_ms: int = 1000
 
     @classmethod
     def load(cls, path: str | Path) -> ClusterConfig:
@@ -105,6 +107,7 @@ class ClusterConfig:
             pre_vote=bool(raw.get("pre_vote", defaults.pre_vote)),
             max_append_entries=int(raw.get("max_append_entries", defaults.max_append_entries)),
             max_append_bytes=int(raw.get("max_append_bytes", defaults.max_append_bytes)),
+            keepalive_ms=int(raw.get("keepalive_ms", defaults.keepalive_ms)),
         )
 
 
@@ -246,6 +249,7 @@ class RaftServer:
             peers,
             reconnect_backoff_ms=(min(20, backoff_cap), backoff_cap),
             min_connect_timeout_ms=min(20, backoff_cap),
+            keepalive_ms=cluster.keepalive_ms,
         )
         stack.push_async_callback(self.transport.close)
 
@@ -266,7 +270,10 @@ class RaftServer:
         )
         # SO_REUSEPORT off: a second process on this address must fail to
         # bind, not silently share the port.
-        self.grpc_server = grpc.aio.server(options=[("grpc.so_reuseport", 0)])
+        options: list[tuple[str, int]] = [("grpc.so_reuseport", 0)]
+        if cluster.keepalive_ms:
+            options += keepalive_server_options(cluster.keepalive_ms)
+        self.grpc_server = grpc.aio.server(options=options)
         add_RaftServicer_to_server(_Servicer(self.driver, self.storage), self.grpc_server)
         self.grpc_server.add_insecure_port(config.listen or config.address)
         await self.grpc_server.start()

@@ -7,8 +7,9 @@
 # same address. restart: "no" so a node killed by chaos_docker.sh stays
 # down until the script starts it again.
 #
-# PreVote is on (docker/cluster.json). For the PreVote-off control:
-#   RAFT_CONFIG=cluster-noprevote.json docker compose up -d
+# PreVote and gRPC keepalive are on (docker/cluster.json). Controls:
+#   RAFT_CONFIG=cluster-noprevote.json docker compose up -d    # PreVote off
+#   RAFT_CONFIG=cluster-nokeepalive.json docker compose up -d  # keepalive off
 
 x-node: &node
   build: .

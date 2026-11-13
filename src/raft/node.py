@@ -593,9 +593,19 @@ class RaftNode:
         # far (it could still be catching up from an earlier, smaller
         # message), which would mean claiming an entry is committed before
         # this follower has even seen it.
+        #
+        # And only ever *raise* commit_index. Taken literally, the rule
+        # lowers it whenever this message is anchored below it while
+        # leader_commit is above it -- which a leader produces routinely:
+        # its heartbeat to a peer with entries in flight is empty and
+        # anchored at the last index that peer *acknowledged*, so a
+        # follower catching up chunk by chunk, already holding (and
+        # committed through) the chunk in flight, would drop back one chunk
+        # every heartbeat (BUGS.md). Committed is permanent; a message that
+        # covers less than we already know is committed tells us nothing.
         last_new_index = msg.prev_log_index + len(msg.entries)
         if msg.leader_commit > self.commit_index:
-            self.commit_index = min(msg.leader_commit, last_new_index)
+            self.commit_index = max(self.commit_index, min(msg.leader_commit, last_new_index))
 
         reply = AppendEntriesReply(term=self.current_term, success=True, match_index=last_new_index)
         return [(src, reply)]

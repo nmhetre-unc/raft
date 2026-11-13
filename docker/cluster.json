@@ -6,8 +6,12 @@
     "n3": "n3:7000",
     "n4": "n4:7000"
   },
-  "election_timeout_ms": [150, 300],
+  "election_timeout_ms": [
+    150,
+    300
+  ],
   "heartbeat_ms": 50,
   "request_timeout_ms": 2000,
-  "pre_vote": true
+  "pre_vote": true,
+  "keepalive_ms": 1000
 }

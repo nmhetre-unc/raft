@@ -1,0 +1,284 @@
+{
+  "name": "kill-ext4-deferred-2",
+  "environment": {
+    "cpu_count": 12,
+    "os": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.16 (main, Oct 26 2026, 14:08:45) [Clang 23.1.3 ]",
+    "git": "f187777-dirty",
+    "storage": {
+      "data_dir": "/home/neilm/.cache/raft-bench/raft-bench-c6oa85qa",
+      "fs_type": "ext4",
+      "device": "/dev/sdd",
+      "mount_point": "/"
+    }
+  },
+  "options": {
+    "nodes": 5,
+    "clients": 16,
+    "duration": 30.0,
+    "fsync": "deferred",
+    "kill_at": 10.0,
+    "restart_at": 20.0,
+    "put_ratio": 0.5,
+    "keys": 100,
+    "seed": 2,
+    "op_timeout": 30.0,
+    "out_dir": "bench/results/commitfix",
+    "name": "kill-ext4-deferred-2",
+    "keep": false,
+    "trace_batches": 0,
+    "tmpfs": false,
+    "profile": false,
+    "stats_every": 0.0,
+    "profile_native": false,
+    "external": null,
+    "chaos": null,
+    "chaos_at": 10.0
+  },
+  "t0_unix": 1794544171.0342548,
+  "summary": {
+    "window": 30.0,
+    "ops": 23885,
+    "ok": 23885,
+    "failed": 0,
+    "puts_ok": 11920,
+    "gets_ok": 11965,
+    "ops_per_sec": 796.1666666666666,
+    "latency_ms": {
+      "p50": 19.115277000310016,
+      "p99": 34.24447699990196,
+      "p99.9": 76.05768099983834
+    },
+    "longest_gap_s": 0.21211275599989676,
+    "longest_gap_at_s": 10.006170530999952,
+    "first_write_after_fault_s": {
+      "kill": 0.20945717099994
+    }
+  },
+  "resources": {
+    "timeline": []
+  },
+  "verification": {
+    "converged": true,
+    "final_view": {
+      "n0": {
+        "role": "follower",
+        "term": 2,
+        "commit": 23897,
+        "applied": 23897,
+        "hint": "n4"
+      },
+      "n1": {
+        "role": "follower",
+        "term": 2,
+        "commit": 23897,
+        "applied": 23897,
+        "hint": "n4"
+      },
+      "n2": {
+        "role": "follower",
+        "term": 2,
+        "commit": 23897,
+        "applied": 23897,
+        "hint": "n4"
+      },
+      "n3": {
+        "role": "follower",
+        "term": 2,
+        "commit": 23897,
+        "applied": 23897,
+        "hint": "n4"
+      },
+      "n4": {
+        "role": "leader",
+        "term": 2,
+        "commit": 23897,
+        "applied": 23897,
+        "hint": "n1"
+      },
+      "alive": [
+        "n0",
+        "n1",
+        "n2",
+        "n3",
+        "n4"
+      ]
+    },
+    "nodes_checked": [
+      "n0",
+      "n1",
+      "n2",
+      "n3",
+      "n4"
+    ],
+    "commit_index": 23897,
+    "acknowledged_puts": 11920,
+    "prefix_problems": [],
+    "ack_problems": [],
+    "linearizability": {
+      "linearizable": true,
+      "operations": 23885,
+      "checked": 23885,
+      "keys": 100,
+      "segments": 20564,
+      "seconds": 0.07,
+      "summary": "23885 operations, linearizable",
+      "unknown_outcome_puts": {
+        "failed": 0,
+        "observed": 0,
+        "unobserved": 0
+      }
+    }
+  },
+  "events": [
+    {
+      "t": 0.0035,
+      "kind": "term",
+      "node": "n0",
+      "term": 1
+    },
+    {
+      "t": 0.0035,
+      "kind": "term",
+      "node": "n1",
+      "term": 1
+    },
+    {
+      "t": 0.0035,
+      "kind": "term",
+      "node": "n2",
+      "term": 1
+    },
+    {
+      "t": 0.0035,
+      "kind": "term",
+      "node": "n3",
+      "term": 1
+    },
+    {
+      "t": 0.0035,
+      "kind": "term",
+      "node": "n4",
+      "term": 1
+    },
+    {
+      "t": 0.0035,
+      "kind": "leader",
+      "leader": "n1",
+      "term": 1,
+      "same_node": false
+    },
+    {
+      "t": 10.0129,
+      "kind": "kill",
+      "node": "n1"
+    },
+    {
+      "t": 10.2128,
+      "kind": "term",
+      "node": "n0",
+      "term": 2
+    },
+    {
+      "t": 10.2128,
+      "kind": "term",
+      "node": "n2",
+      "term": 2
+    },
+    {
+      "t": 10.2128,
+      "kind": "term",
+      "node": "n3",
+      "term": 2
+    },
+    {
+      "t": 10.2128,
+      "kind": "term",
+      "node": "n4",
+      "term": 2
+    },
+    {
+      "t": 10.2129,
+      "kind": "leader",
+      "leader": "n4",
+      "term": 2,
+      "same_node": false
+    },
+    {
+      "t": 20.0069,
+      "kind": "restart",
+      "node": "n1"
+    },
+    {
+      "t": 20.3186,
+      "kind": "term",
+      "node": "n1",
+      "term": 2
+    },
+    {
+      "t": 20.724,
+      "kind": "caught_up",
+      "node": "n1",
+      "commit_index": 16022
+    }
+  ],
+  "failover": {
+    "killed": "n1",
+    "kill_at": 10.00882611599991,
+    "new_leader": "n4",
+    "a_kill_to_new_leader_s": 0.2040738840000902,
+    "b_kill_to_first_write_s": 0.20945717099994
+  },
+  "restart": {
+    "restart_at": 20.006225406999874,
+    "catch_up_target_commit": 16022,
+    "caught_up": true,
+    "catch_up_trace": [
+      [
+        20.267,
+        0
+      ],
+      [
+        20.319,
+        8718
+      ],
+      [
+        20.366,
+        10254
+      ],
+      [
+        20.421,
+        11278
+      ],
+      [
+        20.476,
+        12302
+      ],
+      [
+        20.526,
+        12814
+      ],
+      [
+        20.575,
+        13326
+      ],
+      [
+        20.627,
+        14350
+      ],
+      [
+        20.676,
+        15374
+      ],
+      [
+        20.724,
+        16345
+      ]
+    ],
+    "e_restart_to_catch_up_s": 0.7177963389999604,
+    "c_elections_after_restart": 0,
+    "d_longest_write_stall_s": 0.06041316699975141,
+    "d_stall_starts_at": 20.494508589999896
+  },
+  "history": "kill-ext4-deferred-2.history.jsonl"
+}

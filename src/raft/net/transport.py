@@ -51,6 +51,28 @@ from raft.net.raft_pb2_grpc import RaftStub
 log = logging.getLogger(__name__)
 
 
+def keepalive_channel_options(keepalive_ms: int) -> list[tuple[str, int]]:
+    """Client-side keepalive: ping every `keepalive_ms`, idle or not, and
+    give up on the connection after `keepalive_ms` without an answer."""
+    return [
+        ("grpc.keepalive_time_ms", keepalive_ms),
+        ("grpc.keepalive_timeout_ms", keepalive_ms),
+        ("grpc.keepalive_permit_without_calls", 1),
+        ("grpc.http2.max_pings_without_data", 0),
+    ]
+
+
+def keepalive_server_options(keepalive_ms: int) -> list[tuple[str, int]]:
+    """Server-side: accept pings that often, with or without calls. By
+    default a gRPC server tolerates a ping without data only every 5
+    minutes and answers more with GOAWAY "too_many_pings"."""
+    return [
+        ("grpc.keepalive_permit_without_calls", 1),
+        ("grpc.http2.min_recv_ping_interval_without_data_ms", keepalive_ms // 2),
+        ("grpc.http2.max_ping_strikes", 0),
+    ]
+
+
 class GrpcTransport:
     def __init__(
         self,
@@ -61,23 +83,38 @@ class GrpcTransport:
         rpc_timeout: float = 0.5,
         reconnect_backoff_ms: tuple[int, int] = (20, 50),
         min_connect_timeout_ms: int = 20,
+        keepalive_ms: int = 0,
     ) -> None:
         """`peers` maps each peer's node id to its ``host:port``.
 
         `reconnect_backoff_ms` is gRPC's (initial, max) reconnect backoff
         and `min_connect_timeout_ms` its minimum connect timeout; keep all
         of them well under the minimum election timeout.
+
+        `keepalive_ms` > 0 pings each peer every that many ms, data or not,
+        and drops the connection if a ping goes unanswered for as long.
+        Without it, a connection to a peer cut off by a partition (no RST
+        ever arrives) stays ESTABLISHED, retransmitting with exponential
+        backoff, and after the partition heals nothing reaches the peer
+        until the next retransmission -- seconds later (BUGS.md). With it,
+        the dead connection is dropped within ~2 keepalive periods and the
+        channel reconnects on its short backoff as soon as the peer is back.
+        The peer's server must accept pings this often (`RaftServer` does).
         """
         if queue_size < 1:
             raise ValueError("queue_size must be positive")
         initial_backoff, max_backoff = reconnect_backoff_ms
         if not 0 < initial_backoff <= max_backoff or min_connect_timeout_ms <= 0:
             raise ValueError("need 0 < initial backoff <= max backoff, connect timeout > 0")
-        self.channel_options = [
+        if keepalive_ms < 0:
+            raise ValueError("keepalive_ms must be >= 0")
+        self.channel_options: list[tuple[str, int]] = [
             ("grpc.initial_reconnect_backoff_ms", initial_backoff),
             ("grpc.max_reconnect_backoff_ms", max_backoff),
             ("grpc.min_reconnect_backoff_ms", min_connect_timeout_ms),
         ]
+        if keepalive_ms:
+            self.channel_options += keepalive_channel_options(keepalive_ms)
         self.node_id = node_id
         self.dropped = 0
         self.failed = 0

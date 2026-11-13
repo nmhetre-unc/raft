@@ -927,3 +927,182 @@ entries per leader fsync; `bench/results/groupcommit/`):
 - At 1 client `deferred` is ~10% slower (repeat: 109 against 121 ops/s,
   p50 +1.1 ms): with nothing to batch, each operation pays a thread
   hand-off for the leader's sync and again for the follower's.
+
+## A follower's commit index went backwards: Figure 2's rule 5 taken literally
+
+**Symptom.** On the Docker cluster, after a 10 s partition, the rejoined
+follower's reported commit index flipped between 713 and 1225 for ~7 s
+while it caught up (the bench's catch-up trace polls it every 50 ms). A
+node's commit index must never decrease.
+
+**Root cause.** `RaftNode._handle_append_entries` implemented AppendEntries
+rule 5 word for word: "if leaderCommit > commitIndex, set commitIndex =
+min(leaderCommit, index of last new entry)". When a message's last
+covered index (`prev_log_index + len(entries)`) is *below* the follower's
+commit index while its `leader_commit` is above it, that assignment lowers
+the commit index. The leader produces such messages routinely since
+per-peer flow control: to a peer with entries in flight, its heartbeat is
+empty and anchored at `next_index - 1` -- the last index that peer has
+*acknowledged* -- but carries the leader's *current* commit index. A
+follower catching up chunk by chunk already holds the chunk in flight and
+has committed through it (the chunk carried the commit index too); the
+heartbeat then drops it back one chunk. On Docker the chunks were 512
+entries (713 -> 1225), and the leader's view of the follower stayed stale
+for seconds because its TCP connection to it was in retransmission backoff
+(next entry), so heartbeats kept arriving anchored at 713.
+
+Reproduced directly on a `RaftNode`: entries 1-10 with leader_commit 10,
+then a heartbeat with prev_log_index 5 and leader_commit 12: commit_index
+10 -> 5.
+
+**Why safety held.** Nothing is ever uncommitted by this: entries up to
+the old commit index stay committed everywhere (a majority holds them,
+and every later leader has them), `last_applied` never moves back so no
+entry is un-applied or re-applied, and clients are answered from applied
+state. What broke: the follower *reported* a stale, non-monotonic commit
+index (Status, and the benchmark's catch-up measurement), and it stopped
+applying until its commit index passed `last_applied` again. Had it won
+an election meanwhile it would have started from a lower commit index,
+which is safe -- a new leader recomputes it from match indexes.
+
+**Why the fuzzer missed it.** No invariant looked at commit_index over
+time, and the precondition is nearly unreachable in the fuzz phase:
+
+- it needs a heartbeat to land *inside* a chunk's flight -- after the
+  follower processed the chunk, before the leader processed the reply.
+  The fuzz phase runs every link at zero delay, so a reply returns
+  without simulated time passing; only an ADVANCE_CLOCK landing in exactly
+  that gap opens the window;
+- the other source of stale-anchored messages, STALE_REDELIVER and
+  duplicates, always carries an *old* `leader_commit`, which the
+  `leader_commit > commit_index` guard rejects.
+
+Counted across both 1000-seed sweeps (2,000 runs, 66,214 AppendEntries
+handled): 3,330 had a stale anchor and 17,721 a fresh leader_commit, but
+none had both. With the new invariant in place and the fix reverted,
+both sweeps still pass.
+
+**Fix.** Only ever raise it:
+`commit_index = max(commit_index, min(leader_commit, last_new_index))`.
+
+- New invariant `check_commit_index_monotonic`, run by the fuzzer after
+  every step: within one incarnation (a restart legitimately starts again
+  from 0; incarnations are told apart by node object identity), a node's
+  commit_index never decreases. Both sweeps check it now.
+- `tests/test_commit_index.py`: the `RaftNode` reproduction; a
+  deterministic simulator test -- a follower 20 entries behind catching up
+  in 5-entry chunks, with a 33 ms delay on its replies only and a 10 ms
+  tick, so each reply sends the next chunk mid-interval and the next
+  heartbeat finds it in flight -- which fails without the fix ("node 0
+  commit_index decreased from 10 to 5") and passes with it; and the
+  checker's own restart/crash handling.
+- No mutation-detection count moved.
+
+Earlier catch-up figures from the process bench were not affected: none of
+their catch-up traces (leader-kill and large-gap, before and after the
+fix) shows a decrease -- on localhost a chunk's reply always beats the
+next heartbeat. After the fix, same benches, ext4, deferred, 16 clients:
+leader-kill catch-up 597 / 718 / 517 ms (before: 774 / 580 / 591 ms),
+large-gap 0.257 s (before: 0.365 s), within run-to-run spread; all
+verified and linearizable.
+
+## A partitioned follower rejoined seconds late: the leader's TCP connection was in retransmission backoff
+
+**Symptom.** On the Docker cluster, a follower cut off for 10 s (`docker
+network disconnect`, PreVote on) took about 5 s after its network came
+back to catch up. A follower restarted after a crash catches up in well
+under a second.
+
+**Cause, confirmed with `ss -tin` inside the containers** (one separate
+diagnostic run per setting, sampling every container's sockets every
+0.25 s; not part of the measured runs below, because the sampling cut
+throughput to about a third). A `docker network disconnect` drops packets
+silently: no RST, no ICMP. So the leader's gRPC connection to the victim
+stayed `ESTAB` the whole time, with HTTP/2 frames piling up behind one
+unacknowledged segment. Times are seconds since load start, with the
+partition at 10.87 s:
+
+| time | leader → victim socket |
+|---|---|
+| 10.60 | rto 204, first retransmit |
+| 11.04 / 11.45 / 12.26 | rto 408 / 816 / 1632 |
+| 13.84 | rto 3264, backoff 4 |
+| 17.35 | rto 6528, backoff 5, send_q ~9 KB and growing |
+| ~21.0 | network back; nothing happens |
+| 24.12 | retransmit timer fires, rto 204, backoff 0: recovered |
+
+- The victim's side of the same connection was also backing off its
+  unacknowledged replies (rto 6912, backoff 5), and recovered at the same
+  moment.
+- TCP's exponential backoff is deterministic from the moment of the
+  partition. With a 10 s partition the next retransmit always falls about
+  13 s after the partition started, so about 3 s after the network
+  returns. That is why the three measured runs without keepalive agree so
+  closely.
+- On the node's own clock, the first commit progress after rejoin came
+  3.1-3.4 s after its interface reappeared. A second stall of about 1.1 s
+  followed, then the backlog streamed in about 0.3 s. That second stall
+  is not decomposed. A plausible cause is draining the stale queued
+  frames with the congestion window reset to one segment after the RTO,
+  but the capture does not show it directly.
+
+Raft was not at fault: the leader kept sending heartbeats and chunks into
+a socket that would not deliver them until the kernel's next retransmit.
+
+**Fix: gRPC keepalive, behind `ClusterConfig.keepalive_ms`** (cluster
+JSON `"keepalive_ms"`, default 1000; 0 turns it off).
+- Client channel options: `grpc.keepalive_time_ms` = `keepalive_timeout_ms`
+  = keepalive_ms, `grpc.keepalive_permit_without_calls` 1, and
+  `grpc.http2.max_pings_without_data` 0.
+- The server must accept those pings: `keepalive_permit_without_calls` 1,
+  `http2.min_recv_ping_interval_without_data_ms` keepalive_ms/2, and
+  `http2.max_ping_strikes` 0. A default server answers a ping without
+  data more often than every 5 minutes with GOAWAY "too_many_pings"
+  after two strikes.
+- gRPC clamps the client interval to at least 1 s, so 1000 is the
+  floor.
+
+With keepalive on, the diagnostic run shows the leader declaring the
+connection dead about 1.4 s into the partition (a ping unanswered
+for the 1 s keepalive timeout). It then retries the connection (`SYN-SENT`, a new attempt about
+every 0.5 s) instead of waiting on a backed-off socket. The first
+attempt after the network returned succeeded at once (`ESTAB`, rto 208,
+backoff 0).
+
+**Measured** on Docker Desktop: 5 nodes, PreVote on, 16 clients, deferred
+fsync, a 10 s partition of a follower, 3 runs per setting, no sampler.
+Catch-up is timed on the victim's own container clock, from its network
+interface reappearing to its commit index reaching the highest index any
+node had reported:
+
+| keepalive | catch-up (ms) | elections | verify | linearizable |
+|---|---|---|---|---|
+| off (`docker/cluster-nokeepalive.json`) | 5004 / 5092 / 4926 | 0 | PASS | yes |
+| on (`docker/cluster.json`) | 425 / 319 / 427 | 0 | PASS | yes |
+
+In every run the victim came back in term 1 and the leader kept its
+term.
+
+**Measuring it honestly on Docker Desktop.** The first figures (about
+3.3 s even with keepalive) were not Raft's. After `docker network
+connect`, Docker Desktop holds back both published-port forwarding and
+`docker exec` output streams for about 3.3-3.8 s. A host-side poll, and
+even a poll inside the container whose output is read on the host, sees
+everything arrive at once, late.
+- `scripts/chaos_docker.sh` now stamps each sample inside the container
+  with its CLOCK_MONOTONIC, whether it has a non-loopback interface, and
+  PID 1's start time on that same clock (`/proc/1/stat` field 22).
+- `cluster_bench.py` computes catch-up from those stamps
+  (`restart.in_network`): from the 0→1 network transition (partition) or
+  the server's start (restart).
+- The host-side figure is still reported, but on Docker Desktop it
+  includes that forwarding delay.
+
+**Tests.**
+- `test_server_accepts_keepalive_pings_without_goaway`: a channel with
+  1 s keepalive idles 6.5 s against the server and stays READY. Without
+  the server-side allowance it receives GOAWAY and goes IDLE, which was
+  checked by stubbing the allowance out.
+- Tests that keepalive off adds no ping options and that a negative
+  value is rejected.
+- The fuzzer cannot see this: the simulator has no transport.

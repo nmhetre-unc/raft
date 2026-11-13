@@ -153,19 +153,33 @@ def filesystem_of(path: Path) -> dict[str, str]:
     return best
 
 
-def docker_data_filesystem() -> dict[str, str]:
-    """Where the local Docker engine keeps volumes, for --external runs
-    against docker-compose.yml (assumes that engine runs on this host)."""
-    try:
-        root = subprocess.run(
-            ["docker", "info", "--format", "{{.DockerRootDir}}"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        return {"data_dir": "external", "fs_type": "unknown"}
-    return {"data_dir": f"docker volumes under {root}", **filesystem_of(Path(root))}
+def docker_data_filesystem(container: str = "raft-n0") -> dict[str, str]:
+    """Where an --external docker-compose cluster keeps its data: the
+    engine (with Docker Desktop, volumes live in its VM, not on this
+    host's disks) and, from inside `container`, the filesystem behind its
+    /data volume."""
+
+    def docker(*argv: str) -> str:
+        try:
+            return subprocess.run(
+                ["docker", *argv], capture_output=True, text=True, check=True, timeout=30
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return ""
+
+    engine = docker("info", "--format", "{{.OperatingSystem}} {{.ServerVersion}}")
+    root = docker("info", "--format", "{{.DockerRootDir}}")
+    # "<fstype> <source>" of the volume, as the container sees it.
+    df = docker("exec", container, "df", "--output=fstype,source", "/data").splitlines()
+    fs_type, _, device = df[-1].partition(" ") if len(df) > 1 else ("", "", "")
+    where = "Docker Desktop's VM" if engine.startswith("Docker Desktop") else "the engine"
+    return {
+        "data_dir": f"docker volume /data of {container}, under {root or '?'} in {where}"
+        + (", not on this host's disks" if where != "the engine" else ""),
+        "engine": engine or "unknown",
+        "fs_type": fs_type or "unknown",
+        "device": device.strip() or "unknown",
+    }
 
 
 def server_cpu_s(pid: int) -> float:
@@ -553,6 +567,10 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
             poller._record(kind="restart", node=fault.node)
 
         partition: dict[str, Any] = {}
+        # From --chaos "commit" lines -- the node's own Status, polled from
+        # inside its container: (node, commit, term, container clock,
+        # has a network, container's server start on that clock).
+        in_network: list[tuple[str, int, int, float, int, float]] = []
 
         async def chaos() -> None:
             """Run --chaos at --chaos-at; act on its down/up lines."""
@@ -588,6 +606,11 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
                             leader_at_down=poller.leader,
                             leader_term_at_down=poller.leader_term,
                         )
+                elif word == "commit":
+                    commit, term, clock, net, started = rest[:5]
+                    in_network.append(
+                        (node, int(commit), int(term), float(clock), int(net), float(started))
+                    )
                 elif word == "up":
                     restart_info["max_term_before"] = poller.max_term
                     restart_info["at"] = at
@@ -797,10 +820,55 @@ async def bench(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
                 "d_longest_write_stall_s": stall,
                 "d_stall_starts_at": stall_at - t0,
             }
+            if in_network and poller.catch_up_target is not None:
+                result["restart"]["in_network"] = in_network_catch_up(
+                    in_network, *poller.catch_up_target, partitioned=bool(partition)
+                )
         result["_ops"] = ops
         return result
     finally:
         await cluster.shutdown()
+
+
+def in_network_catch_up(
+    samples: list[tuple[str, int, int, float, int, float]],
+    node: str,
+    target: int,
+    *,
+    partitioned: bool,
+) -> dict[str, Any]:
+    """Catch-up timed on the node's own container clock (see
+    scripts/chaos_docker.sh): from the moment it was back -- its network
+    interface reappearing (partition) or its server starting (restart) --
+    to the first sample at or past `target`, the highest commit index any
+    node reported when it came back."""
+    mine = [x for x in samples if x[0] == node]
+    back = None
+    if partitioned:
+        back = next((b[3] for a, b in zip(mine, mine[1:], strict=False) if not a[4] and b[4]), None)
+    elif mine:
+        back = mine[0][5]
+    after = [x for x in mine if back is not None and x[3] >= back]
+    done = next((x for x in after if x[1] >= target), None)
+    return {
+        "samples": len(mine),
+        "back_at_container_clock": back,
+        "e_restart_to_catch_up_s": round(done[3] - back, 3)
+        if done is not None and back is not None
+        else None,
+        "first_sample_after_back_s": round(after[0][3] - back, 3)
+        if after and back is not None
+        else None,
+        "term_while_out_max": max(
+            (x[2] for x in mine if back is None or x[3] < back), default=None
+        ),
+        "term_first_after_back": after[0][2] if after else None,
+        "trace": [
+            (x[3], x[1], x[2], x[4])
+            for i, x in enumerate(mine)
+            if i == 0 or x[1:3] != mine[i - 1][1:3] or x[4] != mine[i - 1][4]
+        ],
+    }
 
 
 def sync_arrivals(
@@ -911,6 +979,15 @@ def report(name: str, result: dict[str, Any]) -> None:
             f"   restart: {catch_up}  (c) {r['c_elections_after_restart']} elections  "
             f"(d) longest write stall {fmt(r['d_longest_write_stall_s'], 1000, 0)} ms"
         )
+        if "in_network" in r:
+            n = r["in_network"]
+            print(
+                f"   on the node's own clock: caught up in "
+                f"{fmt(n['e_restart_to_catch_up_s'], 1000, 0)} ms (first sample "
+                f"{fmt(n['first_sample_after_back_s'], 1000, 0)} ms after it was back); "
+                f"its term while out {n['term_while_out_max']}, once back "
+                f"{n['term_first_after_back']}"
+            )
     res = result.get("resources")
     if res and "cpu_percent" in res:
         cpu = "  ".join(f"{n} {c:.0f}%" for n, c in sorted(res["cpu_percent"].items()))

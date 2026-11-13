@@ -122,6 +122,7 @@ from raft.invariants import (
     AppliedEntryHistory,
     CommittedEntry,
     SafetyViolation,
+    check_commit_index_monotonic,
     check_election_safety,
     check_leader_append_only,
     check_leader_completeness,
@@ -469,6 +470,7 @@ class Fuzzer:
         self._no_spurious_truncation_history: dict[str, list[LogEntry]] = {}
         self._leader_completeness_history: dict[int, CommittedEntry] = {}
         self._state_machine_safety_history = AppliedEntryHistory()
+        self._commit_index_history: dict[int, tuple[RaftClusterNode, int]] = {}
         # CLIENT_REQUEST's own bookkeeping -- see _next_client_request.
         # Live-draw-decision aids only: replay never reconstructs or
         # consults these, since a forced entry already carries the full,
@@ -878,6 +880,7 @@ class Fuzzer:
             check_log_matching(self.cluster)
             check_leader_completeness(self.cluster, self._leader_completeness_history)
             check_state_machine_safety(self.cluster, self._state_machine_safety_history)
+            check_commit_index_monotonic(self.cluster, self._commit_index_history)
         except SafetyViolation as violation:
             violation.step = step_index
             violation.trace = tuple(self.trace)

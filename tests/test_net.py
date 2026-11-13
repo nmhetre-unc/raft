@@ -30,7 +30,7 @@ from raft.net.driver import Lost, Ok, Timeout
 from raft.net.filestorage import FileStorage
 from raft.net.raft_pb2_grpc import RaftStub
 from raft.net.server import ClusterConfig, RaftServer, ServerConfig, main, run, submit_reply
-from raft.net.transport import GrpcTransport
+from raft.net.transport import GrpcTransport, keepalive_channel_options
 from raft.node import NotLeader
 from raft.statemachine import NOT_FOUND
 from raft.storage import StorageError
@@ -401,6 +401,11 @@ def test_transport_rejects_bad_backoff(kwargs: dict[str, Any]) -> None:
         GrpcTransport("n0", {}, **kwargs)
 
 
+def test_transport_rejects_negative_keepalive() -> None:
+    with pytest.raises(ValueError, match="keepalive"):
+        GrpcTransport("n0", {}, keepalive_ms=-1)
+
+
 def test_server_keeps_reconnect_backoff_under_the_election_timeout(tmp_path: Path) -> None:
     async def body() -> None:
         (port,) = free_ports(1)
@@ -412,7 +417,57 @@ def test_server_keeps_reconnect_backoff_under_the_election_timeout(tmp_path: Pat
                 "grpc.initial_reconnect_backoff_ms": 20,
                 "grpc.max_reconnect_backoff_ms": 30,
                 "grpc.min_reconnect_backoff_ms": 20,
+                # keepalive, on by default (ClusterConfig.keepalive_ms)
+                "grpc.keepalive_time_ms": 1000,
+                "grpc.keepalive_timeout_ms": 1000,
+                "grpc.keepalive_permit_without_calls": 1,
+                "grpc.http2.max_pings_without_data": 0,
             }
+        finally:
+            await server.stop()
+
+    asyncio.run(body())
+
+
+def test_keepalive_can_be_turned_off(tmp_path: Path) -> None:
+    async def body() -> None:
+        (port,) = free_ports(1)
+        cluster = ClusterConfig.load(write_config(tmp_path, {"solo": f"127.0.0.1:{port}"}, 0))
+        assert cluster.keepalive_ms == 0
+        server = RaftServer(ServerConfig("solo", cluster, tmp_path / "solo"))
+        await server.start()
+        try:
+            options = dict(server.transport.channel_options)
+            assert not any("keepalive" in k or "pings" in k for k in options)
+        finally:
+            await server.stop()
+
+    asyncio.run(body())
+
+
+def test_server_accepts_keepalive_pings_without_goaway(tmp_path: Path) -> None:
+    """An idle client pinging every second keeps its connection. A default
+    gRPC server allows a ping without data only every 2 hours on an idle
+    connection: it counts the third ping a strike and, past two strikes,
+    answers with GOAWAY "too_many_pings" (~5 s in), dropping the channel out
+    of READY. (gRPC won't ping more often than once a second, so this takes
+    a few seconds.)"""
+
+    async def body() -> None:
+        (port,) = free_ports(1)
+        address = f"127.0.0.1:{port}"
+        cluster = ClusterConfig(nodes={"solo": address}, keepalive_ms=1000)
+        server = RaftServer(ServerConfig("solo", cluster, tmp_path / "solo"))
+        await server.start()
+        try:
+            options = keepalive_channel_options(1000)
+            async with grpc.aio.insecure_channel(address, options=options) as channel:
+                await RaftStub(channel).Status(pb.StatusRequest(), timeout=2)
+                states = set()
+                for _ in range(65):  # 6.5 s idle: 6 pings without data
+                    states.add(channel.get_state())
+                    await asyncio.sleep(0.1)
+                assert states == {grpc.ChannelConnectivity.READY}
         finally:
             await server.stop()
 
@@ -476,7 +531,7 @@ async def test_transport_counts_what_it_sends(cluster: LiveCluster) -> None:
 # -- main() --
 
 
-def write_config(tmp_path: Path, nodes: dict[str, str]) -> Path:
+def write_config(tmp_path: Path, nodes: dict[str, str], keepalive_ms: int = 1000) -> Path:
     path = tmp_path / "cluster.json"
     path.write_text(
         json.dumps(
@@ -485,6 +540,7 @@ def write_config(tmp_path: Path, nodes: dict[str, str]) -> Path:
                 "election_timeout_ms": [150, 300],
                 "heartbeat_ms": 50,
                 "request_timeout_ms": 1000,
+                "keepalive_ms": keepalive_ms,
             }
         )
     )
